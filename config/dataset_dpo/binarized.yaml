@@ -1,0 +1,2 @@
+name: "binarized"
+huggingface_dataset_id: "trl-lib/ultrafeedback_binarized"

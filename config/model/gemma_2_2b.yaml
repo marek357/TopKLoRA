@@ -1,0 +1,5 @@
+name: "gemma"
+version: 2.0
+size: "2B"
+model_name: "google/gemma-2-2b"
+model_it_name: "google/gemma-2-2b-it"
