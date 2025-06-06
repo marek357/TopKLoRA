@@ -1,3 +1,0 @@
-name: alpaca
-huggingface_dataset_id: "tatsu-lab/alpaca"
-split: train

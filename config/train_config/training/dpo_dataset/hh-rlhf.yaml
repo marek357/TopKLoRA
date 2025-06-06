@@ -1,3 +1,0 @@
-name: hh-rlhf
-huggingface_dataset_id: "Anthropic/hh-rlhf"
-split: train

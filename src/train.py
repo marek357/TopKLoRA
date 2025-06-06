@@ -10,15 +10,18 @@ from trl import (
 )
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer
 from datasets import load_dataset
-from peft import LoraConfig, TaskType
+from peft import LoraConfig, TaskType, get_peft_model
+import peft
 import time
 import os
+from src.models import TopKLoRALinear
 from src.utils import build_quant_config, get_conversational_dataset, is_valid_dpo_pair, preprocess_to_messages, violates_alternation
 from peft import PeftModelForCausalLM
 import numpy as np
 import logging
 
-device = 'mps' if torch.mps.is_available() else 'cpu'
+device = 'cuda' if torch.cuda.is_available() else \
+    'mps' if torch.mps.is_available() else 'cpu'
 
 
 def compute_metrics(eval_pred):
@@ -419,6 +422,7 @@ def lukas_dpo(cfg, model):
     logging.info("EOT token set to %s", eot_token)
 
     # ------------------ LoRA ------------------
+    topk_k = cfg.training.dpo_experiment.lora.k
     peft_config = LoraConfig(
         r=cfg.training.dpo_experiment.lora.r,
         lora_alpha=cfg.training.dpo_experiment.lora.alpha,
@@ -431,6 +435,29 @@ def lukas_dpo(cfg, model):
             cfg.training.dpo_experiment.lora.target_modules
         ),
     )
+
+    # Apply standard LoRA to model
+    model = get_peft_model(model, peft_config)
+
+    if cfg.training.dpo_experiment.lora.top_k_experiment:
+        # ── Inject Top-k masking ------------------------------------------------
+        replaced = 0
+        for name, module in model.named_modules():
+            # print(isinstance(module, lora.Linear), module)
+            print(type(module), module)
+            if isinstance(module, peft.tuners.lora.layer.Linear) and hasattr(module, "lora_dropout"):
+                parent = model.get_submodule(".".join(name.split(".")[:-1]))
+                setattr(
+                    parent, name.split(".")[-1],
+                    TopKLoRALinear(
+                        module, r=peft_config.r,
+                        alpha=peft_config.lora_alpha,
+                        k=topk_k
+                    )
+                )
+                replaced += 1
+        logging.info("TopKLoRALinear injected in %d layers", replaced)
+        assert False
 
     model_str = f'{cfg.training.model.name}_{cfg.training.model.version}_{cfg.training.model.size}'
     dpo_cfg = DPOConfig(
@@ -465,7 +492,7 @@ def lukas_dpo(cfg, model):
         model=model,
         ref_model=None,       # frozen copy auto‑created
         args=dpo_cfg,
-        peft_config=peft_config,
+        peft_config=None,           # already applied
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         processing_class=tokenizer,
@@ -478,29 +505,29 @@ def lukas_dpo(cfg, model):
 
     # ------------------ Sanity check ------------------
     # SAFE: log the first chosen conversation
-    for i in range(10):
-        sample = trainer.train_dataset[i]
+    # for i in range(10):
+    #     sample = trainer.train_dataset[i]
 
-        # Decode each field
-        prompt_text = tokenizer.decode(
-            sample['prompt_input_ids'],
-            skip_special_tokens=True
-        )
-        chosen_text = tokenizer.decode(
-            sample['chosen_input_ids'],
-            skip_special_tokens=True
-        )
-        rejected_text = tokenizer.decode(
-            sample['rejected_input_ids'],
-            skip_special_tokens=True
-        )
+    #     # Decode each field
+    #     prompt_text = tokenizer.decode(
+    #         sample['prompt_input_ids'],
+    #         skip_special_tokens=True
+    #     )
+    #     chosen_text = tokenizer.decode(
+    #         sample['chosen_input_ids'],
+    #         skip_special_tokens=True
+    #     )
+    #     rejected_text = tokenizer.decode(
+    #         sample['rejected_input_ids'],
+    #         skip_special_tokens=True
+    #     )
 
-        logging.info("Prompt:")
-        logging.info(prompt_text)
-        logging.info("\nChosen:")
-        logging.info(chosen_text)
-        logging.info("\nRejected:")
-        logging.info(rejected_text)
+    #     logging.info("Prompt:")
+    #     logging.info(prompt_text)
+    #     logging.info("\nChosen:")
+    #     logging.info(chosen_text)
+    #     logging.info("\nRejected:")
+    #     logging.info(rejected_text)
 
     # ------------------ Training ------------------
     start = time.time()

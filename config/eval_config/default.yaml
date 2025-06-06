@@ -1,5 +1,10 @@
 defaults:
-  - logger: wandb
+  - _self_
+  - logger: wandb_disabled
+  - evals/metrics@evals.metrics
+  # - evals/auto-interpret@evals.eval2
+  # - evals/perspective-api@evals.eval3
   # - override hydra/launcher: submitit_slurm
 seed: 42
-experiment_name: ${training.method}_${training.model}_experiment
+checkpoint_dir: adapter
+experiment_name: ${evals}_eval

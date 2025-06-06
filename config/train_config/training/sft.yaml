@@ -2,8 +2,8 @@ method: "sft"
 
 defaults:
   - model: llama_3_1b_instruct
-  - sft_experiment: lora_r_16_mlp_attn_llama
-  - dpo_experiment: lora_r_16_mlp_attn_llama
+  - experiment/lora_r_16_mlp_attn_llama@sft_experiment
+  - experiment/lora_r_16_mlp_attn_llama@dpo_experiment
   - sft_dataset: alpaca-train
   - dpo_dataset: hh-rlhf
   - quantization: 8bit
@@ -33,5 +33,6 @@ sft:
   weight_decay: 0.001
   push_to_hub: False
   do_eval: True
+
 dpo:
   enabled: False

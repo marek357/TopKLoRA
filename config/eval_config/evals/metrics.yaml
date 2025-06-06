@@ -1,0 +1,4 @@
+name: metrics
+build_eval_function:
+  _target_: src.evals.metrics
+model_path: meta-llama/Llama-3.2-1B-Instruct

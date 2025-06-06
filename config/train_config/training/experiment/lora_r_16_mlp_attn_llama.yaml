@@ -1,0 +1,14 @@
+size: "medium"
+lora:
+  r: 16
+  bias: 'none'
+  alpha: 16
+  dropout: 0.05
+  top_k_experiment: False
+  k: 10
+  target_modules:
+    - "mlp.gate_proj"
+    - "mlp.down_proj"
+    - "mlp.up_proj"
+    - "q_proj"
+    - "k_proj"

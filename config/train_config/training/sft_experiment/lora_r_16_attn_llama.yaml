@@ -1,8 +1,0 @@
-size: "medium"
-lora:
-  r: 16
-  alpha: 18
-  dropout: 0.05
-  target_modules:
-    - "q_proj"
-    - "k_proj"

@@ -1,9 +1,14 @@
-from typing import Dict, Any, List
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, set_seed
+from typing import Dict, Any, List, Tuple
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig
+)
 from trl import apply_chat_template
 from datasets import load_dataset
 from peft import PeftModel
 import torch
+import heapq
 
 
 def get_conversational_dataset(dataset_name, tokenizer):
@@ -231,3 +236,87 @@ def build_quant_config(cfg: Dict[str, Any]) -> BitsAndBytesConfig:
             llm_int8_threshold=cfg.get("llm_int8_threshold", 6.0),
         )
     raise ValueError(f"Unsupported quantisation type: {qtype}")
+
+
+def make_topk_hook(
+    module_name: str, k_heap: int, ax_topk: int,
+    topk_store: Dict[str, Dict[int, Dict[str, List[Tuple[float, int, int, float]]]]],
+):
+    """
+    Build a forward hook for a PEFT lora.Linear layer that
+      • computes h = A·x
+      • optionally selects the Top-AX_TOPK neurons (|h|) per token
+      • stores top-k_heap examples per (layer, neuron, sign) in `topk_store`.
+    """
+    def _hook(module, inp, _):
+        # global: dataset row index of batch[0]
+        ex_offset = CURRENT_EX_OFFSET
+        mask = CURRENT_PAD_MASK      # (B, L) bool, True = real token
+
+        # ---------- resolve which adapter key to use ----------------------
+        adapter = module.active_adapter or next(iter(module.lora_A))
+        if isinstance(adapter, (list, tuple)):
+            adapter = adapter[0]
+
+        # ---------- compute A·x -------------------------------------------
+        x = inp[0]                        # (B, L, D_hidden)
+        h = module.lora_A[adapter](x)     # (B, L, r)
+        if h.ndim == 2:                   # some PEFT ops flatten B·L
+            B, L = x.shape[:2]
+            h = h.view(B, L, -1)
+
+        B, L, R = h.shape
+        if mask is None:
+            mask = h.new_ones((B, L), dtype=torch.bool)
+
+        # ---------- iterate over real tokens ------------------------------
+        for b in range(B):
+            ex_idx = ex_offset + b
+            valid_len = int(mask[b].sum())
+            pad_left = L - valid_len
+
+            for pos in range(L):
+                if not mask[b, pos]:
+                    continue   # skip padding
+                true_pos = pos - pad_left
+                act_vec = h[b, pos]                      # (R,)
+
+                # --- select which neuron indices to store ----------------
+                if ax_topk is None or ax_topk >= R:
+                    store_idx = range(R)                  # keep all
+                else:
+                    store_idx = act_vec.abs().topk(ax_topk).indices.tolist()
+
+                for n_idx in store_idx:
+                    raw_val = act_vec[n_idx].item()
+                    sign = "pos" if raw_val >= 0 else "neg"
+                    # TODO: make topk_store part of local frame
+                    #       let's not rely on global state
+                    heap = topk_store[module_name][n_idx][sign]
+
+                    mag = abs(raw_val)
+                    item = (mag, ex_idx, true_pos, raw_val)
+
+                    if len(heap) < k_heap:
+                        heapq.heappush(heap, item)
+                    elif mag > heap[0][0]:
+                        heapq.heapreplace(heap, item)
+
+    return _hook
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: build chat messages for apply_chat_template
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def build_metrics_eval_messages(question: str, reply_a: str, reply_b: str) -> List[Dict]:
+    user = (
+        f"{question}\n\n"
+        f"### Reply A:\n{reply_a}\n\n"
+        f"### Reply B:\n{reply_b}\n\n"
+        "Which reply is better? Answer with A or B only."
+    )
+    return [
+        {"role": "user",   "content": user},
+        # The assistant role is left blank; the tokenizer adds the tag.
+    ]

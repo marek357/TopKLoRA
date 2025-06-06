@@ -1,11 +1,11 @@
 method: "dpo"
 
 defaults:
-  - model: llama_3_1b_instruct
-  - sft_experiment: lora_r_16_mlp_attn_llama
-  - dpo_experiment: lora_r_16_mlp_attn_llama
-  - sft_dataset: alpaca-train
-  - dpo_dataset: hh-rlhf
+  - model: gemma_2b
+  - experiment/lora_r_16_mlp_attn_llama@sft_experiment
+  - experiment/lora_r_16_mlp_attn_llama@dpo_experiment
+  - dataset/alpaca-train@sft_dataset
+  - dataset/hh-rlhf@dpo_dataset
   - quantization: 8bit
 
 
