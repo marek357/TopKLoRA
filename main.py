@@ -47,17 +47,13 @@ def main(cfg: DictConfig):
         model = lukas_sft(cfg)
 
     if cfg.training.dpo.enabled:
-        if model is not None:
-            print('Merging LoRA adapter from memory after SFT training')
-            model = model.merge_and_unload()
-        else:
-            print('Loading and merging LoRA adapter from checkpoint')
-            model = merge_lora_adapter(
-                cfg.training.model.model_name,
-                cfg.training.adapter.checkpoint_dir,
-                f'experiments/merged/{cfg.training.model.model_name}_sft',
-                save_merged_model=True
-            )
+        print('Loading and merging LoRA adapter from checkpoint')
+        model = merge_lora_adapter(
+            cfg.training.model.model_name,
+            cfg.training.adapter.checkpoint_dir,
+            f'experiments/merged/{cfg.training.model.model_name}_sft',
+            save_merged_model=True
+        )
 
         model = lukas_dpo(cfg, model)
 

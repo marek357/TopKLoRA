@@ -37,8 +37,8 @@ class TopKLoRALinear(nn.Module):
 
     def forward(self, x: torch.Tensor):
         # match dtype for mixed precision
-        A = self.A.to(x.dtype)
-        B = self.B.to(x.dtype)
+        A = self.A.to(dtype=x.dtype, device=x.device)
+        B = self.B.to(dtype=x.dtype, device=x.device)
         z = F.linear(x, A)
         if self.k < self.r:
             thresh = z.abs().topk(self.k, dim=-1)[0][..., -1:]

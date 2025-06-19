@@ -149,22 +149,22 @@ def preprocess_to_messages(example: Dict[str, Any]) -> Dict[str, Any]:  # noqa: 
 # Quantisation helper
 # -----------------------------------------------------------------------------
 
-def build_quant_config(cfg: Dict[str, Any]) -> BitsAndBytesConfig:
-    """Return a BitsAndBytesConfig from YAML sub‑dict."""
-    qtype = cfg["type"].lower()
-    if qtype == "4bit":
-        return BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type=cfg.get("bnb_4bit_quant_type", "nf4"),
-            bnb_4bit_compute_dtype=getattr(
-                torch, cfg.get("compute_dtype", "bfloat16")),
-        )
-    if qtype == "8bit":
-        return BitsAndBytesConfig(
-            load_in_8bit=True,
-            llm_int8_threshold=cfg.get("llm_int8_threshold", 6.0),
-        )
-    raise ValueError(f"Unsupported quantisation type: {qtype}")
+# def build_quant_config(cfg: Dict[str, Any]) -> BitsAndBytesConfig:
+#     """Return a BitsAndBytesConfig from YAML sub‑dict."""
+#     qtype = cfg["type"].lower()
+#     if qtype == "4bit":
+#         return BitsAndBytesConfig(
+#             load_in_4bit=True,
+#             bnb_4bit_quant_type=cfg.get("bnb_4bit_quant_type", "nf4"),
+#             bnb_4bit_compute_dtype=getattr(
+#                 torch, cfg.get("compute_dtype", "bfloat16")),
+#         )
+#     if qtype == "8bit":
+#         return BitsAndBytesConfig(
+#             load_in_8bit=True,
+#             llm_int8_threshold=cfg.get("llm_int8_threshold", 6.0),
+#         )
+#     raise ValueError(f"Unsupported quantisation type: {qtype}")
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +230,7 @@ def hh_string_to_messages(text: str) -> List[Dict[str, str]]:
 
 def hh_rlhf_preprocess_to_messages(example: Dict[str, Any]) -> Dict[str, Any]:
     """Map HH‑RLHF record → {'chosen': [...], 'rejected': [...]} chat lists."""
+    print(example)
     return {
         "chosen":   hh_string_to_messages(example["chosen"]),
         "rejected": hh_string_to_messages(example["rejected"]),
@@ -556,13 +557,13 @@ def autointerp_token_windows_dict(
         ]
 
         center = tok_pos - start          # position of the “hot” token
-        if center >= len(toks):
-            print(center, tok_pos, start)
-            print(center, tok_pos, start)
-            print(len(toks))
-            print(len(toks))
-            assert False
-        print(tok_pos, start, center, len(toks))
+        # if center >= len(toks):
+        #     print(center, tok_pos, start)
+        #     print(center, tok_pos, start)
+        #     print(len(toks))
+        #     print(len(toks))
+        #     assert False
+        # print(tok_pos, start, center, len(toks))
         token_text = toks[center]         # raw decoded token
 
         # Wrap the center token in << ... >>

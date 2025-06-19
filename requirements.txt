@@ -121,3 +121,4 @@ wandb==0.19.11
 wcwidth==0.2.13
 xxhash==3.5.0
 yarl==1.20.0
+ifeval @ git+https://github.com/oKatanaaa/ifeval@41a4de7

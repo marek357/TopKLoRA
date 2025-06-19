@@ -1,10 +1,12 @@
 import json
 import re
 import time
+from ifeval import Evaluator, instruction_registry, get_default_dataset
 from googleapiclient import discovery
 from collections import defaultdict
 import numpy as np
 from openai import OpenAI
+from src.models import TopKLoRALinear
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import (
     get_dataset_config_names,
@@ -46,17 +48,60 @@ device = 'cuda' if torch.cuda.is_available() else \
 
 def metrics():
     def eval_metrics(cfg):
+        # TODO: load top-k lora
         tokenizer = AutoTokenizer.from_pretrained(
-            cfg.model.model_path
+            cfg.evals.auto_interp.adapter_checkpoint_dir,
+            use_fast=True
         )
         model = AutoModelForCausalLM.from_pretrained(
-            cfg.model.model_path
-        ).to(device)
+            cfg.evals.auto_interp.base_model_name,
+            torch_dtype="auto",
+            device_map="cpu"
+        )
 
-        if 'gemma' in model.config._name_or_path:
-            model.generation_config.eos_token_id = [1, 107]
+        model = PeftModel.from_pretrained(
+            model,
+            cfg.evals.auto_interp.adapter_checkpoint_dir,
+            # there are issues with mps
+            # so first loading to cpu
+            # and then moving it to $device
+            device_map="cpu"
+        )
+        replaced = 0
+        for name, module in model.named_modules():
+            if isinstance(module, TopKLoRALinear):
+                continue  # Already wrapped
+            if hasattr(module, "lora_A"):
+                parent = model.get_submodule(".".join(name.split(".")[:-1]))
+                attr = name.split(".")[-1]
+                wrapped = TopKLoRALinear(
+                    module,
+                    layer_name=name,
+                    r=module.r,
+                    alpha=module.lora_alpha,
+                    k=cfg.model.k,
+                )
+                setattr(parent, attr, wrapped)
+                replaced += 1
+        print(f"Wrapped {replaced} LoraLayer modules into TopKLoRALinear.")
+        model.to(device)
+
+
 
         model.eval()
+
+        if 'gemma' in cfg.model.name:
+            tokenizer.padding_side = "left"
+            tokenizer.truncation_side = "left"
+            model.generation_config.eos_token_id = [1, 107]
+            model.generation_config.max_length = 512
+
+        elif 'llama' in cfg.model.name:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
         configs = get_dataset_config_names("HuggingFaceH4/hhh_alignment")
         parts = []
         for cfg_ in configs:
@@ -124,14 +169,6 @@ def auto_interp():
             cfg.evals.auto_interp.adapter_checkpoint_dir,
             use_fast=True
         )
-        if 'gemma' in cfg.model.name:
-            tokenizer.padding_side = "left"
-            tokenizer.truncation_side = "left"
-        elif 'llama' in cfg.model.name:
-            tokenizer.pad_token = tokenizer.eos_token
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
         model = AutoModelForCausalLM.from_pretrained(
             cfg.evals.auto_interp.base_model_name,
             torch_dtype="auto",
@@ -148,6 +185,18 @@ def auto_interp():
         )
         model.to(device)
         model.eval()
+
+        if 'gemma' in cfg.model.name:
+            tokenizer.padding_side = "left"
+            tokenizer.truncation_side = "left"
+            model.generation_config.eos_token_id = [1, 107]
+            model.generation_config.max_length = 512
+
+        elif 'llama' in cfg.model.name:
+            tokenizer.pad_token = tokenizer.eos_token
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
 
         topk_store = defaultdict(
             lambda: defaultdict(lambda: {"pos": [], "neg": []})
@@ -328,6 +377,8 @@ def toxicity():
             discoveryServiceUrl="https://commentanalyzer.googleapis.com/$discovery/rest?version=v1alpha1",
             static_discovery=False,
         )
+
+        # TODO: load top-k LoRA for eval
         tokenizer = AutoTokenizer.from_pretrained(
             cfg.model.model_path
         )
@@ -347,6 +398,9 @@ def toxicity():
         if 'gemma' in model.config._name_or_path:
             model.generation_config.eos_token_id = [1, 107]
             model.generation_config.max_length = 512
+            tokenizer.padding_side = "left"
+            tokenizer.truncation_side = "left"
+
 
         challenging_dataset = dataset.filter(
             lambda example: example["challenging"]
@@ -482,3 +536,16 @@ def toxicity():
         return toxicity_scores
 
     return eval_toxicity
+
+
+def instruction_following():
+    def eval_instruction_following(cfg):
+        evaluator = Evaluator(instruction_registry)
+        input_examples = get_default_dataset("en")
+
+        responses = {ex.prompt: your_model.generate(ex.prompt) for ex in input_examples}
+
+        report, all_outputs = evaluator.evaluate(input_examples, responses)
+
+
+    return eval_instruction_following

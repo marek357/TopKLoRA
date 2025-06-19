@@ -149,7 +149,7 @@ def lukas_sft(cfg):
     model = AutoModelForCausalLM.from_pretrained(
         cfg.training.model.model_name,
         # quantization doesn't work on Apple Metal
-        quantization_config=quant_cfg if device != 'mps' else None,
+        # quantization_config=quant_cfg if device != 'mps' else None,
     ).to(device)
 
     if 'gemma' in cfg.training.model.name:
@@ -566,7 +566,7 @@ def lukas_dpo(cfg, model):
         model = AutoModelForCausalLM.from_pretrained(
             cfg.training.model.model_name,
             # quantization doesn't work on Apple Metal
-            quantization_config=quant_cfg if device != 'mps' else None,
+            # quantization_config=quant_cfg if device != 'mps' else None,
         ).to(device)
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -687,7 +687,7 @@ def lukas_dpo(cfg, model):
         lora_dropout=lcfg.dropout,
         bias=lcfg.bias,
         task_type=TaskType.CAUSAL_LM,
-        target_modules=lcfg.target_modules,
+        target_modules=list(lcfg.target_modules),
     )
     peft_cfg.k = topk_k  # record Top-k in adapter_config.json
 
@@ -745,6 +745,8 @@ def lukas_dpo(cfg, model):
         do_eval=False,
     )
 
+    # from pprint import pprint
+    # pprint(dpo_cfg)
     # Trainer setup
     trainer = DPOTrainer(
         model=model,
@@ -772,7 +774,9 @@ def lukas_dpo(cfg, model):
     logging.info("Reverted %d TopK wrappers back to LoraLayer", unwrapped)
 
     # Save adapter
-    out_path = os.path.join(cfg["output_dir"], "final_adapter")
+    out_path = os.path.join(f'experiments/{model_str}_dpo', "final_adapter")
     trainer.save_model(out_path)
     logging.info("Adapter saved to %s", out_path)
     wandb.finish()
+
+    return trainer.model

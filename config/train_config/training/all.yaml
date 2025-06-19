@@ -2,26 +2,26 @@ method: "all"
 
 defaults:
   - model: gemma_2b
-  - experiment/lora_r_16_mlp_attn_llama@sft_experiment
-  - experiment/lora_r_16_mlp_attn_llama@dpo_experiment
+  - experiment/lora_gemma@sft_experiment
+  - experiment/lora_gemma@dpo_experiment
   - dataset/alpaca-train@sft_dataset
   - dataset/hh-rlhf@dpo_dataset
+  - adapter: gemma_2b
   - quantization: 8bit
 
 dump_trained_model: True
 dump_path: "models/all/${training.model.model_name}"
-
 
 sft:
   enabled: True
   packing: False
   completion_only_loss: True
   max_seq_length: 1024
-  num_epochs: 15
+  num_epochs: 1
   batch_size_train: 4
   gradient_accumulation_steps: 2
   gradient_checkpointing: True
-  optim: "paged_adamw_8bit"
+  optim: "adamw_torch"
   lr: 1e-4
   warmup_ratio: 0.03
   bf16: False
@@ -32,7 +32,7 @@ sft:
   save_total_limit: 3
   eval_steps: 100
   eval_strategy: "steps"
-  max_steps: 1000
+  max_steps: 5000
   batch_size_eval: 12
   weight_decay: 0.001
   push_to_hub: False
@@ -45,10 +45,11 @@ dpo:
   beta: 0.1
   loss_type: 'sigmoid'
   num_train_epochs: 1
-  per_device_train_batch_size: 8
+  per_device_train_batch_size: 4
   per_device_eval_batch_size: 4
   gradient_accumulation_steps: 1
   gradient_checkpointing: True
+  max_steps: 5000
   optim: 'adamw_torch'
   learning_rate: 5e-6
   warmup_ratio: 0.03

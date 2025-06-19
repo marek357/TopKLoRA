@@ -1,6 +1,7 @@
 name: "gemma"
 version: 1.0
 size: "2B"
-type: sft_model
+type: dpo_model
+top_k: 10
 base_model: "google/gemma-2b"
 adapter_checkpoint_dir: "/Users/remak/Documents/misc/lora_dpo/experiments/gemma_1.0_2B_dpo/final_adapter"

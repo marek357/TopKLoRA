@@ -6,6 +6,7 @@ defaults:
   - experiment/lora_gemma@dpo_experiment
   - dataset/alpaca-train@sft_dataset
   - dataset/hh-rlhf@dpo_dataset
+  - adapter: gemma_2b
   - quantization: 8bit
 
 dump_trained_model: True
