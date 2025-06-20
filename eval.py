@@ -11,6 +11,7 @@ from hydra.utils import instantiate
 from dotenv import load_dotenv
 from omegaconf import DictConfig, OmegaConf
 import logging
+from src.evals import metrics
 
 
 @hydra.main(
