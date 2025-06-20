@@ -13,6 +13,7 @@ from datasets import (
     load_dataset,
     concatenate_datasets
 )
+import torch.nn.functional as F
 from peft import PeftModel
 from torch.utils.data import DataLoader
 from itertools import islice
@@ -46,61 +47,77 @@ device = 'cuda' if torch.cuda.is_available() else \
     'mps' if torch.mps.is_available() else 'cpu'
 
 
+def init_model_tokenizer(model_cfg):
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_cfg.adapter_checkpoint_dir,
+        use_fast=True
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        model_cfg.base_model,
+        torch_dtype="auto",
+        device_map="cpu"
+    )
+
+    model = PeftModel.from_pretrained(
+        model,
+        model_cfg.adapter_checkpoint_dir,
+        # there are issues with mps
+        # so first loading to cpu
+        # and then moving it to $device
+        device_map="cpu"
+    )
+    replaced = 0
+    for name, module in model.named_modules():
+        if isinstance(module, TopKLoRALinear):
+            continue  # Already wrapped
+        if hasattr(module, "lora_A"):
+            parent = model.get_submodule(".".join(name.split(".")[:-1]))
+            attr = name.split(".")[-1]
+            wrapped = TopKLoRALinear(
+                module,
+                layer_name=name,
+                r=module.r,
+                alpha=module.lora_alpha,
+                k=model_cfg.k,
+            )
+            setattr(parent, attr, wrapped)
+            replaced += 1
+    print(f"Wrapped {replaced} LoraLayer modules into TopKLoRALinear.")
+    model.to(device)
+    model.eval()
+
+    if 'gemma' in model_cfg.name:
+        tokenizer.padding_side = "left"
+        tokenizer.truncation_side = "left"
+        model.generation_config.eos_token_id = [1, 107]
+        model.generation_config.max_length = 512
+
+    elif 'llama' in model_cfg.name:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    return model, tokenizer
+
+
+# Final accuracy summary (SFT)
+# overall: 67.873%
+# harmless: 62.069%
+# helpful: 72.881%
+# honest: 72.131%
+# other: 62.791%
+
+# Final accuracy summary (DPO)
+# overall : 66.516%
+# harmless: 60.345%
+# helpful : 71.186%
+# honest  : 68.852%
+# other   : 65.116%
+
 def metrics():
     def eval_metrics(cfg):
-        # TODO: load top-k lora
-        tokenizer = AutoTokenizer.from_pretrained(
-            cfg.evals.auto_interp.adapter_checkpoint_dir,
-            use_fast=True
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg.evals.auto_interp.base_model_name,
-            torch_dtype="auto",
-            device_map="cpu"
-        )
-
-        model = PeftModel.from_pretrained(
-            model,
-            cfg.evals.auto_interp.adapter_checkpoint_dir,
-            # there are issues with mps
-            # so first loading to cpu
-            # and then moving it to $device
-            device_map="cpu"
-        )
-        replaced = 0
-        for name, module in model.named_modules():
-            if isinstance(module, TopKLoRALinear):
-                continue  # Already wrapped
-            if hasattr(module, "lora_A"):
-                parent = model.get_submodule(".".join(name.split(".")[:-1]))
-                attr = name.split(".")[-1]
-                wrapped = TopKLoRALinear(
-                    module,
-                    layer_name=name,
-                    r=module.r,
-                    alpha=module.lora_alpha,
-                    k=cfg.model.k,
-                )
-                setattr(parent, attr, wrapped)
-                replaced += 1
-        print(f"Wrapped {replaced} LoraLayer modules into TopKLoRALinear.")
-        model.to(device)
-
-
-
-        model.eval()
-
-        if 'gemma' in cfg.model.name:
-            tokenizer.padding_side = "left"
-            tokenizer.truncation_side = "left"
-            model.generation_config.eos_token_id = [1, 107]
-            model.generation_config.max_length = 512
-
-        elif 'llama' in cfg.model.name:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+        model, tokenizer = init_model_tokenizer(cfg.model)
 
         configs = get_dataset_config_names("HuggingFaceH4/hhh_alignment")
         parts = []
@@ -121,33 +138,83 @@ def metrics():
         metric_global = evaluate.load("accuracy")
         metrics_by_subset = defaultdict(lambda: evaluate.load("accuracy"))
 
-        tok_id_A = tokenizer.convert_tokens_to_ids("A")
-        tok_id_B = tokenizer.convert_tokens_to_ids("B")
-
         with torch.no_grad():
             for i, ex in tqdm(enumerate(hhh_all)):
                 q = ex["input"]
                 choices = ex["targets"]["choices"]
                 gold_idx = ex["targets"]["labels"].index(1)
 
-                msgs = build_metrics_eval_messages(q, choices[0], choices[1])
-                input_ids = tokenizer.apply_chat_template(
-                    msgs,
-                    return_tensors="pt",
-                    add_generation_prompt=True,
-                ).to(device)
+                base_prompt_raw = build_metrics_eval_messages(
+                    q, choices[0], choices[1]
+                )
+                # msgs = build_metrics_eval_messages(q, choices[0], choices[1])
+                # input_ids = tokenizer.apply_chat_template(
+                #     msgs,
+                #     return_tensors="pt",
+                #     add_generation_prompt=True,
+                # ).to(device)
 
-                logits = model(input_ids).logits
-                last_logits = logits[0, -1]
+                # output = model(input_ids)
+                # logits = output.logits
+                # # print(F.softmax(logits).argmax())
+                # # print(tokenizer.convert_ids_to_tokens(
+                # #     torch.tensor([F.softmax(logits).argmax()])
+                # # ))
+                # # print(tokenizer.decode(input_ids[0], skip_special_tokens=True))
+                # # print(tokenizer.decode(logits[0], skip_special_tokens=True))
+                # # print()
+                # last_logits = logits[0, -1]
 
-                logp_A = last_logits[tok_id_A].item()
-                logp_B = last_logits[tok_id_B].item()
+                # logp_A = F.softmax(last_logits)[tok_id_A].item()
+                # logp_B = F.softmax(last_logits)[tok_id_B].item()
+                # print(logp_A, logp_B, F.softmax(last_logits).max())
+                # print()
+                # pred = 1 if logp_B > logp_A else 0
+
+                # Render prompt up to "Reply A:" and then append one of the replies
+                base_prompt = tokenizer.apply_chat_template(
+                    base_prompt_raw, tokenize=False, add_generation_prompt=False)
+
+                # Create inputs for scoring reply A
+                full_text_a = base_prompt + choices[0]
+                full_text_b = base_prompt + choices[1]
+
+                def logprob_of(text):
+                    enc = tokenizer(text, return_tensors="pt",
+                                    add_special_tokens=False).to(model.device)
+                    input_ids = enc.input_ids
+
+                    with torch.no_grad():
+                        out = model(input_ids)
+                        logits = out.logits
+
+                    # Compute token-wise log probs
+                    shift_logits = logits[:, :-1, :]
+                    shift_labels = input_ids[:, 1:]
+
+                    log_probs = F.softmax(shift_logits, dim=-1)
+                    selected_logprobs = log_probs.gather(
+                        2, shift_labels.unsqueeze(-1)).squeeze(-1)
+
+                    # Sum log probs from the start of the reply only (not prompt)
+                    reply_start = len(
+                        tokenizer(base_prompt, add_special_tokens=False)["input_ids"])
+                    reply_logprob = selected_logprobs[:, reply_start:].sum()
+
+                    return reply_logprob.item()
+
+                logp_A = logprob_of(full_text_a)
+                logp_B = logprob_of(full_text_b)
+
                 pred = 1 if logp_B > logp_A else 0
 
                 metric_global.add(prediction=pred, reference=gold_idx)
                 metrics_by_subset[ex["subset"]].add(
                     prediction=pred, reference=gold_idx
                 )
+
+                # if i > 5:
+                #     assert False
 
         results = {"overall": metric_global.compute()["accuracy"]}
         for subset, m in metrics_by_subset.items():
@@ -164,39 +231,7 @@ def metrics():
 def auto_interp():
     def eval_auto_interp(cfg):
         print('Evaluating auto interp')
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            cfg.evals.auto_interp.adapter_checkpoint_dir,
-            use_fast=True
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg.evals.auto_interp.base_model_name,
-            torch_dtype="auto",
-            device_map="cpu"
-        )
-
-        model = PeftModel.from_pretrained(
-            model,
-            cfg.evals.auto_interp.adapter_checkpoint_dir,
-            # there are issues with mps
-            # so first loading to cpu
-            # and then moving it to $device
-            device_map="cpu"
-        )
-        model.to(device)
-        model.eval()
-
-        if 'gemma' in cfg.model.name:
-            tokenizer.padding_side = "left"
-            tokenizer.truncation_side = "left"
-            model.generation_config.eos_token_id = [1, 107]
-            model.generation_config.max_length = 512
-
-        elif 'llama' in cfg.model.name:
-            tokenizer.pad_token = tokenizer.eos_token
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
+        model, tokenizer = init_model_tokenizer(cfg.model)
 
         topk_store = defaultdict(
             lambda: defaultdict(lambda: {"pos": [], "neg": []})
@@ -370,6 +405,8 @@ def auto_interp():
 
 def toxicity():
     def eval_toxicity(cfg):
+        model, tokenizer = init_model_tokenizer(cfg.model)
+
         client = discovery.build(
             "commentanalyzer",
             "v1alpha1",
@@ -378,29 +415,10 @@ def toxicity():
             static_discovery=False,
         )
 
-        # TODO: load top-k LoRA for eval
-        tokenizer = AutoTokenizer.from_pretrained(
-            cfg.model.model_path
-        )
-
-        # set the pad token if one is missing
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg.model.model_path
-        ).to(device)
         dataset = load_dataset(
             cfg.evals.toxicity.dataset_name,
             split=cfg.evals.toxicity.split
         )
-
-        if 'gemma' in model.config._name_or_path:
-            model.generation_config.eos_token_id = [1, 107]
-            model.generation_config.max_length = 512
-            tokenizer.padding_side = "left"
-            tokenizer.truncation_side = "left"
-
 
         challenging_dataset = dataset.filter(
             lambda example: example["challenging"]
@@ -411,8 +429,6 @@ def toxicity():
             batched=False,
             remove_columns=dataset.column_names
         )
-
-        model.eval()
 
         full_outputs = []
         completions_only = []
@@ -538,14 +554,36 @@ def toxicity():
     return eval_toxicity
 
 
+# Final accuracy summary
+# overall: 67.873%
+# harmless: 62.069%
+# helpful: 72.881%
+# honest: 72.131%
+# other: 62.791%
+
+
 def instruction_following():
     def eval_instruction_following(cfg):
+        model, tokenizer = init_model_tokenizer(cfg.model)
         evaluator = Evaluator(instruction_registry)
         input_examples = get_default_dataset("en")
 
-        responses = {ex.prompt: your_model.generate(ex.prompt) for ex in input_examples}
+        responses = {
+            ex.prompt: model.generate(
+                **tokenizer(
+                    [ex.prompt],
+                    return_tensors="pt"
+                ).to(device)
+            )
+            for ex in tqdm(input_examples)
+        }
+
+        for key in responses:
+            responses[key] = tokenizer.batch_decode(
+                responses[key], skip_special_tokens=True
+            )[0]
 
         report, all_outputs = evaluator.evaluate(input_examples, responses)
-
+        print(report)
 
     return eval_instruction_following

@@ -2,8 +2,9 @@ defaults:
   - _self_
   - logger: wandb_disabled
   # - evals/metrics@evals.metrics
-  - evals/auto-interpret@evals.auto_interp
+  # - evals/auto-interpret@evals.auto_interp
   # - evals/toxicity@evals.toxicity
+  - evals/instruction_following@evals.instruction_following
   - model: dpo_gemma_2b
   # - override hydra/launcher: submitit_slurm
 seed: 42

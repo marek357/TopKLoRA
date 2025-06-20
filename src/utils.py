@@ -1017,7 +1017,7 @@ def build_metrics_eval_messages(question: str, reply_a: str, reply_b: str) -> Li
         "Which reply is better? Answer with A or B only."
     )
     return [
-        {"role": "user",   "content": user},
+        {"role": "user",   "content": f"{question}\n\n"},
         # The assistant role is left blank; the tokenizer adds the tag.
     ]
 
