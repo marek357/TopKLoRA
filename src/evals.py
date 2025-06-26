@@ -46,8 +46,21 @@ from src.utils import (
 device = 'cuda' if torch.cuda.is_available() else \
     'mps' if torch.mps.is_available() else 'cpu'
 
+import hashlib
 
-def init_model_tokenizer(model_cfg):
+def hash_lora_weights(model):
+    import hashlib
+    sha = hashlib.sha256()
+    for name, module in model.named_modules():
+        if isinstance(module, TopKLoRALinear):
+            for pname, param in module.lora_module.named_parameters():
+                sha.update(param.detach().cpu().numpy().tobytes())
+    return sha.hexdigest()
+
+def init_model_tokenizer(model_cfg, auto_interp=False):
+    print('Initialising a model for eval...')
+    print(model_cfg)
+    print('Model init start...')
     tokenizer = AutoTokenizer.from_pretrained(
         model_cfg.adapter_checkpoint_dir,
         use_fast=True
@@ -64,9 +77,11 @@ def init_model_tokenizer(model_cfg):
         # there are issues with mps
         # so first loading to cpu
         # and then moving it to $device
-        device_map="cpu"
+        device_map="cpu",
+        use_safetensors=True
     )
     replaced = 0
+    wrapped_modules = {}
     for name, module in model.named_modules():
         if isinstance(module, TopKLoRALinear):
             continue  # Already wrapped
@@ -85,6 +100,38 @@ def init_model_tokenizer(model_cfg):
     print(f"Wrapped {replaced} LoraLayer modules into TopKLoRALinear.")
     model.to(device)
     model.eval()
+    # print(model)
+
+    # adapter_path = Path(model_cfg.adapter_checkpoint_dir)
+    # if (adapter_path / "adapter_model.safetensors").exists():
+    #     from safetensors.torch import load_file
+    #     adapter_weights = load_file(str(adapter_path / "adapter_model.safetensors"))
+    #     model.load_state_dict(adapter_weights, strict=False)
+    #     print("Loaded adapter weights from safetensors manually.")
+    # else:
+    #     print("WARNING: adapter_model.safetensors not found at path:", adapter_path)
+
+
+    print(f"Loaded adapter from: {model_cfg.adapter_checkpoint_dir}")
+    print(f"Adapter SHA256 hash: {hash_lora_weights(model)}")
+    # assert False
+
+    def debug_lora_weights(model):
+        total_params = 0
+        nonzero_params = 0
+        for name, module in model.named_modules():
+            if isinstance(module, TopKLoRALinear):
+                for pname, param in module.lora_module.named_parameters():
+                    total_params += param.numel()
+                    nonzero_params += param.nonzero().size(0)
+        print(f"LoRA param stats: {nonzero_params}/{total_params} non-zero")
+
+    debug_lora_weights(model)
+
+    for name, module in model.named_modules():
+        if isinstance(module, TopKLoRALinear):
+            wrapped_modules[name] = module
+
 
     if 'gemma' in model_cfg.name:
         tokenizer.padding_side = "left"
@@ -98,7 +145,10 @@ def init_model_tokenizer(model_cfg):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    return model, tokenizer
+    if auto_interp:
+        return model, tokenizer, wrapped_modules
+    else:
+        return model, tokenizer
 
 
 # Final accuracy summary (SFT)
@@ -207,6 +257,9 @@ def metrics():
                 logp_B = logprob_of(full_text_b)
 
                 pred = 1 if logp_B > logp_A else 0
+                if i % 10 == 0:
+                    print(f"[EX {i}] GOLD={gold_idx} | logp_A={logp_A:.4f} | logp_B={logp_B:.4f} | pred={pred}")
+
 
                 metric_global.add(prediction=pred, reference=gold_idx)
                 metrics_by_subset[ex["subset"]].add(
@@ -231,18 +284,22 @@ def metrics():
 def auto_interp():
     def eval_auto_interp(cfg):
         print('Evaluating auto interp')
-        model, tokenizer = init_model_tokenizer(cfg.model)
+        if 'sft' in cfg.model.adapter_checkpoint_dir:
+            print('SFT model, skipping auto interp...')
+            return
+        model, tokenizer, topk_modules = init_model_tokenizer(cfg.model, auto_interp=True)
 
         topk_store = defaultdict(
             lambda: defaultdict(lambda: {"pos": [], "neg": []})
         )
         example_counter = 0        # global running index over all examples
-        lora_modules = {
-            name: mod
-            for name, mod in model.named_modules()
-            if f".{cfg.evals.auto_interp.layer_idx}." in name and
-            isinstance(mod, LoraLayer)
-        }
+        # lora_modules = {
+        #     name: mod
+        #     for name, mod in model.named_modules()
+        #     if f".{cfg.evals.auto_interp.layer_idx}." in name and
+        #     isinstance(mod, LoraLayer)
+        # }
+
 
         # TODO: do NOT rely on global state
         current_vals = {
@@ -250,13 +307,14 @@ def auto_interp():
             'current_pad_mask': None  # will be set per batch
         }
 
-        for name, mod in lora_modules.items():
+        for name, mod in topk_modules.items():
+            print(f"Hooking: {name} of type {type(mod)}")
             mod.register_forward_hook(
                 autointerp_make_topk_hook(
                     name, cfg, topk_store, current_vals
                 )
             )
-        print(f"✔ registered hooks for {len(lora_modules)} LoRA blocks")
+        print(f"✔ registered hooks for {len(topk_modules)} LoRA blocks")
 
         raw_ds = load_dataset(
             cfg.evals.auto_interp.dataset_name,
@@ -304,9 +362,12 @@ def auto_interp():
             drop_last=False
         )
 
-        MAX_BATCHES = int(
-            cfg.evals.auto_interp.max_rows/cfg.evals.auto_interp.batch_size
-        )
+        if cfg.evals.auto_interp.max_rows == -1:
+            MAX_BATCHES = len(loader)
+        else:
+            MAX_BATCHES = int(
+                cfg.evals.auto_interp.max_rows/cfg.evals.auto_interp.batch_size
+            )
 
         # take only the first MAX_BATCHES batches
         limited_loader = islice(loader, MAX_BATCHES)
@@ -325,13 +386,11 @@ def auto_interp():
             current_vals['current_pad_mask'] = None         # clear reference
             current_vals['current_ex_offset'] += B
 
-        # from pprint import pprint
+        from pprint import pprint
         # pprint(topk_store)
-
-        # assert False
         adapters_pos_map = autointerp_collapse_heaps(topk_store)
 
-        # pprint(adapters_pos_map)
+        os.makedirs('temp', exist_ok=True)
         if cfg.evals.auto_interp.dump_generated:
             with open(
                 "temp/adapters_pos_map_topk.json", "w", encoding="utf-8"
@@ -341,19 +400,19 @@ def auto_interp():
                     indent=2, ensure_ascii=False
                 )
 
-        try:
-            with open('temp/lora_neuron_info.json', 'r') as f:
-                json_blob = json.load(f)
-            print('succesfully loaded neuron interp from cache')
-        except FileNotFoundError:
-            print('neuron interp not found in cache, regenerating...')
-            json_blob = autointerp_build_lora_json_with_responses(
-                adapters_pos_map,
-                flat_ds, tokenizer,
-                model="gpt-4o-mini",
-                include_cot=False,
-                include_few_shot=False
-            )
+        # try:
+        #     with open('temp/lora_neuron_info.json', 'r') as f:
+        #         json_blob = json.load(f)
+        #     print('succesfully loaded neuron interp from cache')
+        # except FileNotFoundError:
+        #    print('neuron interp not found in cache, regenerating...')
+        json_blob = autointerp_build_lora_json_with_responses(
+            adapters_pos_map,
+            flat_ds, tokenizer,
+            model="gpt-4o-mini",
+            include_cot=False,
+            include_few_shot=False
+        )
 
         activations = adapters_pos_map
         lora_info = json_blob

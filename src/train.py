@@ -1,5 +1,3 @@
-import wandb
-import torch
 from trl import (
     SFTTrainer,
     SFTConfig,
@@ -8,13 +6,20 @@ from trl import (
     setup_chat_format,
     extract_prompt
 )
+from itertools import islice
+from datasets import IterableDataset
+from datasets import Dataset
+import gc
+import wandb
+import torch
+from transformers import DataCollatorForLanguageModeling, DataCollatorWithPadding
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer
 from datasets import load_dataset
 from peft import LoraConfig, TaskType, get_peft_model
 import peft
 import time
 import os
-from src.models import TopKLoRALinear
+from src.models import TopKLoRALinear, MemoryClearCallback
 from src.utils import build_quant_config, get_conversational_dataset, hh_rlhf_preprocess_to_messages, is_valid_dpo_pair, merge_lora_adapter, preprocess_to_messages, violates_alternation
 from peft import PeftModelForCausalLM
 import numpy as np
@@ -146,14 +151,22 @@ def lukas_sft(cfg):
     )
     logging.info("Using quantisation: %s", quant_cfg)
 
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg.training.model.model_name,
-        # quantization doesn't work on Apple Metal
-        # quantization_config=quant_cfg if device != 'mps' else None,
-    ).to(device)
 
     if 'gemma' in cfg.training.model.name:
         tokenizer.padding_side = 'right'
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg.training.model.model_name,
+            attn_implementation='eager'
+            # quantization doesn't work on Apple Metal
+            # quantization_config=quant_cfg if device != 'mps' else None,
+        ).to(device)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg.training.model.model_name,
+            # quantization doesn't work on Apple Metal
+            # quantization_config=quant_cfg if device != 'mps' else None,
+        ).to(device)
+
 
     # Ensure chat template exists; attempt to copy from -it model.
     if not getattr(tokenizer, "chat_template", None):
@@ -186,19 +199,45 @@ def lukas_sft(cfg):
         except Exception as exc:  # noqa: BLE001
             logging.warning("Failed to copy -it tokenizer: %s", exc)
 
-    dataset = load_dataset(
-        cfg.training.sft_dataset.huggingface_dataset_id,
-        split=cfg.training.sft_dataset.split
-    )
+    # dataset = load_dataset(
+    #     cfg.training.sft_dataset.huggingface_dataset_id,
+    #     split=cfg.training.sft_dataset.split
+    # )
 
-    message_dataset = dataset.map(
-        preprocess_to_messages,
-        remove_columns=dataset.column_names,
-    )
+    # message_dataset = dataset.map(
+    #     preprocess_to_messages,
+    #     remove_columns=dataset.column_names,
+    # )
 
-    # TODO: why train test split if we set split in load_dataset?
-    message_dataset = message_dataset.train_test_split(test_size=0.1)
-    train_dataset, val_dataset = message_dataset["train"], message_dataset["test"]
+    # # TODO: why train test split if we set split in load_dataset?
+    # message_dataset = message_dataset.train_test_split(test_size=0.1)
+    # train_dataset, val_dataset = message_dataset["train"], message_dataset["test"]
+
+    def preprocessed_stream():
+        stream = load_dataset(
+            cfg.training.sft_dataset.huggingface_dataset_id,
+            split=cfg.training.sft_dataset.split,
+            streaming=True
+        )
+        for ex in stream:
+            msg = preprocess_to_messages(ex)
+            yield msg
+
+    def train_gen():
+        for idx, ex in enumerate(preprocessed_stream()):
+            if idx % 10 != 0:
+                yield ex
+
+    def eval_gen():
+        for idx, ex in enumerate(preprocessed_stream()):
+            if idx % 10 == 0:
+                yield ex
+    from datasets import IterableDataset
+    # TODO: again, why are we manually splitting if we can use the default split from huggingface?
+    train_dataset = IterableDataset.from_generator(train_gen)
+    eval_dataset  = IterableDataset.from_generator(eval_gen)
+
+
 
     # Determine EOT token (Gemma uses second additional special token)
     eot_token = (
@@ -263,8 +302,9 @@ def lukas_sft(cfg):
         args=training_args,
         processing_class=tokenizer,
         train_dataset=train_dataset,
-        eval_dataset=val_dataset,
+        eval_dataset=eval_dataset,
         peft_config=peft_config,
+        callbacks=[MemoryClearCallback()],
     )
 
     ft_model = trainer.model
@@ -290,16 +330,22 @@ def lukas_sft(cfg):
 
     logging.info(f"EOS: {str(trainer.processing_class.eos_token_id)}")
     # 1) Raw sample
-    sample = train_dataset[0]
-    logging.info("Sample messages: %s", sample["messages"])
+    # sample = train_dataset[0]
+    # logging.info("Sample messages: %s", sample["messages"])
 
     # 2) One batch from the Trainer’s dataloader
-    train_loader = trainer.get_train_dataloader()
-    batch = next(iter(train_loader))
-    logging.info("Batch keys: %s", list(batch.keys()))
-    logging.info("input_ids[0]: %s", batch["input_ids"][0])
-    logging.info("attention_mask[0]: %s", batch["attention_mask"][0])
-    logging.info("labels[0]:    %s", batch["labels"][0])
+    # train_loader = trainer.get_train_dataloader()
+    # batch = next(iter(train_loader))
+    # logging.info("Batch keys: %s", list(batch.keys()))
+    # logging.info("input_ids[0]: %s", batch["input_ids"][0])
+    # logging.info("attention_mask[0]: %s", batch["attention_mask"][0])
+    # logging.info("labels[0]:    %s", batch["labels"][0])
+
+    if trainer.optimizer is not None:
+        for state in trainer.optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.cpu()
 
     # ------------------------------- Training ------------------------------
     start_ts = time.time()
@@ -321,243 +367,243 @@ def lukas_sft(cfg):
     return trainer.model
 
 
-def lukas_dpo_old(cfg, model):
-    quant_cfg = build_quant_config(
-        cfg.training.quantization
-    )
-    logging.info("Using quantisation: %s", quant_cfg)
+# def lukas_dpo_old(cfg, model):
+#     quant_cfg = build_quant_config(
+#         cfg.training.quantization
+#     )
+#     logging.info("Using quantisation: %s", quant_cfg)
 
-    # if SFT ran before, model is not None
-    if model is None:
-        # otherwise, if just running DPO
-        # initialise model from scratch
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg.training.model.model_name,
-            # quantization doesn't work on Apple Metal
-            quantization_config=quant_cfg if device != 'mps' else None,
-        ).to(device)
+#     # if SFT ran before, model is not None
+#     if model is None:
+#         # otherwise, if just running DPO
+#         # initialise model from scratch
+#         model = AutoModelForCausalLM.from_pretrained(
+#             cfg.training.model.model_name,
+#             # quantization doesn't work on Apple Metal
+#             quantization_config=quant_cfg if device != 'mps' else None,
+#         ).to(device)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        cfg.training.model.model_name, fast=False
-    )
+#     tokenizer = AutoTokenizer.from_pretrained(
+#         cfg.training.model.model_name, fast=False
+#     )
 
-    if 'gemma' in cfg.training.model.name:
-        tokenizer.padding_side = "left"
-        tokenizer.truncation_side = "left"
-    elif 'llama' in cfg.training.model.name:
-        tokenizer.pad_token = tokenizer.eos_token
+#     if 'gemma' in cfg.training.model.name:
+#         tokenizer.padding_side = "left"
+#         tokenizer.truncation_side = "left"
+#     elif 'llama' in cfg.training.model.name:
+#         tokenizer.pad_token = tokenizer.eos_token
 
-    # copy chat template & special tokens if missing
-    if not getattr(tokenizer, "chat_template", None):
-        try:
-            toks_it = AutoTokenizer.from_pretrained(
-                cfg.training.model.model_it_name,
-                use_fast=False
-            )
-            if getattr(toks_it, "chat_template", None):
-                tokenizer.chat_template = toks_it.chat_template
-                logging.info("chat_template copied from -it model")
-            extra = toks_it.special_tokens_map.get(
-                "additional_special_tokens", []
-            )
-            new_tokens = [
-                t for t in extra
-                if t not in tokenizer.get_vocab()
-            ]
-            if new_tokens:
-                tokenizer.add_special_tokens(
-                    {"additional_special_tokens": new_tokens}
-                )
-                model.resize_token_embeddings(len(tokenizer))
-                logging.info("Added %d extra special tokens", len(new_tokens))
-        except Exception as exc:  # noqa: BLE001
-            logging.warning("Failed to copy -it tokenizer: %s", exc)
-    else:
-        print("Tokenizer already has a chat-template.")
+#     # copy chat template & special tokens if missing
+#     if not getattr(tokenizer, "chat_template", None):
+#         try:
+#             toks_it = AutoTokenizer.from_pretrained(
+#                 cfg.training.model.model_it_name,
+#                 use_fast=False
+#             )
+#             if getattr(toks_it, "chat_template", None):
+#                 tokenizer.chat_template = toks_it.chat_template
+#                 logging.info("chat_template copied from -it model")
+#             extra = toks_it.special_tokens_map.get(
+#                 "additional_special_tokens", []
+#             )
+#             new_tokens = [
+#                 t for t in extra
+#                 if t not in tokenizer.get_vocab()
+#             ]
+#             if new_tokens:
+#                 tokenizer.add_special_tokens(
+#                     {"additional_special_tokens": new_tokens}
+#                 )
+#                 model.resize_token_embeddings(len(tokenizer))
+#                 logging.info("Added %d extra special tokens", len(new_tokens))
+#         except Exception as exc:  # noqa: BLE001
+#             logging.warning("Failed to copy -it tokenizer: %s", exc)
+#     else:
+#         print("Tokenizer already has a chat-template.")
 
-    # ------------------ Dataset ------------------
-    print('Loading DPO dataset')
-    raw_dataset = load_dataset(
-        cfg.training.dpo_dataset.huggingface_dataset_id,
-        split=f'{cfg.training.dpo_dataset.split}[:10%]'
-    )
-    print('Dataset loaded')
-    # 1) HH string  →  chosen/rejected lists
-    msg_dataset = raw_dataset.map(
-        preprocess_to_messages,
-        remove_columns=raw_dataset.column_names
-    )
+#     # ------------------ Dataset ------------------
+#     print('Loading DPO dataset')
+#     raw_dataset = load_dataset(
+#         cfg.training.dpo_dataset.huggingface_dataset_id,
+#         split=f'{cfg.training.dpo_dataset.split}[:10%]'
+#     )
+#     print('Dataset loaded')
+#     # 1) HH string  →  chosen/rejected lists
+#     msg_dataset = raw_dataset.map(
+#         preprocess_to_messages,
+#         remove_columns=raw_dataset.column_names
+#     )
 
-    # 2) drop role‑alternation violations (code from previous answer)
-    msg_dataset = msg_dataset.filter(
-        lambda ex: not violates_alternation(ex["chosen"])
-        and not violates_alternation(ex["rejected"])
-    )
+#     # 2) drop role‑alternation violations (code from previous answer)
+#     msg_dataset = msg_dataset.filter(
+#         lambda ex: not violates_alternation(ex["chosen"])
+#         and not violates_alternation(ex["rejected"])
+#     )
 
-    # 3) ensure at least two turns and assistant‑ending
-    msg_dataset = msg_dataset.filter(
-        lambda ex: is_valid_dpo_pair(ex["chosen"])
-        and is_valid_dpo_pair(ex["rejected"])
-    )
+#     # 3) ensure at least two turns and assistant‑ending
+#     msg_dataset = msg_dataset.filter(
+#         lambda ex: is_valid_dpo_pair(ex["chosen"])
+#         and is_valid_dpo_pair(ex["rejected"])
+#     )
 
-    logging.info("Dataset after all filters: %d rows", len(msg_dataset))
+#     logging.info("Dataset after all filters: %d rows", len(msg_dataset))
 
-    # adds 'prompt' field expected by DPO
-    msg_dataset = msg_dataset.map(extract_prompt)
-    # TODO: again, why are we manually splitting if we can use the default split from huggingface?
-    msg_dataset = msg_dataset.train_test_split(test_size=0.1, seed=cfg.seed)
-    train_ds, eval_ds = msg_dataset["train"], msg_dataset["test"]
-    logging.info(train_ds)
+#     # adds 'prompt' field expected by DPO
+#     msg_dataset = msg_dataset.map(extract_prompt)
+#     # TODO: again, why are we manually splitting if we can use the default split from huggingface?
+#     msg_dataset = msg_dataset.train_test_split(test_size=0.1, seed=cfg.seed)
+#     train_ds, eval_ds = msg_dataset["train"], msg_dataset["test"]
+#     logging.info(train_ds)
 
-    eot_token = (
-        tokenizer.special_tokens_map.get(
-            "additional_special_tokens",
-            [tokenizer.eos_token]
-        )[1]
-        if len(tokenizer.special_tokens_map.get("additional_special_tokens", [])) > 1
-        else tokenizer.eos_token
-    )
-    model.generation_config.eos_token_id = [
-        model.generation_config.eos_token_id,
-        tokenizer.convert_tokens_to_ids(eot_token),
-    ]
-    logging.info("EOT token set to %s", eot_token)
+#     eot_token = (
+#         tokenizer.special_tokens_map.get(
+#             "additional_special_tokens",
+#             [tokenizer.eos_token]
+#         )[1]
+#         if len(tokenizer.special_tokens_map.get("additional_special_tokens", [])) > 1
+#         else tokenizer.eos_token
+#     )
+#     model.generation_config.eos_token_id = [
+#         model.generation_config.eos_token_id,
+#         tokenizer.convert_tokens_to_ids(eot_token),
+#     ]
+#     logging.info("EOT token set to %s", eot_token)
 
-    # ------------------ LoRA ------------------
-    topk_k = cfg.training.dpo_experiment.lora.k
-    peft_config = LoraConfig(
-        r=cfg.training.dpo_experiment.lora.r,
-        lora_alpha=cfg.training.dpo_experiment.lora.alpha,
-        lora_dropout=cfg.training.dpo_experiment.lora.dropout,
-        # getting NotImplementedError when bias set else than 'none' (?)
-        bias=cfg.training.dpo_experiment.lora.bias,
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=False,
-        target_modules=list(
-            cfg.training.dpo_experiment.lora.target_modules
-        ),
-    )
+#     # ------------------ LoRA ------------------
+#     topk_k = cfg.training.dpo_experiment.lora.k
+#     peft_config = LoraConfig(
+#         r=cfg.training.dpo_experiment.lora.r,
+#         lora_alpha=cfg.training.dpo_experiment.lora.alpha,
+#         lora_dropout=cfg.training.dpo_experiment.lora.dropout,
+#         # getting NotImplementedError when bias set else than 'none' (?)
+#         bias=cfg.training.dpo_experiment.lora.bias,
+#         task_type=TaskType.CAUSAL_LM,
+#         inference_mode=False,
+#         target_modules=list(
+#             cfg.training.dpo_experiment.lora.target_modules
+#         ),
+#     )
 
-    # Apply standard LoRA to model
-    model = get_peft_model(model, peft_config)
+#     # Apply standard LoRA to model
+#     model = get_peft_model(model, peft_config)
 
-    if cfg.training.dpo_experiment.lora.top_k_experiment:
-        # ── Inject Top-k masking ------------------------------------------------
-        replaced = 0
-        for name, module in model.named_modules():
-            # print(isinstance(module, lora.Linear), module)
-            print(type(module), module)
-            if isinstance(module, peft.tuners.lora.layer.Linear) and hasattr(module, "lora_dropout"):
-                parent = model.get_submodule(".".join(name.split(".")[:-1]))
-                setattr(
-                    parent, name.split(".")[-1],
-                    TopKLoRALinear(
-                        module, r=peft_config.r,
-                        alpha=peft_config.lora_alpha,
-                        k=topk_k
-                    )
-                )
-                replaced += 1
-        logging.info("TopKLoRALinear injected in %d layers", replaced)
-        assert False
+#     if cfg.training.dpo_experiment.lora.top_k_experiment:
+#         # ── Inject Top-k masking ------------------------------------------------
+#         replaced = 0
+#         for name, module in model.named_modules():
+#             # print(isinstance(module, lora.Linear), module)
+#             print(type(module), module)
+#             if isinstance(module, peft.tuners.lora.layer.Linear) and hasattr(module, "lora_dropout"):
+#                 parent = model.get_submodule(".".join(name.split(".")[:-1]))
+#                 setattr(
+#                     parent, name.split(".")[-1],
+#                     TopKLoRALinear(
+#                         module, r=peft_config.r,
+#                         alpha=peft_config.lora_alpha,
+#                         k=topk_k
+#                     )
+#                 )
+#                 replaced += 1
+#         logging.info("TopKLoRALinear injected in %d layers", replaced)
+#         assert False
 
-    model_str = f'{cfg.training.model.name}_{cfg.training.model.version}_{cfg.training.model.size}'
-    dpo_cfg = DPOConfig(
-        max_prompt_length=cfg.training.dpo.max_prompt_length,
-        max_completion_length=cfg.training.dpo.max_completion_length,
-        beta=cfg.training.dpo.beta,
-        loss_type=cfg.training.dpo.loss_type,
-        num_train_epochs=cfg.training.dpo.num_train_epochs,
-        max_steps=cfg.training.dpo.max_steps,
-        per_device_train_batch_size=cfg.training.dpo.per_device_train_batch_size,
-        per_device_eval_batch_size=cfg.training.dpo.per_device_eval_batch_size,
-        gradient_accumulation_steps=cfg.training.dpo.gradient_accumulation_steps,
-        gradient_checkpointing=cfg.training.dpo.gradient_checkpointing,
-        optim=cfg.training.dpo.optim,
-        learning_rate=cfg.training.dpo.learning_rate,
-        warmup_ratio=cfg.training.dpo.warmup_ratio,
-        lr_scheduler_type=cfg.lr_scheduler.type,
-        bf16=cfg.training.dpo.bf16,
-        fp16=cfg.training.dpo.fp16,
-        max_grad_norm=cfg.training.dpo.max_grad_norm,
-        logging_steps=cfg.logger.logging_steps,
-        save_strategy=cfg.training.dpo.save_strategy,
-        save_steps=cfg.training.dpo.save_steps,
-        save_total_limit=cfg.training.dpo.save_total_limit,
-        # eval_strategy=cfg.training.dpo.eval_strategy,
-        # eval_steps=cfg.training.dpo.eval_steps,
-        report_to=cfg.logger.report_to,
-        output_dir=f'experiments/{model_str}_dpo',
-        logging_dir=f'experiments/{model_str}_dpo/logs',
-        do_eval=False
-    )
+#     model_str = f'{cfg.training.model.name}_{cfg.training.model.version}_{cfg.training.model.size}'
+#     dpo_cfg = DPOConfig(
+#         max_prompt_length=cfg.training.dpo.max_prompt_length,
+#         max_completion_length=cfg.training.dpo.max_completion_length,
+#         beta=cfg.training.dpo.beta,
+#         loss_type=cfg.training.dpo.loss_type,
+#         num_train_epochs=cfg.training.dpo.num_train_epochs,
+#         max_steps=cfg.training.dpo.max_steps,
+#         per_device_train_batch_size=cfg.training.dpo.per_device_train_batch_size,
+#         per_device_eval_batch_size=cfg.training.dpo.per_device_eval_batch_size,
+#         gradient_accumulation_steps=cfg.training.dpo.gradient_accumulation_steps,
+#         gradient_checkpointing=cfg.training.dpo.gradient_checkpointing,
+#         optim=cfg.training.dpo.optim,
+#         learning_rate=cfg.training.dpo.learning_rate,
+#         warmup_ratio=cfg.training.dpo.warmup_ratio,
+#         lr_scheduler_type=cfg.lr_scheduler.type,
+#         bf16=cfg.training.dpo.bf16,
+#         fp16=cfg.training.dpo.fp16,
+#         max_grad_norm=cfg.training.dpo.max_grad_norm,
+#         logging_steps=cfg.logger.logging_steps,
+#         save_strategy=cfg.training.dpo.save_strategy,
+#         save_steps=cfg.training.dpo.save_steps,
+#         save_total_limit=cfg.training.dpo.save_total_limit,
+#         eval_strategy=cfg.training.dpo.eval_strategy,
+#         eval_steps=cfg.training.dpo.eval_steps,
+#         report_to=cfg.logger.report_to,
+#         output_dir=f'experiments/{model_str}_dpo',
+#         logging_dir=f'experiments/{model_str}_dpo/logs',
+#         do_eval=False
+#     )
 
-    trainer = DPOTrainer(
-        model=model,
-        ref_model=None,       # frozen copy auto‑created
-        args=dpo_cfg,
-        peft_config=None,           # already applied
-        train_dataset=train_ds,
-        eval_dataset=None,
-        processing_class=tokenizer,
-    )
+#     trainer = DPOTrainer(
+#         model=model,
+#         ref_model=None,       # frozen copy auto‑created
+#         args=dpo_cfg,
+#         peft_config=None,           # already applied
+#         train_dataset=train_ds,
+#         eval_dataset=eval_ds,
+#         processing_class=tokenizer,
+#     )
 
-    # TODO: is this necessary?
-    # for name, module in model.named_modules():
-    #     if "11" in name and isinstance(module, torch.nn.Linear):
-    #         logging.info(name)
+#     # TODO: is this necessary?
+#     # for name, module in model.named_modules():
+#     #     if "11" in name and isinstance(module, torch.nn.Linear):
+#     #         logging.info(name)
 
-    # ------------------ Sanity check ------------------
-    # SAFE: log the first chosen conversation
-    # for i in range(10):
-    #     sample = trainer.train_dataset[i]
+#     # ------------------ Sanity check ------------------
+#     # SAFE: log the first chosen conversation
+#     # for i in range(10):
+#     #     sample = trainer.train_dataset[i]
 
-    #     # Decode each field
-    #     prompt_text = tokenizer.decode(
-    #         sample['prompt_input_ids'],
-    #         skip_special_tokens=True
-    #     )
-    #     chosen_text = tokenizer.decode(
-    #         sample['chosen_input_ids'],
-    #         skip_special_tokens=True
-    #     )
-    #     rejected_text = tokenizer.decode(
-    #         sample['rejected_input_ids'],
-    #         skip_special_tokens=True
-    #     )
+#     #     # Decode each field
+#     #     prompt_text = tokenizer.decode(
+#     #         sample['prompt_input_ids'],
+#     #         skip_special_tokens=True
+#     #     )
+#     #     chosen_text = tokenizer.decode(
+#     #         sample['chosen_input_ids'],
+#     #         skip_special_tokens=True
+#     #     )
+#     #     rejected_text = tokenizer.decode(
+#     #         sample['rejected_input_ids'],
+#     #         skip_special_tokens=True
+#     #     )
 
-    #     logging.info("Prompt:")
-    #     logging.info(prompt_text)
-    #     logging.info("\nChosen:")
-    #     logging.info(chosen_text)
-    #     logging.info("\nRejected:")
-    #     logging.info(rejected_text)
+#     #     logging.info("Prompt:")
+#     #     logging.info(prompt_text)
+#     #     logging.info("\nChosen:")
+#     #     logging.info(chosen_text)
+#     #     logging.info("\nRejected:")
+#     #     logging.info(rejected_text)
 
-    # ------------------ Training ------------------
-    start = time.time()
-    trainer.train()
-    logging.info("Training finished in %.1f min", (time.time() - start) / 60)
+#     # ------------------ Training ------------------
+#     start = time.time()
+#     trainer.train()
+#     logging.info("Training finished in %.1f min", (time.time() - start) / 60)
 
-    # ------------------ Saving ------------------
-    out_path = os.path.join(f'experiments/{model_str}_dpo', "final_adapter")
-    trainer.model.to('cpu')
-    trainer.save_model(out_path)
-    trainer.model.save_pretrained(
-        f'adapters/dpo/{cfg.training.dpo_experiment.lora.r}-{cfg.training.dpo_experiment.lora.alpha}-'
-        f'{cfg.training.dpo_experiment.lora.dropout}/{cfg.training.dpo_dataset.name}/'
-        f'{"-".join(cfg.training.dpo_experiment.lora.target_modules)}'
-    )
-    logging.info("Adapter saved to %s", out_path)
-    wandb.finish()
+#     # ------------------ Saving ------------------
+#     out_path = os.path.join(f'experiments/{model_str}_dpo', "final_adapter")
+#     trainer.model.to('cpu')
+#     trainer.save_model(out_path)
+#     trainer.model.save_pretrained(
+#         f'adapters/dpo/{cfg.training.dpo_experiment.lora.r}-{cfg.training.dpo_experiment.lora.alpha}-'
+#         f'{cfg.training.dpo_experiment.lora.dropout}/{cfg.training.dpo_dataset.name}/'
+#         f'{"-".join(cfg.training.dpo_experiment.lora.target_modules)}'
+#     )
+#     logging.info("Adapter saved to %s", out_path)
+#     wandb.finish()
 
-    return trainer.model
+#     return trainer.model
 
 
 def lukas_dpo(cfg, model):
-    quant_cfg = build_quant_config(
-        cfg.training.quantization
-    )
-    logging.info("Using quantisation: %s", quant_cfg)
+    # quant_cfg = build_quant_config(
+    #     cfg.training.quantization
+    # )
+    # logging.info("Using quantisation: %s", quant_cfg)
 
     # if SFT ran before, model is not None
     if model is None:
@@ -565,9 +611,12 @@ def lukas_dpo(cfg, model):
         # initialise model from scratch
         model = AutoModelForCausalLM.from_pretrained(
             cfg.training.model.model_name,
+            device_map="auto",
+            torch_dtype=torch.bfloat16,
             # quantization doesn't work on Apple Metal
             # quantization_config=quant_cfg if device != 'mps' else None,
-        ).to(device)
+        )
+
 
     tokenizer = AutoTokenizer.from_pretrained(
         cfg.training.model.model_name, fast=False
@@ -608,43 +657,49 @@ def lukas_dpo(cfg, model):
         print("Tokenizer already has a chat-template.")
 
     print('Loading DPO dataset')
-    raw_dataset = load_dataset(
-        cfg.training.dpo_dataset.huggingface_dataset_id,
-        split=f'{cfg.training.dpo_dataset.split}[:10%]'
-    )
+    # raw_dataset = load_dataset(
+    #     cfg.training.dpo_dataset.huggingface_dataset_id,
+    #     split=f'{cfg.training.dpo_dataset.split}',
+    #     streaming=True
+    # )
+    #.take(100)
+    # raw_dataset = Dataset.from_list(raw_dataset[:100])
     print('Dataset loaded')
-    # 1) HH string  →  chosen/rejected lists
-    msg_dataset = raw_dataset.map(
-        hh_rlhf_preprocess_to_messages,
-        remove_columns=raw_dataset.column_names
-    )
 
-    # 2) drop role‑alternation violations (code from previous answer)
-    msg_dataset = msg_dataset.filter(
-        lambda ex: not violates_alternation(ex["chosen"])
-        and not violates_alternation(ex["rejected"])
-    )
 
-    # 3) ensure at least two turns and assistant‑ending
-    msg_dataset = msg_dataset.filter(
-        lambda ex: is_valid_dpo_pair(ex["chosen"])
-        and is_valid_dpo_pair(ex["rejected"])
-    )
 
-    logging.info("Dataset after all filters: %d rows", len(msg_dataset))
+    def preprocessed_stream():
+        stream = load_dataset(
+            cfg.training.dpo_dataset.huggingface_dataset_id,
+            split=cfg.training.dpo_dataset.split,
+            streaming=True
+        )
+        for ex in stream:
+            msg = hh_rlhf_preprocess_to_messages(ex)
+            # Skip if *either* chosen or rejected has a role-alternation violation
+            if violates_alternation(msg["chosen"]) or violates_alternation(msg["rejected"]):
+                continue
 
-    # adds 'prompt' field expected by DPO
-    msg_dataset = msg_dataset.map(extract_prompt)
+            # Skip if either side isn’t a valid DPO pair
+            if not is_valid_dpo_pair(msg["chosen"]) or not is_valid_dpo_pair(msg["rejected"]):
+                continue
+
+            # Now it’s safe to extract and yield
+            yield extract_prompt(msg)
+
+    def train_gen():
+        for idx, ex in enumerate(preprocessed_stream()):
+            if idx % 10 != 0:
+                yield ex
+
+    def eval_gen():
+        for idx, ex in enumerate(preprocessed_stream()):
+            if idx % 10 == 0:
+                yield ex
+    from datasets import IterableDataset
     # TODO: again, why are we manually splitting if we can use the default split from huggingface?
-    msg_dataset = msg_dataset.train_test_split(
-        test_size=0.1, seed=cfg.seed
-    )
-    train_ds, eval_ds = msg_dataset["train"], msg_dataset["test"]
-    logging.info(
-        "Dataset after filters: %d rows",
-        len(train_ds) + len(eval_ds)
-    )
-    logging.info(train_ds)
+    train_ds = IterableDataset.from_generator(train_gen)
+    eval_ds  = IterableDataset.from_generator(eval_gen)
 
     eot_token = (
         tokenizer.special_tokens_map.get(
@@ -667,12 +722,14 @@ def lukas_dpo(cfg, model):
         cfg.training.model.model_name,
         cfg.training.adapter.checkpoint_dir,
         f'experiments/merged/{cfg.training.model.model_name}_sft',
-        save_merged_model=True
-    )
+        save_merged_model=True,
+        device_map={"": "cpu"}
+    ).to('cpu')
 
-    # ref_model = AutoModelForCausalLM.from_pretrained(
-    #     cfg["model_name"], quantization_config=quant_cfg, device_map="auto"
-    # )
+    for param in ref_model.parameters():
+        param.requires_grad = False
+
+    ref_model.eval()
 
     # LoRA config + record k
     lcfg = cfg.training.dpo_experiment.lora
@@ -692,6 +749,7 @@ def lukas_dpo(cfg, model):
     peft_cfg.k = topk_k  # record Top-k in adapter_config.json
 
     # Apply LoRA
+    model.eval()
     model = get_peft_model(model, peft_cfg)
     print(model)
 
@@ -737,16 +795,56 @@ def lukas_dpo(cfg, model):
         save_strategy=dargs.save_strategy,
         save_steps=dargs.save_steps,
         save_total_limit=dargs.save_total_limit,
-        # eval_strategy=dargs.eval_strategy,
-        # eval_steps=dargs.eval_steps,
+        padding_value=tokenizer.pad_token_id,
+        eval_strategy=dargs.eval_strategy,
+        eval_steps=dargs.eval_steps,
         report_to=cfg.logger.report_to,
         output_dir=f'experiments/{model_str}_dpo',
         logging_dir=f'experiments/{model_str}_dpo/logs',
-        do_eval=False,
+        do_eval=dargs.do_eval,
     )
 
-    # from pprint import pprint
-    # pprint(dpo_cfg)
+    def collate_fn(batch):
+        """
+        Pads every example in `batch` to exactly `max_seq_len` tokens
+        for prompt, chosen, and rejected separately.
+        """
+        B = len(batch)
+        pad_id = tokenizer.pad_token_id
+        max_seq_len = cfg.training.dpo.max_prompt_length + cfg.training.dpo.max_completion_length
+
+        # allocate fixed‐size tensors
+        # prompts
+        prompt_ids   = torch.full((B, max_seq_len), pad_id, dtype=torch.long)
+        prompt_mask  = torch.zeros((B, max_seq_len), dtype=torch.long)
+        # chosen completions
+        chosen_ids   = torch.full((B, max_seq_len), pad_id, dtype=torch.long)
+        chosen_mask  = torch.zeros((B, max_seq_len), dtype=torch.long)
+        # rejected completions
+        rejected_ids  = torch.full((B, max_seq_len), pad_id, dtype=torch.long)
+        rejected_mask = torch.zeros((B, max_seq_len), dtype=torch.long)
+
+        for i, ex in enumerate(batch):
+            p = ex["prompt_input_ids"]
+            c = ex["chosen_input_ids"]
+            r = ex["rejected_input_ids"]
+            # copy and mask
+            prompt_ids[i, : len(p)]   = torch.tensor(p, dtype=torch.long)
+            prompt_mask[i, : len(p)]  = 1
+            chosen_ids[i, : len(c)]   = torch.tensor(c, dtype=torch.long)
+            chosen_mask[i, : len(c)]  = 1
+            rejected_ids[i, : len(r)] = torch.tensor(r, dtype=torch.long)
+            rejected_mask[i, : len(r)]= 1
+
+        return {
+            "prompt_input_ids":        prompt_ids,
+            "prompt_attention_mask":   prompt_mask,
+            "chosen_input_ids":        chosen_ids,
+            "chosen_attention_mask":   chosen_mask,
+            "rejected_input_ids":      rejected_ids,
+            "rejected_attention_mask": rejected_mask,
+        }
+
     # Trainer setup
     trainer = DPOTrainer(
         model=model,
@@ -754,9 +852,17 @@ def lukas_dpo(cfg, model):
         args=dpo_cfg,
         peft_config=None,
         train_dataset=train_ds,
-        eval_dataset=None,
+        eval_dataset=eval_ds,
         processing_class=tokenizer,
+        data_collator=collate_fn,
+        callbacks=[MemoryClearCallback()],
     )
+
+    if trainer.optimizer is not None:
+        for state in trainer.optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.cpu()
 
     # Train
     t0 = time.time()
