@@ -105,7 +105,8 @@ def merge_lora_adapter(
     # 3. Load the LoRA adapter on top of the base model
     model_with_lora = PeftModel.from_pretrained(
         base_model,
-        lora_checkpoint_dir
+        lora_checkpoint_dir, 
+        use_safetensors=True
     )
 
     # 4. Merge LoRA weights into the base model
@@ -230,7 +231,6 @@ def hh_string_to_messages(text: str) -> List[Dict[str, str]]:
 
 def hh_rlhf_preprocess_to_messages(example: Dict[str, Any]) -> Dict[str, Any]:
     """Map HH‑RLHF record → {'chosen': [...], 'rejected': [...]} chat lists."""
-    print(example)
     return {
         "chosen":   hh_string_to_messages(example["chosen"]),
         "rejected": hh_string_to_messages(example["rejected"]),
@@ -272,6 +272,7 @@ def autointerp_make_topk_hook(
       • stores top-k_heap examples per (layer, neuron, sign) in `topk_store`.
     """
     def _hook(module, inp, _):
+        # print('hook')
         # global: dataset row index of batch[0]
         ex_offset = current_vals['current_ex_offset']
         # (B, L) bool, True = real token
@@ -328,6 +329,7 @@ def autointerp_make_topk_hook(
                     sign = "pos" if raw_val >= 0 else "neg"
                     # TODO: make topk_store part of local frame
                     #       let's not rely on global state
+                    # print('here')
                     heap = topk_store[module_name][n_idx][sign]
 
                     mag = abs(raw_val)
@@ -717,7 +719,7 @@ def autointerp_build_lora_json_with_responses(
     tokenizer,
     *,
     window: int = 32,
-    model: str = "gpt-4o-mini",
+    model: str = "gpt-4o",
     include_cot: bool = False,
     include_few_shot: bool = False,
     temperature: float = 0.0,

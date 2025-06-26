@@ -1,8 +1,9 @@
+from transformers import TrainerCallback
 from peft.tuners.lora import LoraLayer
 import torch.nn.functional as F
 import torch.nn as nn
 import torch
-
+import gc
 
 # ────────────────────────────────────────────────────────────────────────────
 # Top-k LoRA module  ── self-contained for convenience
@@ -35,7 +36,17 @@ class TopKLoRALinear(nn.Module):
         self.layer_name = layer_name
         print(f"Using a TopK LoRA Adapter with r: {self.r}, k: {self.k}")
 
+    @property
+    def active_adapter(self):
+        return getattr(self.lora_module, "active_adapter", None)
+
+    @property
+    def lora_A(self):
+        return self.lora_module.lora_A
+
+
     def forward(self, x: torch.Tensor):
+        # print(f"[TopKLoRALinear] Called on input with shape {x.shape}")
         # match dtype for mixed precision
         A = self.A.to(dtype=x.dtype, device=x.device)
         B = self.B.to(dtype=x.dtype, device=x.device)
@@ -46,3 +57,11 @@ class TopKLoRALinear(nn.Module):
         out = self.base_layer(x)
         out += F.linear(z, B) * self.scale
         return out
+
+
+class MemoryClearCallback(TrainerCallback):
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % 10 == 0:
+            gc.collect()
+            torch.cuda.empty_cache()
+        return control

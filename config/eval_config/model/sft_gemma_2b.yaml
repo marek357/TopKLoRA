@@ -4,4 +4,4 @@ size: "2B"
 type: sft_model
 k: 16
 base_model: "google/gemma-2b"
-adapter_checkpoint_dir: "/Users/remak/Documents/misc/lora_dpo/experiments/gemma_1.0_2B_sft/final_adapter"
+adapter_checkpoint_dir: "/home/cvenhoff/lora_interp/experiments/gemma_1.0_2B_sft/final_adapter"
