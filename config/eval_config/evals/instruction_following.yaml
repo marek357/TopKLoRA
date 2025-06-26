@@ -1,0 +1,3 @@
+name: instruction_following
+build_eval_function:
+  _target_: src.evals.instruction_following

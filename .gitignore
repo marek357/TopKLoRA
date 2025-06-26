@@ -185,3 +185,12 @@ output/
 *.safetensors
 *.pt
 *.pth
+outputs/
+helpfulness/
+activations/
+adapters/
+eval_outputs/
+models/
+temp/
+lora_neuron_info.json
+adapters_pos_map_topk.json

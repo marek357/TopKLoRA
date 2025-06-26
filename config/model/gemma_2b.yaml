@@ -1,5 +1,0 @@
-name: "gemma"
-version: 1.0
-size: "2B"
-model_name: "google/gemma-2b"
-model_it_name: "google/gemma-2b-it"

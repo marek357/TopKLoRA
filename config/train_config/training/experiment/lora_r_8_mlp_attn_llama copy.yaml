@@ -1,0 +1,11 @@
+size: "medium"
+lora:
+  r: 8
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    - "mlp.gate_proj"
+    - "mlp.down_proj"
+    - "mlp.up_proj"
+    - "q_proj"
+    - "k_proj"

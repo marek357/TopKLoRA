@@ -1,20 +1,37 @@
+from dotenv import load_dotenv
 import wandb
 import torch
 import hydra
 import random
 import numpy as np
-from trl import setup_chat_format
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from src.train import run_sft, run_dpo
-from peft import LoraConfig, TaskType
+from transformers import set_seed
+from src.train import lukas_dpo, lukas_sft, run_sft, run_dpo
 from omegaconf import DictConfig, OmegaConf
+import logging
+
+from src.utils import merge_lora_adapter
 
 
-@hydra.main(version_base=None, config_path="config", config_name="default")
+@hydra.main(
+    version_base=None,
+    config_path="config/train_config",
+    config_name="default"
+)
 def main(cfg: DictConfig):
+    load_dotenv()
+
     torch.manual_seed(cfg.seed)
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
+    set_seed(cfg.get("seed", 42))
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y‑%m‑%d %H:%M:%S",
+    )
+    logging.info("Loaded configuration:")
+    logging.info(cfg)
 
     wandb.init(
         project=cfg.logger.project,
@@ -24,37 +41,24 @@ def main(cfg: DictConfig):
         mode=cfg.logger.wandb_mode  # NOTE: disabled by default
     )
 
-    peft_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=False,
-        r=cfg.experiment.lora.r,
-        target_modules=list(cfg.experiment.lora.target_modules),
-        lora_alpha=cfg.experiment.lora.alpha,
-        lora_dropout=cfg.experiment.lora.dropout
-    )
-
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model.huggingface_model_id)
+    model = None
 
     if cfg.training.sft.enabled:
-        model = run_sft(cfg, peft_config, tokenizer)
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg.model.huggingface_model_id
-        )
-        try:
-            model, tokenizer = setup_chat_format(
-                model=model, tokenizer=tokenizer
-            )
-        except ValueError:
-            pass
-        model.load_adapter(
-            f'adapters/sft/{cfg.experiment.lora.r}-{cfg.experiment.lora.alpha}-'
-            f'{cfg.experiment.lora.dropout}/{cfg.dataset_sft.name}/'
-            f'{"-".join(cfg.experiment.lora.target_modules)}'
-        )
+        model = lukas_sft(cfg)
 
     if cfg.training.dpo.enabled:
-        run_dpo(cfg, peft_config, tokenizer, model)
+        print('Loading and merging LoRA adapter from checkpoint')
+        model = merge_lora_adapter(
+            cfg.training.model.model_name,
+            cfg.training.adapter.checkpoint_dir,
+            f'experiments/merged/{cfg.training.model.model_name}_sft',
+            save_merged_model=True
+        )
+
+        model = lukas_dpo(cfg, model)
+
+    if cfg.training.dump_trained_model:
+        model.save_pretrained(cfg.training.dump_path)
 
 
 if __name__ == '__main__':

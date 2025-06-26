@@ -1,6 +1,0 @@
-wandb_mode: "disabled"
-project: "llm-lora-dpo"
-entity: "my-entity"
-log_model: False
-logging_steps: 10
-report_to: "wandb"

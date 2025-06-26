@@ -1,0 +1,16 @@
+name: auto-interpret
+layer_idx: 11
+k_heap: 50
+ax_topk: 64
+batch_size: 8
+max_rows: 1024
+context_size_each_side: 10
+dump_generated: True
+dump_analysis: True
+dataset_name: "Anthropic/hh-rlhf"
+sleep_sec: 0.5
+chat_model: "gpt-4o"
+chat_model_temperature: 0.0
+chat_system_prompt: "You are a helpful assistant."
+build_eval_function:
+  _target_: src.evals.auto_interp

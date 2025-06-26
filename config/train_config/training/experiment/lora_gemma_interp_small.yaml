@@ -1,0 +1,16 @@
+size: "medium"
+lora:
+  r: 1024
+  bias: 'none'
+  alpha: 1024
+  dropout: 0.05
+  top_k_experiment: True
+  k: 8
+  target_modules:
+    - layers.11.self_attn.q_proj
+    - layers.11.self_attn.k_proj
+    - layers.11.self_attn.v_proj
+    - layers.11.self_attn.o_proj
+    - layers.11.mlp.gate_proj
+    - layers.11.mlp.up_proj
+    - layers.11.mlp.down_proj

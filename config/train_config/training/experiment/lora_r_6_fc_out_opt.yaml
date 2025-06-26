@@ -1,0 +1,8 @@
+size: "small"
+lora:
+  r: 6
+  alpha: 12
+  dropout: 0.05
+  target_modules:
+    - "fc1"
+    - "fc2"

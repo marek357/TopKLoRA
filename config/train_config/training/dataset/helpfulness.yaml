@@ -1,0 +1,3 @@
+name: "helpfulness"
+huggingface_dataset_id: "trl-lib/ultrafeedback-gpt-3.5-turbo-helpfulness"
+split: train
