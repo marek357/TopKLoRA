@@ -13,6 +13,7 @@ from datasets import (
     load_dataset,
     concatenate_datasets
 )
+from src.analysis import analyse_model
 import torch.nn.functional as F
 from peft import PeftModel
 from torch.utils.data import DataLoader
@@ -23,12 +24,14 @@ from tqdm import tqdm
 import evaluate
 import torch
 import os
+import logging
 from src.utils import (
     AutointerpChatCollator,
     analyze_text_toxicity_eval,
     autointerp_build_activation_prompt,
     autointerp_build_dataset,
     autointerp_build_lora_json_with_responses,
+    autointerp_build_lora_json_with_responses_local,
     autointerp_build_prompt,
     autointerp_collapse_heaps,
     autointerp_evaluate,
@@ -48,14 +51,29 @@ device = 'cuda' if torch.cuda.is_available() else \
 
 import hashlib
 
+# def hash_lora_weights(model):
+#     import hashlib
+#     sha = hashlib.sha256()
+#     for name, module in model.named_modules():
+#         if isinstance(module, TopKLoRALinear):
+#             for pname, param in module.lora_module.named_parameters():
+#                 sha.update(param.detach().cpu().numpy().tobytes())
+#     return sha.hexdigest()
+
 def hash_lora_weights(model):
-    import hashlib
     sha = hashlib.sha256()
     for name, module in model.named_modules():
         if isinstance(module, TopKLoRALinear):
             for pname, param in module.lora_module.named_parameters():
-                sha.update(param.detach().cpu().numpy().tobytes())
+                # pull to CPU once
+                tensor = param.detach().cpu()
+                # numpy() doesn’t support bfloat16 or float16 — cast if needed
+                if tensor.dtype in (torch.bfloat16, torch.float16):
+                    tensor = tensor.to(torch.float32)
+                # now safe to get the raw bytes
+                sha.update(tensor.numpy().tobytes())
     return sha.hexdigest()
+
 
 def init_model_tokenizer(model_cfg, auto_interp=False):
     print('Initialising a model for eval...')
@@ -70,6 +88,37 @@ def init_model_tokenizer(model_cfg, auto_interp=False):
         torch_dtype="auto",
         device_map="cpu"
     )
+
+    if not getattr(tokenizer, "chat_template", None) and not auto_interp:
+        logging.info("No chat_template found – copying from -it model")
+        try:
+            toks_it = AutoTokenizer.from_pretrained(
+                model_cfg.model_it_name,
+                use_fast=False
+            )
+            if getattr(toks_it, "chat_template", None):
+                tokenizer.chat_template = toks_it.chat_template
+                logging.info("chat_template copied successfully")
+            # Merge additional special tokens if needed
+            extra = toks_it.special_tokens_map.get(
+                "additional_special_tokens", []
+            )
+            if extra:
+                new_tokens = [
+                    t for t in extra if t not in tokenizer.get_vocab()
+                ]
+                if new_tokens:
+                    tokenizer.add_special_tokens(
+                        {"additional_special_tokens": new_tokens}
+                    )
+                    model.resize_token_embeddings(len(tokenizer))
+                    logging.info(
+                        "Added %d extra special tokens",
+                        len(new_tokens)
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Failed to copy -it tokenizer: %s", exc)
+
 
     model = PeftModel.from_pretrained(
         model,
@@ -94,27 +143,16 @@ def init_model_tokenizer(model_cfg, auto_interp=False):
                 r=module.r,
                 alpha=module.lora_alpha,
                 k=model_cfg.k,
+                autointerp_evaluation_mode=auto_interp
             )
             setattr(parent, attr, wrapped)
             replaced += 1
     print(f"Wrapped {replaced} LoraLayer modules into TopKLoRALinear.")
     model.to(device)
     model.eval()
-    # print(model)
-
-    # adapter_path = Path(model_cfg.adapter_checkpoint_dir)
-    # if (adapter_path / "adapter_model.safetensors").exists():
-    #     from safetensors.torch import load_file
-    #     adapter_weights = load_file(str(adapter_path / "adapter_model.safetensors"))
-    #     model.load_state_dict(adapter_weights, strict=False)
-    #     print("Loaded adapter weights from safetensors manually.")
-    # else:
-    #     print("WARNING: adapter_model.safetensors not found at path:", adapter_path)
-
 
     print(f"Loaded adapter from: {model_cfg.adapter_checkpoint_dir}")
     print(f"Adapter SHA256 hash: {hash_lora_weights(model)}")
-    # assert False
 
     def debug_lora_weights(model):
         total_params = 0
@@ -133,14 +171,53 @@ def init_model_tokenizer(model_cfg, auto_interp=False):
             wrapped_modules[name] = module
 
 
-    if 'gemma' in model_cfg.name:
-        tokenizer.padding_side = "left"
-        tokenizer.truncation_side = "left"
-        model.generation_config.eos_token_id = [1, 107]
-        model.generation_config.max_length = 512
 
-    elif 'llama' in model_cfg.name:
-        tokenizer.pad_token = tokenizer.eos_token
+    eot_token = (
+        tokenizer.special_tokens_map.get(
+            "additional_special_tokens", [tokenizer.eos_token])[1]
+        if len(tokenizer.special_tokens_map.get("additional_special_tokens", [])) > 1
+        else tokenizer.eos_token
+    )
+    
+    # Convert to ID
+    eot_token_id = tokenizer.convert_tokens_to_ids(eot_token)
+    
+    # Get the base EOS token ID
+    base_eos_token_id = tokenizer.eos_token_id
+    
+    # Update generation config with both EOS and EOT tokens
+    if hasattr(model.generation_config, 'eos_token_id'):
+        # Create a list of both tokens
+        eos_token_ids = []
+        
+        # Add base EOS token
+        if isinstance(base_eos_token_id, list):
+            eos_token_ids.extend(base_eos_token_id)
+        else:
+            eos_token_ids.append(base_eos_token_id)
+        
+        # Add EOT token if it's different
+        if eot_token_id not in eos_token_ids:
+            eos_token_ids.append(eot_token_id)
+        
+        model.generation_config.eos_token_id = eos_token_ids
+    else:
+        model.generation_config.eos_token_id = [base_eos_token_id, eot_token_id]
+    
+    # Log the configuration
+    print(f"EOT token: '{eot_token}' (ID: {eot_token_id})")
+    print(f"EOS token ID(s): {model.generation_config.eos_token_id}")
+
+
+
+    # if 'gemma' in model_cfg.name:
+    #     tokenizer.padding_side = "left"
+    #     tokenizer.truncation_side = "left"
+    #     model.generation_config.eos_token_id = [1, 107]
+    #     model.generation_config.max_length = 512
+
+    # elif 'llama' in model_cfg.name:
+    #     tokenizer.pad_token = tokenizer.eos_token
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -149,21 +226,6 @@ def init_model_tokenizer(model_cfg, auto_interp=False):
         return model, tokenizer, wrapped_modules
     else:
         return model, tokenizer
-
-
-# Final accuracy summary (SFT)
-# overall: 67.873%
-# harmless: 62.069%
-# helpful: 72.881%
-# honest: 72.131%
-# other: 62.791%
-
-# Final accuracy summary (DPO)
-# overall : 66.516%
-# harmless: 60.345%
-# helpful : 71.186%
-# honest  : 68.852%
-# other   : 65.116%
 
 def metrics():
     def eval_metrics(cfg):
@@ -197,29 +259,6 @@ def metrics():
                 base_prompt_raw = build_metrics_eval_messages(
                     q, choices[0], choices[1]
                 )
-                # msgs = build_metrics_eval_messages(q, choices[0], choices[1])
-                # input_ids = tokenizer.apply_chat_template(
-                #     msgs,
-                #     return_tensors="pt",
-                #     add_generation_prompt=True,
-                # ).to(device)
-
-                # output = model(input_ids)
-                # logits = output.logits
-                # # print(F.softmax(logits).argmax())
-                # # print(tokenizer.convert_ids_to_tokens(
-                # #     torch.tensor([F.softmax(logits).argmax()])
-                # # ))
-                # # print(tokenizer.decode(input_ids[0], skip_special_tokens=True))
-                # # print(tokenizer.decode(logits[0], skip_special_tokens=True))
-                # # print()
-                # last_logits = logits[0, -1]
-
-                # logp_A = F.softmax(last_logits)[tok_id_A].item()
-                # logp_B = F.softmax(last_logits)[tok_id_B].item()
-                # print(logp_A, logp_B, F.softmax(last_logits).max())
-                # print()
-                # pred = 1 if logp_B > logp_A else 0
 
                 # Render prompt up to "Reply A:" and then append one of the replies
                 base_prompt = tokenizer.apply_chat_template(
@@ -266,9 +305,6 @@ def metrics():
                     prediction=pred, reference=gold_idx
                 )
 
-                # if i > 5:
-                #     assert False
-
         results = {"overall": metric_global.compute()["accuracy"]}
         for subset, m in metrics_by_subset.items():
             results[subset] = m.compute()["accuracy"]
@@ -283,6 +319,9 @@ def metrics():
 
 def auto_interp():
     def eval_auto_interp(cfg):
+        model, tokenizer, _ = init_model_tokenizer(cfg.model, True)
+        analyse_model(cfg, model, tokenizer)
+        return
         print('Evaluating auto interp')
         if 'sft' in cfg.model.adapter_checkpoint_dir:
             print('SFT model, skipping auto interp...')
@@ -293,13 +332,6 @@ def auto_interp():
             lambda: defaultdict(lambda: {"pos": [], "neg": []})
         )
         example_counter = 0        # global running index over all examples
-        # lora_modules = {
-        #     name: mod
-        #     for name, mod in model.named_modules()
-        #     if f".{cfg.evals.auto_interp.layer_idx}." in name and
-        #     isinstance(mod, LoraLayer)
-        # }
-
 
         # TODO: do NOT rely on global state
         current_vals = {
@@ -351,8 +383,6 @@ def auto_interp():
 
         print(f"Dataset size after flattening: {len(flat_ds):,}")
 
-        # assert False
-
         autointerp_collate_chat = AutointerpChatCollator(tokenizer, device)
         loader = DataLoader(
             flat_ds,
@@ -386,8 +416,6 @@ def auto_interp():
             current_vals['current_pad_mask'] = None         # clear reference
             current_vals['current_ex_offset'] += B
 
-        from pprint import pprint
-        # pprint(topk_store)
         adapters_pos_map = autointerp_collapse_heaps(topk_store)
 
         os.makedirs('temp', exist_ok=True)
@@ -406,12 +434,21 @@ def auto_interp():
         #     print('succesfully loaded neuron interp from cache')
         # except FileNotFoundError:
         #    print('neuron interp not found in cache, regenerating...')
-        json_blob = autointerp_build_lora_json_with_responses(
-            adapters_pos_map,
-            flat_ds, tokenizer,
-            model="gpt-4o-mini",
+        
+        # json_blob = autointerp_build_lora_json_with_responses(
+        #     adapters_pos_map,
+        #     flat_ds, tokenizer,
+        #     model="gpt-4o-mini",
+        #     include_cot=False,
+        #     include_few_shot=False
+        # )
+
+        json_blob = autointerp_build_lora_json_with_responses_local(
+            adapters_pos_map, flat_ds, tokenizer,
+            model_name="deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
             include_cot=False,
-            include_few_shot=False
+            include_few_shot=False,
+            temperature=0.0
         )
 
         activations = adapters_pos_map

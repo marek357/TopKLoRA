@@ -1,11 +1,11 @@
 size: "small"
 lora:
-  r: 1024
+  r: 16
   bias: 'none'
-  alpha: 16384
-  dropout: 0.1
+  alpha: 16
+  dropout: 0.05
   top_k_experiment: True
-  k: 8
+  k: 16
   target_modules:
     - layers.11.self_attn.q_proj
     - layers.11.self_attn.k_proj

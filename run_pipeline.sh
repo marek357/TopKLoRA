@@ -10,7 +10,7 @@ error_handler() {
 trap error_handler ERR
 
 
-MODEL_NAME="gemma_2_2b"
+MODEL_NAME="gemma_2b"
 
 # /home/cvenhoff/miniconda/envs/lora_env/bin/python3 /home/cvenhoff/lora_interp/main.py training=sft training/model="$MODEL_NAME"
 
@@ -20,11 +20,11 @@ MODEL_NAME="gemma_2_2b"
 
 # echo "Step 2. complete: SFT model eval done!"
 
-# echo "DPO training start..."
+echo "DPO training start..."
 
-# /home/cvenhoff/miniconda/envs/lora_env/bin/python3 /home/cvenhoff/lora_interp/main.py training=dpo training/model=$MODEL_NAME training/adapter=$MODEL_NAME
+/home/cvenhoff/miniconda/envs/lora_env/bin/python3 /home/cvenhoff/lora_interp/main.py training=dpo training/model=$MODEL_NAME training/adapter=$MODEL_NAME #logger=wandb_disabled
 
-# echo "Step 3. complete: DPO model ($MODEL_NAME) fine-tuned!"
+echo "Step 3. complete: DPO model ($MODEL_NAME) fine-tuned!"
 
 /home/cvenhoff/miniconda/envs/lora_env/bin/python3 /home/cvenhoff/lora_interp/eval.py model=dpo_$MODEL_NAME
 

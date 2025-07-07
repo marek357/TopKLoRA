@@ -7,7 +7,7 @@ defaults:
   - dataset/alpaca-train@sft_dataset
   - dataset/hh-rlhf@dpo_dataset
   - adapter: gemma_2b
-  - quantization: 8bit
+  - quantization: 4bit
 
 dump_trained_model: True
 dump_path: "models/sft/${training.model.model_name}"
@@ -19,7 +19,7 @@ sft:
   max_seq_length: 1024
   num_epochs: 5000
   batch_size_train: 4
-  gradient_accumulation_steps: 2
+  gradient_accumulation_steps: 12
   gradient_checkpointing: True
   optim: "adamw_torch"
   lr: 1e-4
@@ -30,9 +30,9 @@ sft:
   save_strategy: "steps"
   save_steps: 50
   save_total_limit: 3
-  eval_steps: 500
+  eval_steps: 100
   eval_strategy: "steps"
-  max_steps: 5000
+  max_steps: 1000
   batch_size_eval: 12
   weight_decay: 0.001
   push_to_hub: False

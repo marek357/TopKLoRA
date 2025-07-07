@@ -1,9 +1,18 @@
 name: auto-interpret
 layer_idx: 11
 k_heap: 50
-ax_topk: 64
-batch_size: 8
-max_rows: 1024
+# k: 32
+# r: 4096
+k: 8
+r: 1024
+train_steps: 5000
+batch_size: 10
+max_new_tokens: 25
+hook_type: "disable"
+max_examples_per_latent: 10
+latent_interp_batch_size: 10
+max_length: 512
+max_rows: 10
 context_size_each_side: 10
 dump_generated: True
 dump_analysis: True

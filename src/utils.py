@@ -64,11 +64,12 @@ def get_spider_dataset(dataset_name, tokenizer):
 def merge_lora_adapter(
     base_model_dir: str,
     lora_checkpoint_dir: str,
+    quantization_config,
     merged_output_dir: Optional[str] = None,
     save_merged_model: bool = False,
     tokenizer_dir: str = None,
     torch_dtype="auto",
-    device_map="auto"
+    device_map="auto",
 ):
     """
     Load a base model and its tokenizer (optionally from a separate directory),
@@ -99,7 +100,9 @@ def merge_lora_adapter(
     base_model = AutoModelForCausalLM.from_pretrained(
         base_model_dir,
         torch_dtype=torch_dtype,
-        device_map=device_map
+        device_map=device_map,
+        trust_remote_code=True, 
+        quantization_config=quantization_config,
     )
 
     # 3. Load the LoRA adapter on top of the base model
@@ -239,13 +242,14 @@ def hh_rlhf_preprocess_to_messages(example: Dict[str, Any]) -> Dict[str, Any]:
 
 def build_quant_config(cfg: Dict[str, Any]) -> BitsAndBytesConfig:
     """Return a BitsAndBytesConfig from YAML sub‑dict."""
-    qtype = cfg["type"].lower()
+    qtype = cfg.type.lower()
     if qtype == "4bit":
         return BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_quant_type=cfg.get("bnb_4bit_quant_type", "nf4"),
+            bnb_4bit_quant_type=cfg.bnb_4bit_quant_type,
             bnb_4bit_compute_dtype=getattr(
-                torch, cfg.get("compute_dtype", "bfloat16")),
+                torch, cfg.compute_dtype
+            ),
         )
     if qtype == "8bit":
         return BitsAndBytesConfig(
@@ -559,13 +563,6 @@ def autointerp_token_windows_dict(
         ]
 
         center = tok_pos - start          # position of the “hot” token
-        # if center >= len(toks):
-        #     print(center, tok_pos, start)
-        #     print(center, tok_pos, start)
-        #     print(len(toks))
-        #     print(len(toks))
-        #     assert False
-        # print(tok_pos, start, center, len(toks))
         token_text = toks[center]         # raw decoded token
 
         # Wrap the center token in << ... >>
@@ -804,6 +801,107 @@ def autointerp_build_lora_json_with_responses(
     )
     return results
 
+def autointerp_build_lora_json_with_responses_local(
+    adapters_pos_map: Dict[str, Mapping[int, Tuple[int, int, float]]],
+    dataset: Any,
+    tokenizer_name_or_obj,
+    *,
+    window: int = 32,
+    model_name: str = "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
+    include_cot: bool = False,
+    include_few_shot: bool = False,
+    temperature: float = 0.0,
+    max_new_tokens: int = 512,
+    device: str = "cuda",
+    outfile: str = "temp/lora_neuron_info_local.json"
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """
+    Same as before, but uses a local HF‐style model.generate instead of OpenAI’s API.
+    """
+
+    # 1) load model & tokenizer (once)
+    if isinstance(tokenizer_name_or_obj, str):
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_obj, use_fast=True)
+    else:
+        tokenizer = tokenizer_name_or_obj
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto",      # or model.to(device)
+        torch_dtype=torch.float16,  # if your GPU supports it
+        # low_cpu_mem_usage=True,
+        # trust_remote_code=True,     # if the repo needs it
+    )
+    model.eval()
+
+    # build system prompt just once
+    system_prompt = autointerp_generate_system_prompt(
+        include_cot=include_cot, include_few_shot=include_few_shot
+    )
+
+    results: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+    for adapter, neuron_maps in tqdm(adapters_pos_map.items(), desc="Adapters"):
+        adapter_block: Dict[str, Dict[str, Any]] = {}
+        for n_idx, pos_map in tqdm(neuron_maps.items(), desc=f"  {adapter}", leave=False):
+            pos_map = {int(k): v for k, v in pos_map.items()}
+            windows_dict = autointerp_token_windows_dict(
+                pos_map, dataset, tokenizer, window=window, topk=40
+            )
+            prompt = autointerp_build_activation_prompt(
+                windows_dict,
+                pos_map,
+                newline="\n",
+                context_newline=True,
+            )
+
+            # 2) Prepare the full text we feed the model
+            full_input = system_prompt + "\n\n" + prompt
+
+            # 3) Tokenize + generate
+            inputs = tokenizer(
+                full_input,
+                return_tensors="pt",
+                truncation=True,
+                max_length=4096,     # adjust to your model’s context window
+            ).to(model.device)
+
+            with torch.no_grad():
+                generation_output = model.generate(
+                    **inputs,
+                    do_sample=temperature > 0.0,
+                    temperature=temperature,
+                    top_p=0.95,
+                    top_k=50,
+                    max_new_tokens=max_new_tokens,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+
+            # 4) Decode just the **new** tokens
+            generated = generation_output[0][ inputs["input_ids"].shape[-1]: ]
+            answer_text = tokenizer.decode(generated, skip_special_tokens=True)
+
+            interpretation = autointerp_extract_interpretation(answer_text) or "N/A"
+
+            ranks = sorted(windows_dict)
+            topk_snippets = [windows_dict[r]["context"] for r in ranks]
+            topk_values   = [windows_dict[r]["value"]   for r in ranks]
+
+            adapter_block[str(n_idx)] = {
+                "interpretation":  interpretation,
+                "top_activations": topk_snippets,
+                "values":          topk_values,
+            }
+
+        results[adapter] = adapter_block
+
+    # 5) write to disk
+    with open(outfile, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+
+    print(f"✓ Saved {outfile}  ({len(results)} adapters × {len(next(iter(results.values())))} neurons)")
+    return results
+
 
 TOKENIZER_CACHE: Dict[str, Any] = {}
 
@@ -823,18 +921,6 @@ def autointerp_token_window(dataset, tokenizer, ex_idx: int, pos: int, window: i
         padding=False,
         return_tensors="pt"
     )[0]
-    # s, e = max(0, pos-window), min(ids.size(0), pos+window+1)
-    # toks = [
-    #     tokenizer.decode([tid], skip_special_tokens=False)
-    #     for tid in ids[s:e]
-    # ]
-    # print(len(toks), pos-s, pos, s)
-    # center_idx = pos - s
-    # # if 0 <= center_idx < len(toks):
-    # #     toks[center_idx] = f"<<{toks[center_idx]}>>"
-
-    # toks[pos-s] = f"<<{toks[pos-s]}>>"
-    # return "".join(toks).replace("\n", "⏎")
     seq_len = ids.size(0)
 
     if pos < 0 or pos >= seq_len:
@@ -899,37 +985,6 @@ def autointerp_build_dataset(act_dict, lora_info, examples, model, window=7, k_s
             return autointerp_token_window(examples, tok, ex_idx, pos, window)
         return autointerp_ctx_lorainfo(layer, nid, rank, lora_info, model, tid)
 
-    # for (layer, nid), rows in rows_by_neuron.items():
-    #     if len(rows) <= k_skip:
-    #         continue
-    #     pos_rows = rows[k_skip:]
-    #     positives = random.choices(pos_rows, k=n_examples)
-    #     pos_positions = {p for _tid, p, _v, _r, _e in rows}
-
-    #     for tid, pos, _v, rank, ex_idx in positives:
-    #         negs, tries = [], 0
-    #         while len(negs) < n_neg and tries < 100:
-    #             tries += 1
-    #             nl, nn = random.choice(all_keys)
-    #             if (nl, nn) == (layer, nid):
-    #                 continue
-    #             ntid, npos, _nval, nrank, nex = random.choice(
-    #                 rows_by_neuron[(nl, nn)][:k_skip])
-    #             if npos in pos_positions:
-    #                 continue
-    #             negs.append(ctx(nl, nn, ntid, npos, nrank, nex))
-    #         if len(negs) < n_neg:
-    #             continue
-    #         pos_ctx = ctx(layer, nid, tid, pos, rank, ex_idx)
-    #         sents = negs+[pos_ctx]
-    #         random.shuffle(sents)
-    #         # print(lora_info[layer].keys())
-    #         dataset.append({
-    #             "layer": layer, "neuron": nid,
-    #             "sentences": sents,
-    #             "answer": sents.index(pos_ctx)+1,
-    #             "interpretation": lora_info[layer][str(nid)]["interpretation"],
-    #         })
     invalid_examples = 0
     for (layer, nid), rows in rows_by_neuron.items():
         if len(rows) <= k_skip:
