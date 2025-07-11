@@ -1,1 +1,2 @@
-TORCH_LOGS=recompiles python3 eval.py
+TORCH_LOGS=recompiles python3 eval.py model=interp_dpo_gemma_small_5k
+TORCH_LOGS=recompiles python3 eval.py model=interp_dpo_gemma_large_5k

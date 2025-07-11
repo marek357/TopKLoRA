@@ -7,6 +7,7 @@ defaults:
   # - evals/instruction_following@evals.instruction_following
   # - model: interp_dpo_gemma_large
   - model: interp_dpo_gemma_small_5k
+  # - model: interp_dpo_gemma_large_5k
   # - override hydra/launcher: submitit_slurm
 seed: 42
 checkpoint_dir: adapter

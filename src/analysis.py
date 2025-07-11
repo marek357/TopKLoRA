@@ -18,6 +18,8 @@ from peft import PeftModel
 from itertools import islice
 from tqdm import tqdm
 from pprint import pprint
+from typing import Union, Optional
+from dataclasses import dataclass
 import logging
 from torch.utils.data import DataLoader
 import pickle
@@ -28,120 +30,18 @@ import gc
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-
-def manual_format_to_prompt(messages):
-    """Convert message format to manual ###Question/###Answer format."""
-    prompt_parts = []
-    
-    for msg in messages:
-        if msg["role"] == "user":
-            prompt_parts.append(f"###Question:\n{msg['content']}\n\n###Answer:\n")
-        elif msg["role"] == "assistant":
-            # For the last assistant message, we don't add the trailing prompt
-            prompt_parts.append(msg['content'])
-    
-    return "".join(prompt_parts)
-
-class ManualTemplateCollator:
-    """Collator that uses manual chat template instead of tokenizer's chat template."""
-    
-    def __init__(self, tokenizer, device, max_length=1024):
-        self.tokenizer = tokenizer
-        self.device = device
-        self.max_length = max_length
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-    
-    def __call__(self, examples):
-        # Convert messages to manual format
-        prompts = []
-        for ex in examples:
-            if "input" in ex:  # For the flattened dataset
-                prompt = manual_format_to_prompt(ex["input"])
-            else:  # For raw examples
-                # Assuming chosen/rejected are already in message format
-                prompt = manual_format_to_prompt(ex.get("chosen", ex.get("rejected", [])))
-            prompts.append(prompt)
-        
-        # Tokenize
-        batch = self.tokenizer(
-            prompts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt"
-        )
-        
-        # Move to device
-        batch = {k: v.to(self.device) for k, v in batch.items()}
-        
-        return batch
-
-# class ChatTemplateCollator:
-#     def __init__(self, tokenizer, device, max_length=1024):
-#         self.tokenizer = tokenizer
-#         self.device = device
-#         self.max_length = max_length
-#         # ensure there's a pad token
-#         if tokenizer.pad_token is None:
-#             tokenizer.pad_token = tokenizer.eos_token
-
-#     def __call__(self, examples):
-#         # each example must carry a list of {"role","content"} messages
-#         all_prompts = []
-#         for ex in examples:
-#             # if your examples come flattened, adapt this to wrap them back into messages
-#             msgs = ex.get("input", ex.get("chosen", ex.get("rejected")))
-#             # apply the tokenizer’s chat template
-#             prompt = self.tokenizer.apply_chat_template(
-#                 msgs,
-#                 tokenize=True,               # returns IDs
-#                 add_generation_prompt=True,  # leaves room for model continuation
-#             )
-#             all_prompts.append(prompt)
-
-#         # now pad/truncate into a batch
-#         batch = self.tokenizer.pad(
-#             all_prompts,
-#             padding=True,
-#             truncation=True,
-#             max_length=self.max_length,
-#             return_tensors="pt",
-#         )
-#         return {k: v.to(self.device) for k, v in batch.items()}
-
-
-# class ChatTemplateCollator:
-#     def __init__(self, tokenizer, device, max_length=1024):
-#         self.tokenizer = tokenizer
-#         self.device = device
-#         self.max_length = max_length
-#         if tokenizer.pad_token is None:
-#             tokenizer.pad_token = tokenizer.eos_token
-
-#     def __call__(self, examples):
-#         texts = []
-#         for ex in examples:
-#             msgs = ex.get("input", ex.get("chosen", ex.get("rejected")))
-#             # Apply chat template to get text
-#             text = self.tokenizer.apply_chat_template(
-#                 msgs,
-#                 tokenize=False,  # Get text, not IDs
-#                 add_generation_prompt=True,
-#             )
-#             texts.append(text)
-        
-#         # Now tokenize all texts at once
-#         batch = self.tokenizer(
-#             texts,
-#             padding=True,
-#             truncation=True,
-#             max_length=self.max_length,
-#             return_tensors="pt"
-#         )
-        
-#         return {k: v.to(self.device) for k, v in batch.items()}
+@dataclass
+class LatentActivation:
+    activation_magnitude: float
+    example_idx: int
+    activating_token_id: int
+    activating_idx: int
+    activating_token: Optional[str]
+    is_padding_token: Optional[bool]
+    baseline_generation: Optional[str] = None
+    ablated_generation: Optional[str] = None
+    input_text: Optional[str] = None
+    ablation_has_effect: Optional[bool] = None
 
 class ChatTemplateCollator:
     def __init__(self, tokenizer, device, max_length=1024):
@@ -196,19 +96,22 @@ class TopKHeapHook:
         # this will be later used to generate examples
         # and ablate the effect of the latent
         self.activating_examples = {
-            latent: set()
+            latent: []
             for latent in range(self.r)
         }
         # raise error if params don't make sense
         assert self.k <= self.r, f"Recording top-{self.k} latents when only {self.r} available"
         # these get updated before each forward pass:
         self.dataset_examples_seen = 0
-        self.current_pad_mask  = None
+        self.current_pad_mask = None
+        self.input_ids = None
 
-    def set_batch_state(self, pad_mask: torch.BoolTensor, ex_offset: int = 0):
+    def set_batch_state(self, pad_mask: torch.BoolTensor, ex_offset: int = 0, input_ids = None):
         """Call this once per microbatch, before running forward."""
         self.dataset_examples_seen += ex_offset
         self.current_pad_mask  = pad_mask
+        if input_ids is not None:
+            self.input_ids = input_ids
 
     def __call__(self, module, input_activations_tuple, out):
         input_activations = input_activations_tuple[0]
@@ -251,8 +154,17 @@ class TopKHeapHook:
                     .tolist()
 
                 for latent in active_latents:
-                    self.activating_examples[latent] \
-                        .add(example_idx)
+                    self.activating_examples[latent].append(
+                        LatentActivation(
+                            activation_magnitude=low_rank_activations[latent].item(),
+                            example_idx=example_idx,
+                            activating_token_id=self.input_ids[batch_idx][analysed_token_position].item(),
+                            activating_idx=analysed_token_position,
+                            activating_token=None,
+                            is_padding_token=None
+                        )
+                    )
+                
 
 
 def configure_eot_token(model, tokenizer):
@@ -318,7 +230,13 @@ def check_if_any_dead_neurons(hooks, verbose=True):
                     'there are following dead neurons:',
                     dead_neurons, '\n', '-'*60, end='\n\n'
                 )
-    
+        else:
+            if verbose:
+                print(
+                    'In module:', hook.module_name, 
+                    'there are no dead neurons!', '\n', '-'*60, end='\n\n'
+                )
+
     if no_dead_neurons and verbose:
         print('No dead neurons!')
 
@@ -342,24 +260,6 @@ def make_enable_hook(layer: int, neuron_idx: int):
     return enable_latent
 
 
-# def make_disable_hook(layer: int, neuron_idx: int, r: int):
-#     def disable_latent(module, input, output):
-#         # Reshape and modify
-#         activations = output.view(-1, output.size(-1), r)
-#         activations[..., neuron_idx] = 0.
-#         return activations.view(output.shape)  # Reshape back
-#     return disable_latent
-
-# def make_enable_hook(layer: int, neuron_idx: int, r: int):
-#     def enable_latent(module, input, output):
-#         # Reshape and modify
-#         activations = output.view(-1, output.size(-1), r)
-#         activations[..., neuron_idx] = 1.
-#         return activations.view(output.shape)  # Reshape back
-#     return enable_latent
-
-
-
 def get_hook_statistics(hooks):
     hook_statistics = {}
     for hook in hooks:
@@ -381,28 +281,6 @@ def get_hook_statistics(hooks):
     return hook_statistics
 
 
-# def precompute_baseline_generations(model, tokenizer, flat_ds, example_indices, cfg, max_seq_len):
-#     """Precompute baseline generations for all examples that will be used."""
-#     print("Precomputing baseline generations...")
-    
-#     manual_collate = ManualTemplateCollator(
-#         tokenizer, 
-#         device,
-#         max_length=cfg.evals.auto_interp.max_length
-#     )
-    
-#     baseline_cache = {}
-#     batch_size = cfg.evals.auto_interp.batch_size
-#     max_new_tokens = cfg.evals.auto_interp.max_new_tokens
-#     autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    
-#     # Process in batches
-#     for i in tqdm(range(0, len(example_indices), batch_size), desc="Computing baselines"):
-#         batch_indices = example_indices[i:i + batch_size]
-#         batch_examples = [flat_ds[idx] for idx in batch_indices]
-        
-#         # Collate batch
-#         input_batch = manual_collate(batch_examples)
 def precompute_baseline_generations(model, tokenizer, flat_ds, example_indices, cfg, max_seq_len, collate_fn):
     """Precompute baseline generations for all examples that will be used."""
     print("Precomputing baseline generations...")
@@ -469,15 +347,16 @@ def precompute_baseline_generations(model, tokenizer, flat_ds, example_indices, 
                             early_stopping=True,
                             return_dict_in_generate=False  # Slightly faster
                         )
-        
         # Store results
-        baseline_texts = tokenizer.batch_decode(baseline_outputs, skip_special_tokens=True)
+        baseline_texts_with_prompt = tokenizer.batch_decode(baseline_outputs, skip_special_tokens=True)
         input_texts = tokenizer.batch_decode(input_ids, skip_special_tokens=True)
+        # for b, bas, inp in zip(baseline_texts, baseline_texts_with_prompt, input_texts):
+        #     assert bas.removeprefix(inp) == b, f'{inp} || {bas}'
         
-        for idx, input_text, baseline_text in zip(batch_indices, input_texts, baseline_texts):
+        for idx, input_text, baseline_text in zip(batch_indices, input_texts, baseline_texts_with_prompt):
             baseline_cache[str(idx)] = {
                 'input': input_text,
-                'baseline': baseline_text
+                'baseline': baseline_text.removeprefix(input_text)
             }
     
     print(f"Precomputed baselines for {len(baseline_cache)} examples")
@@ -543,19 +422,11 @@ def analyse_model(cfg, model, tokenizer):
 
     print(f"Dataset size after flattening: {len(flat_ds):,}")
 
-    # autointerp_collate_chat = AutointerpChatCollator(tokenizer, device)
-    # manual_collate = ManualTemplateCollator(
-    #     tokenizer, 
-    #     device,
-    #     max_length=getattr(cfg.evals.auto_interp, 'max_length', 1024)
-    # )
 
     loader = DataLoader(
         flat_ds,
         batch_size=cfg.evals.auto_interp.batch_size,
         shuffle=False,
-        # collate_fn=autointerp_collate_chat,
-        # collate_fn=manual_collate,
         collate_fn=chat_collate,
         drop_last=False
     )
@@ -566,28 +437,28 @@ def analyse_model(cfg, model, tokenizer):
         MAX_BATCHES = int(
             cfg.evals.auto_interp.max_rows/cfg.evals.auto_interp.batch_size
         )
-    MAX_BATCHES = 2000
+    MAX_BATCHES = 3500
+    # MAX_BATCHES = 1
     # take only the first MAX_BATCHES batches
     limited_loader = islice(loader, MAX_BATCHES)
 
     try:
-        with open(f'cache/hooks_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}.pkl', 'rb+') as f:
+        with open(f'cache/hooks_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_batches{MAX_BATCHES}_with_activations.pkl', 'rb+') as f:
             hooks = pickle.load(f)
+        print('loaded hooks from cache')
 
     except Exception as e:
         print(e)
-        for row_idx, batch in enumerate(
-            tqdm(
-                limited_loader, 
-                total=MAX_BATCHES, 
-                desc="Collecting hook firings"
-            ), 
-            start=0
+        for batch in tqdm(
+            limited_loader, 
+            total=MAX_BATCHES, 
+            desc="Collecting hook firings"
         ):
             input_ids = batch["input_ids"].to(device)
             for hook in hooks:
                 hook.set_batch_state(
-                    pad_mask=batch["attention_mask"].to(torch.bool)
+                    pad_mask=batch["attention_mask"].to(torch.bool),
+                    input_ids=input_ids
                 )
 
             model(input_ids)
@@ -598,8 +469,21 @@ def analyse_model(cfg, model, tokenizer):
                     ex_offset=input_ids.size(0),
                     pad_mask=None
                 )
+
+        # add extra metadata
+        for hook in hooks:
+            for latent in hook.activating_examples:
+                for latent_activation in hook.activating_examples[latent]:
+                    tok_id = latent_activation.activating_token_id
+                    latent_activation.activating_token = tokenizer.decode(
+                        tok_id, skip_special_tokens=False
+                    )
+                    latent_activation.is_padding_token = bool(
+                        tokenizer.pad_token == tok_id
+                    )
+
         try:
-            with open(f'cache/hooks_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}.pkl', 'wb+') as f:
+            with open(f'cache/hooks_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_batches{MAX_BATCHES}_with_activations.pkl', 'wb+') as f:
                 pickle.dump(hooks, f)
         except Exception as err:
             print(err)
@@ -609,15 +493,6 @@ def analyse_model(cfg, model, tokenizer):
 
     check_if_any_dead_neurons(hooks)
 
-    all_example_indices = set()
-    for hook in hooks:
-        for latent in range(hook.r):
-            if len(hook.activating_examples[latent]) > 0:
-                max_examples = cfg.evals.auto_interp.max_examples_per_latent
-                example_indices = list(hook.activating_examples[latent])[:max_examples]
-                all_example_indices.update(example_indices)
-    
-    # all_example_indices = sorted(list(all_example_indices))
     all_example_indices = list(range(
         MAX_BATCHES * cfg.evals.auto_interp.batch_size
     ))
@@ -625,14 +500,15 @@ def analyse_model(cfg, model, tokenizer):
     print(f"Will precompute baselines for {len(all_example_indices)} unique examples")
     
     # Precompute all baseline generations
+    max_new_tokens = cfg.evals.auto_interp.max_new_tokens
+    max_seq_len = chat_collate.max_length + max_new_tokens
+    max_len_path = max_new_tokens
     try:
-        with open(f'cache/baselines_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}.json', 'r') as f:
+        with open(f'cache/baselines_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_maxlen{max_len_path}.json', 'r') as f:
             baseline_cache = json.load(f)
     except Exception as e:
         print(e)
         batch_size = cfg.evals.auto_interp.latent_interp_batch_size
-        max_new_tokens = cfg.evals.auto_interp.max_new_tokens
-        max_seq_len = chat_collate.max_length + max_new_tokens
 
         baseline_cache = precompute_baseline_generations(
             model, tokenizer, flat_ds, 
@@ -640,7 +516,7 @@ def analyse_model(cfg, model, tokenizer):
             max_seq_len, chat_collate
         )
         try:
-            with open(f'cache/baselines_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}.json', 'w+') as f:
+            with open(f'cache/baselines_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_maxlen{max_len_path}.json', 'w+') as f:
                 json.dump(baseline_cache, f)
         except Exception as err:
             print(err)
@@ -650,8 +526,9 @@ def analyse_model(cfg, model, tokenizer):
     ablation_results = {}
 
     try:
-        with open('cache/experiment_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}.json', 'r') as f:
-            ablation_results = json.load(f)
+        with open(f'cache/experiment_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_batches{MAX_BATCHES}_maxlen{max_len_path}_sorted.pkl', 'rb') as f:
+            ablation_results = pickle.load(f)
+        print('read ablation results from cache')
     except Exception as e:
         print(e)
 
@@ -673,7 +550,8 @@ def analyse_model(cfg, model, tokenizer):
             adapter = adapter[0]
 
         # store generation results in results dict
-        ablation_results[hook.module_name] = {}
+        if hook.module_name not in ablation_results:
+            ablation_results[hook.module_name] = {}
 
         batch_size = cfg.evals.auto_interp.latent_interp_batch_size
         max_new_tokens = cfg.evals.auto_interp.max_new_tokens
@@ -691,7 +569,7 @@ def analyse_model(cfg, model, tokenizer):
         assert set(hook.activating_examples) == set(range(hook.r))
 
         for latent in tqdm(range(hook.r), desc=f"Latents in {hook.module_name}", leave=False):
-            if latent in ablation_results[hook.module_name]:
+            if str(latent) in ablation_results[hook.module_name]:
                 logging.info(f'Loaded {hook.module_name}/{latent} from cache')
                 continue
             if len(hook.activating_examples[latent]) == 0:
@@ -704,7 +582,18 @@ def analyse_model(cfg, model, tokenizer):
             }
 
             max_examples = cfg.evals.auto_interp.max_examples_per_latent
-            example_indices = list(hook.activating_examples[latent])[:max_examples]
+            examples_to_ablate = list(
+                sorted(
+                    hook.activating_examples[latent],
+                    # descending sort according to 
+                    # the activation magnitude
+                    key=lambda x: abs(x.activation_magnitude),
+                    reverse=True
+                )
+            # restrict to only the top 
+            # activating examples within
+            # this setting
+            )[:max_examples]
 
             if cfg.evals.auto_interp.hook_type == 'disable':
                 ablation_hook = make_disable_hook(hook.module_name, latent)
@@ -715,7 +604,6 @@ def analyse_model(cfg, model, tokenizer):
 
             all_examples = []
 
-
             # Clear any conflicting generation config
             if hasattr(model.generation_config, 'cache_implementation'):
                 model.generation_config.cache_implementation = None
@@ -723,14 +611,11 @@ def analyse_model(cfg, model, tokenizer):
             # Enable mixed precision for faster computation
             autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
-
-
-            for i in range(0, len(example_indices), batch_size):
-                batch_indices = example_indices[i:i + batch_size]
-                batch_examples = [flat_ds[idx] for idx in batch_indices]
+            for i in range(0, len(examples_to_ablate), batch_size):
+                batch_indices = examples_to_ablate[i:i + batch_size]
+                batch_examples = [flat_ds[idx.example_idx] for idx in batch_indices]
                 
                 # Collate batch
-                # input_batch = autointerp_collate_chat(batch_examples, device)
                 input_batch = chat_collate(batch_examples)
                 input_ids = input_batch["input_ids"].to(device)
                 attention_mask = input_batch["attention_mask"].to(device)
@@ -740,76 +625,95 @@ def analyse_model(cfg, model, tokenizer):
                     ablation_hook
                 )
                 
-                
                 try:
                     with torch.no_grad():
                         with torch.amp.autocast('cuda', dtype=autocast_dtype):
-                            ablated_outputs = model.generate(
-                                input_ids,
-                                attention_mask=attention_mask,
-                                past_key_values=static_cache,  # Use pre-allocated cache
-                                max_new_tokens=max_new_tokens,
-                                pad_token_id=tokenizer.pad_token_id,
-                                eos_token_id=model.generation_config.eos_token_id,
-                                do_sample=False,
-                                use_cache=True,
-                                num_beams=1,  # Greedy is fastest
-                                # early_stopping=True,
-                                return_dict_in_generate=False  # Slightly faster
-                            )
+                            try:
+                                ablated_outputs = model.generate(
+                                    input_ids,
+                                    attention_mask=attention_mask,
+                                    # past_key_values=static_cache,  # Use pre-allocated cache
+                                    max_new_tokens=max_new_tokens,
+                                    pad_token_id=tokenizer.pad_token_id,
+                                    eos_token_id=model.generation_config.eos_token_id,
+                                    do_sample=False,
+                                    use_cache=True,
+                                    num_beams=1,  # Greedy is fastest
+                                    # early_stopping=True,
+                                    return_dict_in_generate=False  # Slightly faster
+                                )
+                            except RuntimeError as e:
+                                if "index_copy_" in str(e):
+                                    # Fallback to dynamic cache if static cache fails
+                                    print(f"Static cache failed for batch, using dynamic cache: {e}")
+                                    ablated_outputs = model.generate(
+                                        input_ids,
+                                        attention_mask=attention_mask,
+                                        max_new_tokens=max_new_tokens,
+                                        pad_token_id=tokenizer.pad_token_id,
+                                        eos_token_id=model.generation_config.eos_token_id,
+                                        do_sample=False,
+                                        use_cache=True,  # Will use dynamic cache
+                                        num_beams=1,
+                                        return_dict_in_generate=False
+                                    )
+                                else:
+                                    raise e
                 finally:
                     ablation_handle.remove()
 
+                # Batch-decode in one go
+                ablated_texts = tokenizer.batch_decode(
+                    ablated_outputs,
+                    skip_special_tokens=True,
+                    # clean_up_tokenization_spaces=True
+                )
 
                 # Process batch results
-                ablated_texts = tokenizer.batch_decode(ablated_outputs, skip_special_tokens=True)
+                # ablated_texts = tokenizer.batch_decode(ablated_outputs, skip_special_tokens=True)
                 
                 batch_results = []
-                for idx, ablated_text in zip(batch_indices, ablated_texts):
+                for example, ablated_text in zip(examples_to_ablate, ablated_texts):
                     # Get precomputed baseline from cache
-                    cached_data = baseline_cache[str(idx)]
+                    cached_data = baseline_cache[str(example.example_idx)]
                     baseline_text = cached_data['baseline']
                     input_text = cached_data['input']
-                    
-                    batch_results.append({
-                        'example_idx': idx,
-                        'input': input_text,
-                        'baseline': baseline_text,
-                        'ablated': ablated_text,
-                        'has_effect': baseline_text != ablated_text
-                    })
-                
+                    example.input_text = input_text
+                    example.baseline_text = baseline_text
+                    example.ablated_text = ablated_text.removeprefix(input_text)
+                    example.ablation_has_effect = baseline_text != example.ablated_text
+                    batch_results.append(example)
+                    # batch_results.append({
+                    #     'example_idx': idx,
+                    #     'input': input_text,
+                    #     'baseline': baseline_text,
+                    #     'ablated': ablated_text.removeprefix(input_text),
+                    #     'has_effect': baseline_text != ablated_text.removeprefix(input_text)
+                    # })
                 all_examples.extend(batch_results)
             
             # Store all examples for this latent
             ablation_results[hook.module_name][latent]['examples'] = all_examples
             
             # Calculate effect rate for this latent
-            effects = [ex['has_effect'] for ex in all_examples]
+            effects = [ex.ablation_has_effect for ex in all_examples]
             ablation_results[hook.module_name][latent]['effect_rate'] = (
                 sum(effects) / len(effects) if effects else 0
             )
 
             try:
-                with open('cache/experiment_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}.json', 'w+') as f:
-                    json.dump(ablation_results, f)
-            except KeyboardInterrupt:
+                with open(f'cache/experiment_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_batches{MAX_BATCHES}_maxlen{max_len_path}_sorted.pkl', 'wb+') as f:
+                    pickle.dump(ablation_results, f)
+            except KeyboardInterrupt as e:
                 # finish saving to a file if keyboard interrupt
-                with open('cache/experiment_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}.json', 'w+') as f:
-                    json.dump(ablation_results, f)
+                with open(f'cache/experiment_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_batches{MAX_BATCHES}_maxlen{max_len_path}_sorted.pkl', 'wb+') as f:
+                    pickle.dump(ablation_results, f)
+                raise e
             except Exception as e:
                 print(e)
         
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
         gc.collect() 
-
-    try:
-
-        with open('ablation_results.json', 'w+') as f:
-            json.dump(ablation_results, f)
-            
-    except Exception as e:
-        print(e)
             
     print("\n" + "="*60)
     print("ABLATION ANALYSIS RESULTS")
@@ -847,8 +751,8 @@ def analyse_model(cfg, model, tokenizer):
                 if example_with_effect:
                     print("     Example effect:")
                     print(f"     Input: {example_with_effect['input'][:100]}...")
-                    print(f"     Baseline: {example_with_effect['baseline'][len(example_with_effect['input']):len(example_with_effect['input'])+100]}...")
-                    print(f"     Ablated:  {example_with_effect['ablated'][len(example_with_effect['input']):len(example_with_effect['input'])+100]}...")
+                    print(f"     Baseline: {example_with_effect['baseline'][:100]}...")
+                    print(f"     Ablated:  {example_with_effect['ablated'][:100]}...")
 
     return ablation_results
 

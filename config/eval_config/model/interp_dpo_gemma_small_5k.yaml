@@ -2,7 +2,8 @@ name: "gemma"
 version: 2.0
 size: "2B"
 type: dpo_model
-k: 32
+k: 8
+r: 1024
 base_model: "/home/cvenhoff/lora_interp/experiments/merged/google/gemma-2-2b_sft"
 model_it_name: "google/gemma-2-2b-it"
 adapter_checkpoint_dir: "/home/cvenhoff/lora_interp/experiments/gemma-2-2b_topk_dpo_r1024_k8_steps5000/final_adapter"
