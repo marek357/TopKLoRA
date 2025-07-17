@@ -3,6 +3,7 @@ from transformers import (
     AutoModelForCausalLM,
     BitsAndBytesConfig
 )
+import torch._dynamo as dynamo
 from transformers import StaticCache
 from src.utils import (
     autointerp_preprocess_to_messages,
@@ -10,6 +11,8 @@ from src.utils import (
     autointerp_is_valid_dpo_pair,
     AutointerpChatCollator
 )
+import dataclasses
+import glob
 import matplotlib.pyplot as plt
 from transformer_lens import HookedTransformer
 from src.models import FixedTopKLoRALinear, TopKLoRALinear
@@ -18,7 +21,7 @@ from peft import PeftModel
 from itertools import islice
 from tqdm import tqdm
 from pprint import pprint
-from typing import Union, Optional
+from typing import Union, Optional, List
 from dataclasses import dataclass
 import logging
 from torch.utils.data import DataLoader
@@ -27,20 +30,27 @@ import json
 import torch
 import re
 import gc
+import os
+import faulthandler
+faulthandler.enable()
 
+dynamo.config.fail_on_recompile_limit_hit = False
+dynamo.config.recompile_limit = 1e4
+dynamo.config.accumulated_recompile_limit = 1e5
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 @dataclass
 class LatentActivation:
-    activation_magnitude: float
     example_idx: int
-    activating_token_id: int
-    activating_idx: int
-    activating_token: Optional[str]
-    is_padding_token: Optional[bool]
-    baseline_generation: Optional[str] = None
-    ablated_generation: Optional[str] = None
+    activation_magnitude: List[float]
+    activating_token_id: List[int]
+    activating_idx: List[int]
+    activating_token: List[Optional[str]]
+    is_padding_token: List[Optional[bool]]
+    baseline_text: Optional[str] = None
+    ablated_text: Optional[str] = None
     input_text: Optional[str] = None
+    tokenised_input_text: List[Optional[str]] = None
     ablation_has_effect: Optional[bool] = None
 
 class ChatTemplateCollator:
@@ -91,12 +101,17 @@ class TopKHeapHook:
         self.module_name = module_name
         self.k = cfg.evals.auto_interp.k
         self.r = cfg.evals.auto_interp.r
+        self.max_activating_examples = cfg.evals.auto_interp.max_examples_per_latent
         # store activating examples for each latent
         # in the low-rank activation space
         # this will be later used to generate examples
         # and ablate the effect of the latent
         self.activating_examples = {
             latent: []
+            for latent in range(self.r)
+        }
+        self.activation_counts = {
+            latent: 0
             for latent in range(self.r)
         }
         # raise error if params don't make sense
@@ -111,7 +126,7 @@ class TopKHeapHook:
         self.dataset_examples_seen += ex_offset
         self.current_pad_mask  = pad_mask
         if input_ids is not None:
-            self.input_ids = input_ids
+            self.input_ids = input_ids.detach().clone().cpu()
 
     def __call__(self, module, input_activations_tuple, out):
         input_activations = input_activations_tuple[0]
@@ -139,6 +154,7 @@ class TopKHeapHook:
         # iterate over each batch in input activations
         for batch_idx in range(num_batches):
             example_idx = self.dataset_examples_seen + batch_idx
+            activating_stats = {}
             for analysed_token_position in range(seq_length):
                 # skip tokens which are masked
                 if not mask[batch_idx, analysed_token_position]:
@@ -154,16 +170,76 @@ class TopKHeapHook:
                     .tolist()
 
                 for latent in active_latents:
+                    self.activation_counts[latent] += 1
+                    if latent not in activating_stats:
+                        activating_stats[latent] = {
+                            'example_idx': example_idx,
+                            'activation_magnitude': [
+                                low_rank_activations[latent].item()
+                            ],
+                            'activating_token_id': [
+                                self.input_ids[batch_idx][analysed_token_position].item()
+                            ],
+                            'activating_idx': [analysed_token_position],
+                            'activating_token': [None],
+                            'is_padding_token': [None],
+                        }
+                    else:
+                        activating_stats[latent]['activation_magnitude'].append(
+                            low_rank_activations[latent].item()
+                        )
+                        activating_stats[latent]['activating_token_id'].append(
+                            self.input_ids[batch_idx][analysed_token_position].item()
+                        )
+                        activating_stats[latent]['activating_idx'].append(
+                            analysed_token_position
+                        )
+                        activating_stats[latent]['activating_token'].append(None)
+                        activating_stats[latent]['is_padding_token'].append(None)
+                    # self.activating_examples[latent].append(
+                    #     LatentActivation(
+                    #         activation_magnitude=low_rank_activations[latent].item(),
+                    #         example_idx=example_idx,
+                    #         activating_token_id=self.input_ids[batch_idx][analysed_token_position].item(),
+                    #         activating_idx=analysed_token_position,
+                    #         activating_token=None,
+                    #         is_padding_token=None
+                    #     )
+                    # )
+            for latent in activating_stats:
+                if len(self.activating_examples[latent]) > self.max_activating_examples:
+                    #print('logic started thisss;')
+                    min_idx = 0
+                    min_val = max([abs(m) for m in self.activating_examples[latent][0].activation_magnitude])
+                    for idx_ex, ex in enumerate(self.activating_examples[latent]):
+                        step_max = max([abs(m) for m in ex.activation_magnitude])
+                        if step_max < min_val:
+                            min_val = step_max
+                            min_idx = idx_ex
+
+                    if max([abs(m) for m in activating_stats[latent]['activation_magnitude']]) > min_val:
+                        # replace the lowest-activating sample
+                        self.activating_examples[latent][min_idx] = LatentActivation(
+                            example_idx=activating_stats[latent]['example_idx'],
+                            activation_magnitude=activating_stats[latent]['activation_magnitude'],
+                            activating_token_id=activating_stats[latent]['activating_token_id'],
+                            activating_idx=activating_stats[latent]['activating_idx'],
+                            activating_token=activating_stats[latent]['activating_token'],
+                            is_padding_token=activating_stats[latent]['is_padding_token']
+                        )
+                else:
                     self.activating_examples[latent].append(
                         LatentActivation(
-                            activation_magnitude=low_rank_activations[latent].item(),
-                            example_idx=example_idx,
-                            activating_token_id=self.input_ids[batch_idx][analysed_token_position].item(),
-                            activating_idx=analysed_token_position,
-                            activating_token=None,
-                            is_padding_token=None
+                            example_idx=activating_stats[latent]['example_idx'],
+                            activation_magnitude=activating_stats[latent]['activation_magnitude'],
+                            activating_token_id=activating_stats[latent]['activating_token_id'],
+                            activating_idx=activating_stats[latent]['activating_idx'],
+                            activating_token=activating_stats[latent]['activating_token'],
+                            is_padding_token=activating_stats[latent]['is_padding_token']
                         )
                     )
+
+                    
                 
 
 
@@ -281,7 +357,7 @@ def get_hook_statistics(hooks):
     return hook_statistics
 
 
-def precompute_baseline_generations(model, tokenizer, flat_ds, example_indices, cfg, max_seq_len, collate_fn):
+def precompute_baseline_generations(model, tokenizer, flat_ds, example_indices, cfg, max_seq_len, collate_fn, checkpoint_path=None):
     """Precompute baseline generations for all examples that will be used."""
     print("Precomputing baseline generations...")
     
@@ -289,10 +365,20 @@ def precompute_baseline_generations(model, tokenizer, flat_ds, example_indices, 
     batch_size = cfg.evals.auto_interp.batch_size
     max_new_tokens = cfg.evals.auto_interp.max_new_tokens
     autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+    if checkpoint_path is not None:
+        try:
+            with open(checkpoint_path, 'r') as f:
+                baseline_cache = json.dump(f)
+        except Exception as err:
+            print(err)
     
     # Process in batches
     for i in tqdm(range(0, len(example_indices), batch_size), desc="Computing baselines"):
         batch_indices = example_indices[i:i + batch_size]
+        if all([str(idx) in baseline_cache for idx in batch_indices]):
+            print(f'skipping batch {i}, already precomputed...')
+            continue
         batch_examples = [flat_ds[idx] for idx in batch_indices]
         
         # Use the provided collate function
@@ -358,28 +444,107 @@ def precompute_baseline_generations(model, tokenizer, flat_ds, example_indices, 
                 'input': input_text,
                 'baseline': baseline_text.removeprefix(input_text)
             }
+        
+        if checkpoint_path is not None and i % 100 == 0:
+            # checkpoint every 100 steps
+            try:
+                with open(checkpoint_path, 'w+') as f:
+                    json.dump(baseline_cache, f)
+            except Exception as err:
+                print(err)
     
     print(f"Precomputed baselines for {len(baseline_cache)} examples")
     return baseline_cache
+
+
+def dump_hooks(hooks, path):
+    for hook in tqdm(hooks, desc='Serialising hooks'):
+        os.makedirs(path, exist_ok=True)
+        with open(f'{path}/{hook.module_name}.json', 'w+') as f:
+            json.dump({
+                'module_name': hook.module_name,
+                'k': hook.k,
+                'r': hook.r,
+                'dataset_examples_seen': hook.dataset_examples_seen,
+                'activating_examples': {
+                    latent: [
+                        dataclasses.asdict(example)
+                        for example in hook.activating_examples[latent]
+                    ]
+                    for latent in hook.activating_examples
+                },
+                'current_pad_mask': None,
+                'input_ids': None
+            }, f)
+        
+    print('hooks dumped to json')
 
 
 
 def analyse_model(cfg, model, tokenizer):
     torch.set_float32_matmul_precision('high')
     # eot_token_id = configure_eot_token(model, tokenizer)
+    if cfg.evals.auto_interp.max_rows == -1:
+        # MAX_BATCHES = len(loader)
+        pass
+    else:
+        MAX_BATCHES = int(
+            cfg.evals.auto_interp.max_rows/cfg.evals.auto_interp.batch_size
+        )
+    MAX_BATCHES = 3500
+
     chat_collate = ChatTemplateCollator(
         tokenizer, device,
         max_length=cfg.evals.auto_interp.max_length
     )
+
+    skip_batches = 0
     hooks = []
+
+    if os.path.isfile(f'cache/hooks_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_batches{MAX_BATCHES}_with_activations_truncated.pkl'):
+        hook_dict = {}
+        with open(f'cache/hooks_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_batches{MAX_BATCHES}_with_activations_truncated.pkl', 'rb') as f:
+            hook_list = pickle.load(f)
+        for hook in hook_list:
+            hook_dict[hook.module_name] = hook
+        print('loaded hooks from final checkpoint')
+        skip_batches = MAX_BATCHES
+        files = None
+    else:
+        files = glob.glob(f'cache/hooks_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_batches*_with_activations_truncated/')
+        print('Directories:', files)
+        if files:
+            num_batches = max(
+                [
+                    int(f.split('_')[4].removeprefix('batches'))
+                    for f in files
+                ]
+            )
+            print('Last batch:', num_batches)
+            sub_files = glob.glob(f'cache/hooks_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_batches*_with_activations_truncated/*')
+            hook_dict = {}
+            for file in sub_files:
+                with open(file, 'rb') as f:
+                    hook_dict[file.split('/')[-1][:-4]] = pickle.load(f)
+            skip_batches = num_batches
+            print(f'Restarting from {num_batches} computed batches')
+        else:
+            print('No cache files found')
     handles = []
     num_inserted_hooks = 0
     for name, module in model.base_model.model.named_modules():
         if isinstance(module, TopKLoRALinear):
-            # we are using a stateful hook to keep track
-            # of processing example's parameters 
-            # (processing example's idx and mask)
-            hook = TopKHeapHook(name, cfg)
+            # if hooks are not loaded from a checkpoint
+            # initialise them
+            if files == []:
+                # we are using a stateful hook to keep track
+                # of processing example's parameters 
+                # (processing example's idx and mask)
+                hook = TopKHeapHook(name, cfg)
+            else:
+                # if loading from a checkpoint
+                # find the hook for the module
+                hook = hook_dict[name]
             hooks.append(hook)
             handles.append(
                 module.register_forward_hook(hook)
@@ -431,29 +596,34 @@ def analyse_model(cfg, model, tokenizer):
         drop_last=False
     )
 
-    if cfg.evals.auto_interp.max_rows == -1:
-        MAX_BATCHES = len(loader)
-    else:
-        MAX_BATCHES = int(
-            cfg.evals.auto_interp.max_rows/cfg.evals.auto_interp.batch_size
-        )
-    MAX_BATCHES = 3500
+    # MAX_BATCHES = 3000
+    # MAX_BATCHES = 2500
     # MAX_BATCHES = 1
     # take only the first MAX_BATCHES batches
     limited_loader = islice(loader, MAX_BATCHES)
 
-    try:
-        with open(f'cache/hooks_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_batches{MAX_BATCHES}_with_activations.pkl', 'rb+') as f:
-            hooks = pickle.load(f)
-        print('loaded hooks from cache')
+    # try:
+    #     with open(f'cache/hooks_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_batches{MAX_BATCHES}_with_activations.pkl', 'rb') as f:
+    #         hooks = pickle.load(f)
+    #     print('loaded hooks from cache')
 
-    except Exception as e:
-        print(e)
-        for batch in tqdm(
-            limited_loader, 
-            total=MAX_BATCHES, 
-            desc="Collecting hook firings"
+    # except Exception as e:
+    #     print(e)
+
+    # if we already processed the
+    # max number of batches requested
+    # no need to do the computations again
+    if skip_batches < MAX_BATCHES:
+        for index, batch in enumerate(
+            tqdm(
+                limited_loader, 
+                total=MAX_BATCHES, 
+                desc="Collecting hook firings"
+            )
         ):
+            if index < skip_batches:
+                print(f'Batch {index} loaded from cache. Skipping...')
+                continue
             input_ids = batch["input_ids"].to(device)
             for hook in hooks:
                 hook.set_batch_state(
@@ -470,22 +640,64 @@ def analyse_model(cfg, model, tokenizer):
                     pad_mask=None
                 )
 
+            if index % 500 == 0 and index != 0 and index != skip_batches:
+                # add extra metadata
+                print('intermediate dump')
+                for hook in tqdm(hooks, desc='Adding metadata to hook firings'):
+                    for latent in hook.activating_examples:
+                        for latent_activation in hook.activating_examples[latent]:
+                            try:
+                                toks_id = latent_activation.activating_token_id
+                                latent_activation.activating_token = tokenizer.convert_ids_to_tokens(toks_id)
+                                latent_activation.is_padding_token = toks_id == tokenizer.pad_token
+                            except Exception as e:
+                                print(e)
+                                continue
+                print('added metadata to intermediate dump')
+                # try:
+                #     dump_hooks(hooks, f'cache/hooks_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_batches{index}_with_activations.json')
+                # except Exception as e:
+                #     print('failed to dump hooks to json', e)
+                try:
+                    for hook in hooks:
+                        os.makedirs(f'cache/hooks_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_batches{index}_with_activations_truncated', exist_ok=True)
+                        with open(f'cache/hooks_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_batches{index}_with_activations_truncated/{hook.module_name}.pkl', 'wb+') as f:
+                            pickle.dump(hook, f)
+                    print('saved hook firings to pickle')
+                except Exception as err:
+                    print('failed to save hook firings to pickle')
+                    print(err)
+
+
+        print('finished collecting hook firings')
+        # try:
+        #     with open(f'cache/hooks_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_batches{MAX_BATCHES}_with_activations_premetadata.pkl', 'wb+') as f:
+        #         pickle.dump(hooks, f)
+        #     print('saved hook firings to pickle')
+        # except Exception as err:
+        #     print('failed to save hook firings to pickle')
+        #     print(err)
         # add extra metadata
-        for hook in hooks:
+        for hook in tqdm(hooks, desc='Adding metadata to hook firings'):
             for latent in hook.activating_examples:
                 for latent_activation in hook.activating_examples[latent]:
-                    tok_id = latent_activation.activating_token_id
-                    latent_activation.activating_token = tokenizer.decode(
-                        tok_id, skip_special_tokens=False
-                    )
-                    latent_activation.is_padding_token = bool(
-                        tokenizer.pad_token == tok_id
-                    )
-
+                    try:
+                        toks_id = latent_activation.activating_token_id
+                        latent_activation.activating_token = tokenizer.convert_ids_to_tokens(toks_id)
+                        latent_activation.is_padding_token = toks_id == tokenizer.pad_token
+                    except Exception as e:
+                        print(e)
+        print('added metadata')
         try:
-            with open(f'cache/hooks_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_batches{MAX_BATCHES}_with_activations.pkl', 'wb+') as f:
+            dump_hooks(hooks, f'cache/hooks_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_batches{MAX_BATCHES}_with_activations_truncated.json')
+        except Exception as e:
+            print('failed to dump hooks to json', e)
+        try:
+            with open(f'cache/hooks_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_batches{MAX_BATCHES}_with_activations_truncated.pkl', 'wb+') as f:
                 pickle.dump(hooks, f)
+            print('saved hook firings to pickle')
         except Exception as err:
+            print('failed to save hook firings to pickle')
             print(err)
 
     for handle in handles:
@@ -513,7 +725,8 @@ def analyse_model(cfg, model, tokenizer):
         baseline_cache = precompute_baseline_generations(
             model, tokenizer, flat_ds, 
             all_example_indices, cfg, 
-            max_seq_len, chat_collate
+            max_seq_len, chat_collate,
+            f'cache/baselines_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_maxlen{max_len_path}_checkpoint.json'
         )
         try:
             with open(f'cache/baselines_r{cfg.evals.auto_interp.r}_k{cfg.evals.auto_interp.k}_steps{cfg.model.train_steps}_maxlen{max_len_path}.json', 'w+') as f:
@@ -586,8 +799,11 @@ def analyse_model(cfg, model, tokenizer):
                 sorted(
                     hook.activating_examples[latent],
                     # descending sort according to 
-                    # the activation magnitude
-                    key=lambda x: abs(x.activation_magnitude),
+                    # the strongest activation for a token
+                    # in a sequence
+                    key=lambda x: max(
+                        [abs(mgn) for mgn in x.activation_magnitude]
+                    ),
                     reverse=True
                 )
             # restrict to only the top 
@@ -632,7 +848,7 @@ def analyse_model(cfg, model, tokenizer):
                                 ablated_outputs = model.generate(
                                     input_ids,
                                     attention_mask=attention_mask,
-                                    # past_key_values=static_cache,  # Use pre-allocated cache
+                                    past_key_values=static_cache,  # Use pre-allocated cache
                                     max_new_tokens=max_new_tokens,
                                     pad_token_id=tokenizer.pad_token_id,
                                     eos_token_id=model.generation_config.eos_token_id,
@@ -679,6 +895,7 @@ def analyse_model(cfg, model, tokenizer):
                     baseline_text = cached_data['baseline']
                     input_text = cached_data['input']
                     example.input_text = input_text
+                    example.tokenised_input_text = tokenizer.tokenize(input_text)
                     example.baseline_text = baseline_text
                     example.ablated_text = ablated_text.removeprefix(input_text)
                     example.ablation_has_effect = baseline_text != example.ablated_text
@@ -745,7 +962,7 @@ def analyse_model(cfg, model, tokenizer):
                 
                 # Show an example of the effect
                 example_with_effect = next(
-                    (ex for ex in ablation_results[module_name][latent]['examples'] if ex['has_effect']),
+                    (ex for ex in ablation_results[module_name][latent]['examples'] if ex.ablation_has_effect),
                     None
                 )
                 if example_with_effect:
