@@ -43,7 +43,7 @@ def format_example_with_activation_tags(example, tokenizer):
             # Tag all activations for this latent (since we're analyzing this specific latent)
             # Use tokenizer to properly convert single tokens
             token_str = tokenizer.convert_tokens_to_string([token])
-            formatted_text += f"[{token_str.strip()}|{magnitude:.2f}]"
+            formatted_text += f" [{token_str.strip()}|{magnitude:.2f}]"
         else:
             formatted_text += tokenizer.convert_tokens_to_string([token])
     
@@ -119,6 +119,7 @@ Below are examples where this latent both activated strongly AND causally influe
         prompt += f"- Number of activating tokens: {num_activations}\n"
         prompt += f"- Strongest activation: {max_magnitude:.2f}\n"
         prompt += f"- Activation range: [{min(example.activation_magnitude):.2f}, {max(example.activation_magnitude):.2f}]\n"
+        prompt += f"- Activating tokens: {example.activating_token}\n"
         
         # Show full input with activation tags
         prompt += f"\n**Full Input (with activation magnitudes):**\n```\n"
@@ -142,8 +143,8 @@ Below are examples where this latent both activated strongly AND causally influe
         # Show more context around divergence
         if diverge_idx < len(baseline_words):
             # Show 10 words before and 20 after divergence
-            context_start = max(0, diverge_idx - 10)
-            context_end = min(max(len(baseline_words), len(ablated_words)), diverge_idx + 20)
+            context_start = max(0, diverge_idx - 25)
+            context_end = min(max(len(baseline_words), len(ablated_words)), diverge_idx + 30)
             
             baseline_context = " ".join(baseline_words[context_start:context_end])
             ablated_context = " ".join(ablated_words[context_start:context_end] if context_start < len(ablated_words) else ["[GENERATION ENDED]"])
@@ -246,7 +247,7 @@ def run_autointerp_analysis(ablation_results, module_name, latent_idx, tokenizer
         module_name=module_name,
         latent_idx=latent_idx,
         tokenizer=tokenizer,
-        max_examples=10
+        max_examples=20
     )
     
     return prompt
@@ -385,7 +386,7 @@ class QwenInterpretabilityAnalyzer:
             model=self.model_name,
             trust_remote_code=True,
             gpu_memory_utilization=gpu_memory_utilization,
-            max_model_len=16384,  # NOTE: This may cause OOM
+            max_model_len=32768,  # NOTE: This may cause OOM
             download_dir=cache_dir,
             tensor_parallel_size=1,
             dtype="auto",  # Will automatically use int4 for AWQ
@@ -513,9 +514,17 @@ class QwenInterpretabilityAnalyzer:
             batch = prompts[i:i + batch_size]
             prompt_texts = [p[0] for p in batch]
             metadata_list = [p[1] for p in batch]
+
+            # for m in metadata_list:
+            #     print(m['prompt_tok_num'], end=', ')
+            # print()
             
-            # Run batch inference
-            outputs = self.llm.generate(prompt_texts, self.sampling_params)
+            try:
+                # Run batch inference
+                outputs = self.llm.generate(prompt_texts, self.sampling_params)
+            except Exception as e:
+                print(f'[ERROR] Skipping idx {i}:', e)
+                continue
             
             # Process outputs
             for output, metadata in zip(outputs, metadata_list):
@@ -556,7 +565,111 @@ class QwenInterpretabilityAnalyzer:
         logger.info(f"Saved checkpoint with {len(results)} results to {checkpoint_path}")
 
 
+def check_vllm_tokens(analyzer, prompt_text, print_details=True):
+    """
+    Check exactly how many tokens vLLM sees for a given prompt.
+    
+    Args:
+        analyzer: Your QwenInterpretabilityAnalyzer instance
+        prompt_text: The prompt to check
+        print_details: Whether to print detailed information
+    """
+    # Access vLLM's tokenizer
+    vllm_tokenizer = analyzer.llm.llm_engine.tokenizer.tokenizer
+    
+    # For chat models, vLLM applies the chat template internally
+    # Let's manually replicate what vLLM does
+    
+    # Method 1: Direct tokenization (what you're currently checking)
+    direct_tokens = vllm_tokenizer.tokenize(prompt_text)
+    direct_token_ids = vllm_tokenizer.convert_tokens_to_ids(direct_tokens)
+    
+    # Method 2: What vLLM actually uses (with chat template if applicable)
+    # Check if this is a chat model
+    if hasattr(vllm_tokenizer, 'chat_template') and vllm_tokenizer.chat_template:
+        # Apply chat template
+        messages = [{"role": "user", "content": prompt_text}]
+        
+        # This is what vLLM does internally
+        formatted_prompt = vllm_tokenizer.apply_chat_template(
+            messages, 
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        
+        # Now tokenize the formatted prompt
+        actual_tokens = vllm_tokenizer.tokenize(formatted_prompt)
+        actual_token_ids = vllm_tokenizer.convert_tokens_to_ids(actual_tokens)
+    else:
+        # Non-chat model
+        formatted_prompt = prompt_text
+        actual_tokens = direct_tokens
+        actual_token_ids = direct_token_ids
+    
+    # Method 3: Use vLLM's internal processor (most accurate)
+    # This is exactly what happens when you call generate()
+    from vllm.sequence import Logprob
+    from vllm.transformers_utils.tokenizer import get_tokenizer
+    
+    # Get the processed inputs as vLLM sees them
+    if hasattr(analyzer.llm, 'llm_engine'):
+        # Access the engine's processor
+        engine = analyzer.llm.llm_engine
+        
+        # For newer vLLM versions
+        if hasattr(engine, 'processor'):
+            processor = engine.processor
+            # Process the inputs
+            processed = processor.process_inputs(
+                request_id=f"test_{hash(prompt_text)}",
+                prompt=prompt_text,
+                params=analyzer.sampling_params
+            )
+            
+            if hasattr(processed, 'prompt_token_ids'):
+                vllm_token_ids = processed.prompt_token_ids
+            else:
+                vllm_token_ids = None
+        else:
+            vllm_token_ids = None
+    
+    if print_details:
+        print(f"=== Token Count Analysis ===")
+        print(f"Direct tokenization: {len(direct_token_ids)} tokens")
+        print(f"With chat template: {len(actual_token_ids)} tokens")
+        
+        if vllm_token_ids:
+            print(f"vLLM internal: {len(vllm_token_ids)} tokens")
+        
+        print(f"\nChat template overhead: {len(actual_token_ids) - len(direct_token_ids)} tokens")
+        print(f"Max model length: {analyzer.llm.llm_engine.model_config.max_model_len}")
+        print(f"Will fit: {'YES' if len(actual_token_ids) <= analyzer.llm.llm_engine.model_config.max_model_len else 'NO'}")
+        
+        if len(actual_token_ids) > analyzer.llm.llm_engine.model_config.max_model_len:
+            print(f"OVERFLOW by: {len(actual_token_ids) - analyzer.llm.llm_engine.model_config.max_model_len} tokens!")
+        
+        # Show a sample of the formatted prompt
+        if formatted_prompt != prompt_text:
+            print(f"\n=== Chat Template Format ===")
+            print("First 500 chars of formatted prompt:")
+            print(formatted_prompt[:500])
+            print("...")
+            print("Last 200 chars:")
+            print(formatted_prompt[-200:])
+    
+    return {
+        'direct_tokens': len(direct_token_ids),
+        'chat_tokens': len(actual_token_ids),
+        'vllm_tokens': len(vllm_token_ids) if vllm_token_ids else None,
+        'max_length': analyzer.llm.llm_engine.model_config.max_model_len,
+        'will_fit': len(actual_token_ids) <= analyzer.llm.llm_engine.model_config.max_model_len,
+        'overflow': max(0, len(actual_token_ids) - analyzer.llm.llm_engine.model_config.max_model_len),
+        'chat_overhead': len(actual_token_ids) - len(direct_token_ids),
+        'formatted_prompt': formatted_prompt
+    }
+
 def prepare_prompts_for_module(
+    analyzer,
     ablation_results: Dict,
     module_name: str,
     tokenizer,
@@ -582,7 +695,7 @@ def prepare_prompts_for_module(
     
     if max_prompts:
         causal_latents = causal_latents[:max_prompts]
-    
+        
     for latent_idx, latent_data in tqdm(causal_latents, desc=f"Preparing prompts for {module_name}"):
         try:
             prompt = generate_autointerp_prompt(
@@ -590,14 +703,42 @@ def prepare_prompts_for_module(
                 module_name=module_name,
                 latent_idx=latent_idx,
                 tokenizer=tokenizer,
-                max_examples=10
+                max_examples=20
             )
+
+            max_examples = 19
+            decrease = False
+            try:
+                meta = check_vllm_tokens(analyzer, prompt, False)
+            except Exception:
+                decrease = True
+            while not meta['will_fit'] or decrease:
+                decrease = False
+                try:
+                    prompt = generate_autointerp_prompt(
+                        latent_data=latent_data,
+                        module_name=module_name,
+                        latent_idx=latent_idx,
+                        tokenizer=tokenizer,
+                        max_examples=max_examples
+                    )
+                    meta = check_vllm_tokens(analyzer, prompt, False)
+                except Exception:
+                    pass
+                try:
+                    analyzer.llm.generate(prompt, analyzer.sampling_params)
+                except Exception as e:
+                    print('local generate error:', e)
+                max_examples -= 1
+
+            assert len(tokenizer.tokenize(prompt)) < 32768
             
             metadata = {
                 'module_name': module_name,
                 'latent_idx': latent_idx,
                 'num_examples': len(latent_data.get('examples', [])),
-                'effect_rate': latent_data.get('effect_rate', 0)
+                'effect_rate': latent_data.get('effect_rate', 0),
+                # 'prompt_tok_num': meta['chat_tokens']
             }
             
             prompts.append((prompt, metadata))
@@ -627,6 +768,9 @@ def run_full_analysis(
     logger.info(f"Loading ablation results from {ablation_results_path}")
     with open(ablation_results_path, 'rb') as f:
         ablation_results = pickle.load(f)
+
+    # print(run_autointerp_analysis(ablation_results, 'model.layers.11.self_attn.q_proj', 889, tokenizer))
+    # assert False
     
     # Initialize analyzer
     analyzer = QwenInterpretabilityAnalyzer()
@@ -655,6 +799,7 @@ def run_full_analysis(
         
         # Prepare prompts
         prompts = prepare_prompts_for_module(
+            analyzer,
             ablation_results,
             module_name,
             tokenizer,
@@ -755,7 +900,7 @@ if __name__ == "__main__":
     parser.add_argument("--ablation-results", required=True, help="Path to ablation results pickle file")
     parser.add_argument("--output-dir", required=True, help="Output directory for results")
     parser.add_argument("--use-awq", action="store_true", help="Use AWQ quantized model")
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size for inference")
+    parser.add_argument("--batch-size", type=int, default=5, help="Batch size for inference")
     parser.add_argument("--min-effect-rate", type=float, default=0.1, help="Minimum effect rate to analyze")
     parser.add_argument("--checkpoint-every", type=int, default=100, help="Save checkpoint every N batches")
     

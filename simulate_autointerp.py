@@ -11,6 +11,8 @@ from vllm import SamplingParams
 import logging
 import pickle
 from collections import defaultdict
+import os
+
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +248,7 @@ NO_ACTIVATION:
             for pos in range(len(example.tokenized_text)):
                 pred_val = preds.get(pos, 0.0)
                 actual_val = abs(example.actual_activations.get(pos, 0.0))
+                # print(example.actual_activations, pos)
                 
                 all_predicted.append(pred_val)
                 all_actual.append(actual_val)
@@ -285,6 +288,23 @@ NO_ACTIVATION:
         
         # Top-k accuracy
         top_k_accuracy = self.compute_top_k_accuracy(predictions, examples)
+        # print({
+        #     'pearson_correlation': pearson_corr,
+        #     'spearman_correlation': spearman_corr,
+        #     'pr_auc': pr_auc,
+        #     'roc_auc': roc_auc,
+        #     'precision': precision_at_threshold,
+        #     'recall': recall_at_threshold,
+        #     'f1_score': f1,
+        #     'top_k_accuracy': top_k_accuracy,
+        #     'num_true_positives': int(true_positives),
+        #     'num_false_positives': int(false_positives),
+        #     'num_false_negatives': int(false_negatives),
+        #     'total_actual_activations': int(np.sum(all_binary_actual)),
+        #     'total_predicted_activations': int(np.sum(all_binary_predicted))
+        # })
+        # assert False
+
         
         return {
             'pearson_correlation': pearson_corr,
@@ -422,7 +442,7 @@ def run_simulation_validation(
     logger.info(f"Simulating {len(to_simulate)} interpretations")
     
     simulation_results = []
-    
+    per_gpu_examples = 1000
     for result in tqdm(to_simulate[10:1010], desc="Running simulations"): # TODO: all sims
         # Prepare examples
         try:
@@ -594,164 +614,6 @@ def compute_confidence_correlation(
     return 0.0
 
 
-def run_fast_simulation_validation(
-    interpretability_results_path: str,
-    ablation_results_path: str,
-    output_dir: str,
-    tokenizer,
-    stage="both",  # "quick", "detailed", or "both"
-    max_latents=5000,
-    quick_examples=3,
-    detailed_examples=10,
-    confidence_threshold=0.6
-):
-    """Optimized simulation validation pipeline."""
-    
-    # Load data
-    with open(interpretability_results_path, 'r') as f:
-        all_interpretations = json.load(f)
-    
-    logger.info(f"Loaded {len(all_interpretations)} interpretations")
-    
-    # Stage 1: Quick filtering with small model
-    if stage in ["quick", "both"]:
-        logger.info("Stage 1: Quick validation")
-        from vllm import LLM
-        # Use smaller model for quick validation
-        quick_model = LLM(
-            model="Qwen/Qwen2.5-7B-Instruct",
-            gpu_memory_utilization=0.5,
-            max_model_len=1024,
-        )
-        
-        # Pre-filter by confidence
-        candidates = [r for r in all_interpretations 
-                     if r['confidence_score'] >= confidence_threshold][:max_latents]
-        
-        logger.info(f"Quick validating {len(candidates)} candidates")
-        
-        quick_results = []
-        batch_size = 64  # Large batch for simple prompts
-        
-        for i in tqdm(range(0, len(candidates), batch_size)):
-            batch = candidates[i:i+batch_size]
-            prompts = []
-            
-            for interp in batch:
-                # Ultra-simple validation prompt
-                prompt = f"""Hypothesis: {interp['hypothesis']}
-Effect rate: {interp['effect_rate']:.1%}
-Confidence: {interp['confidence']}
-
-Is this hypothesis likely correct? Answer: YES or NO"""
-                prompts.append(prompt)
-            
-            outputs = quick_model.generate(
-                prompts, 
-                SamplingParams(max_tokens=5, temperature=0)
-            )
-            
-            for j, output in enumerate(outputs):
-                response = output.outputs[0].text.upper()
-                score = 1.0 if "YES" in response else 0.3
-                quick_results.append({
-                    **batch[j],
-                    'quick_validation_score': score
-                })
-        
-        # Filter for detailed validation
-        promising = [r for r in quick_results 
-                    if r['quick_validation_score'] > 0.5]
-        
-        logger.info(f"Selected {len(promising)} for detailed validation")
-        
-        # Save quick results
-        with open(Path(output_dir) / "quick_validation.json", 'w') as f:
-            json.dump(quick_results, f)
-        
-        del quick_model  # Free memory
-        torch.cuda.empty_cache()
-    
-    # Stage 2: Detailed validation on filtered set
-    if stage in ["detailed", "both"]:
-        logger.info("Stage 2: Detailed validation")
-        
-        if stage == "detailed":
-            # Load from previous quick validation
-            with open(Path(output_dir) / "quick_validation.json", 'r') as f:
-                quick_results = json.load(f)
-            promising = [r for r in quick_results 
-                        if r.get('quick_validation_score', 0) > 0.5]
-        
-        # Use medium model for detailed validation
-        detailed_model = LLM(
-            model="Qwen/Qwen2.5-14B-Instruct",  # Compromise
-            gpu_memory_utilization=0.8,
-            max_model_len=2048,
-        )
-        
-        # Run simplified simulation
-        simulator = LatentSimulator(
-            detailed_model,
-            sampling_params=SamplingParams(
-                temperature=0.1,
-                max_tokens=256,  # Shorter responses
-                stop=["NO_ACTIVATION"],  # Stop early
-            )
-        )
-        
-        with open(ablation_results_path, 'rb') as f:
-            ablation_results = pickle.load(f)
-        
-        detailed_results = []
-        
-        for interp in tqdm(promising, desc="Detailed validation"):
-            try:
-                examples = prepare_simulation_examples(
-                    ablation_results,
-                    interp['module_name'],
-                    interp['latent_idx'],
-                    tokenizer,
-                    num_examples=detailed_examples
-                )
-                
-                # Fast simulation without CoT
-                predictions = simulator.simulate_batch(
-                    interp['hypothesis'],
-                    examples,
-                    batch_size=16,
-                    include_cot=False
-                )
-                
-                metrics = simulator.compute_metrics(predictions, examples)
-                
-                detailed_results.append({
-                    **interp,
-                    'validation_metrics': metrics,
-                    'validation_f1': metrics['f1_score']
-                })
-                
-            except Exception as e:
-                logger.error(f"Error: {e}")
-                continue
-        
-        # Save results
-        output_path = Path(output_dir)
-        output_path.mkdir(exist_ok=True)
-        
-        with open(output_path / "detailed_validation.json", 'w') as f:
-            json.dump(detailed_results, f, indent=2)
-        
-        logger.info(f"Completed validation of {len(detailed_results)} latents")
-        
-        # Summary statistics
-        valid_interpretations = [r for r in detailed_results 
-                                if r['validation_f1'] > 0.5]
-        logger.info(f"Valid interpretations: {len(valid_interpretations)} "
-                   f"({len(valid_interpretations)/len(detailed_results)*100:.1f}%)")
-    
-    return quick_results if stage == "quick" else detailed_results
-
 
 # Example usage
 if __name__ == "__main__":
@@ -763,6 +625,9 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", required=True, help="Output directory")
     parser.add_argument("--num-examples", type=int, default=10, help="Examples per latent")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size")
+    parser.add_argument("--validation-mode", type=str, choices=["token", "example"], 
+                   default="token", help="Validation mode: token-level or example-level")
+
     
     args = parser.parse_args()
     

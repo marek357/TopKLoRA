@@ -1,15 +1,17 @@
 name: auto-interpret
 layer_idx: 11
-k_heap: 50
+# k_heap: 50
 # k: 32
 # r: 4096
 k: ${model.k}
 r: ${model.r}
+ablation_study: False
+activations_study: True
 train_steps: 5000
 batch_size: 10
 max_new_tokens: 125
 hook_type: "disable"
-max_examples_per_latent: 20
+max_examples_per_latent: 250
 latent_interp_batch_size: 10
 max_length: 512
 max_rows: 10

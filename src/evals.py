@@ -227,6 +227,41 @@ def init_model_tokenizer(model_cfg, auto_interp=False):
     else:
         return model, tokenizer
 
+def check_bbt_norm():
+    base_model='/home/cvenhoff/lora_interp/experiments/merged/google/gemma-2-2b_sft'
+    adapter_dir='/home/cvenhoff/lora_interp/experiments/gemma-2-2b_topk_dpo_r1024_k8_steps5000/final_adapter'
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model,
+        torch_dtype="auto",
+        device_map="cpu"
+    )
+
+    model = PeftModel.from_pretrained(
+        model,
+        adapter_dir,
+        # there are issues with mps
+        # so first loading to cpu
+        # and then moving it to $device
+        device_map="cpu",
+        use_safetensors=True
+    )
+    for name, module in model.named_modules():
+        if hasattr(module, "lora_B"):
+            lora_B = module.lora_B
+            B = lora_B['default'].weight
+            B = B.T
+            # Normalize
+            B_norm = B / B.norm(dim=1, keepdim=True)
+            # Compute cosine similarity matrix
+            sim_matrix = B_norm @ B_norm.T  # Shape: [in_dim, in_dim]
+            # Print the cosine similarity matrix
+            # Check if any value is greater than 0.99
+            if (sim_matrix > 0.8).any():
+                print(f"High similarity detected in {name} with value: {torch.ones_like(sim_matrix)[sim_matrix > 0.8].sum()-1024} non-diagonal elements")
+                # print(torch.nonzero(sim_matrix[sim_matrix > 0.99]))   
+                    
+            print("-" * 40)
+
 def metrics():
     def eval_metrics(cfg):
         model, tokenizer = init_model_tokenizer(cfg.model)
