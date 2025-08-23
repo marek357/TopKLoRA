@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import time
@@ -6,6 +7,7 @@ from googleapiclient import discovery
 from collections import defaultdict
 import numpy as np
 from openai import OpenAI
+from src.delphi_autointerp import delphi_score
 from src.models import TopKLoRALinear
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import (
@@ -13,7 +15,7 @@ from datasets import (
     load_dataset,
     concatenate_datasets
 )
-from src.analysis import analyse_model
+from src.autointerp import analyse_model
 import torch.nn.functional as F
 from peft import PeftModel
 from torch.utils.data import DataLoader
@@ -42,6 +44,7 @@ from src.utils import (
     autointerp_token_windows_dict,
     autointerp_violates_alternation,
     build_metrics_eval_messages,
+    build_quant_config,
     preprocess_to_perspective_message
 )
 
@@ -49,16 +52,6 @@ from src.utils import (
 device = 'cuda' if torch.cuda.is_available() else \
     'mps' if torch.mps.is_available() else 'cpu'
 
-import hashlib
-
-# def hash_lora_weights(model):
-#     import hashlib
-#     sha = hashlib.sha256()
-#     for name, module in model.named_modules():
-#         if isinstance(module, TopKLoRALinear):
-#             for pname, param in module.lora_module.named_parameters():
-#                 sha.update(param.detach().cpu().numpy().tobytes())
-#     return sha.hexdigest()
 
 def hash_lora_weights(model):
     sha = hashlib.sha256()
@@ -129,8 +122,10 @@ def init_model_tokenizer(model_cfg, auto_interp=False):
         device_map="cpu",
         use_safetensors=True
     )
+
     replaced = 0
     wrapped_modules = {}
+    # if model_cfg.r != model_cfg.k and False:
     for name, module in model.named_modules():
         if isinstance(module, TopKLoRALinear):
             continue  # Already wrapped
@@ -146,6 +141,8 @@ def init_model_tokenizer(model_cfg, auto_interp=False):
                 autointerp_evaluation_mode=auto_interp
             )
             setattr(parent, attr, wrapped)
+            # Add the wrapped module to the dictionary immediately
+            wrapped_modules[name] = wrapped
             replaced += 1
     print(f"Wrapped {replaced} LoraLayer modules into TopKLoRALinear.")
     model.to(device)
@@ -166,11 +163,15 @@ def init_model_tokenizer(model_cfg, auto_interp=False):
 
     debug_lora_weights(model)
 
+    # Add any additional TopKLoRALinear modules that might have been pre-existing
     for name, module in model.named_modules():
-        if isinstance(module, TopKLoRALinear):
+        if isinstance(module, TopKLoRALinear) and name not in wrapped_modules:
             wrapped_modules[name] = module
 
-
+    print(f"Final wrapped_modules count: {len(wrapped_modules)}")
+    print("Wrapped modules:")
+    for name in wrapped_modules.keys():
+        print(f"  - {name}")
 
     eot_token = (
         tokenizer.special_tokens_map.get(
@@ -178,46 +179,36 @@ def init_model_tokenizer(model_cfg, auto_interp=False):
         if len(tokenizer.special_tokens_map.get("additional_special_tokens", [])) > 1
         else tokenizer.eos_token
     )
-    
+
     # Convert to ID
     eot_token_id = tokenizer.convert_tokens_to_ids(eot_token)
-    
+
     # Get the base EOS token ID
     base_eos_token_id = tokenizer.eos_token_id
-    
+
     # Update generation config with both EOS and EOT tokens
     if hasattr(model.generation_config, 'eos_token_id'):
         # Create a list of both tokens
         eos_token_ids = []
-        
+
         # Add base EOS token
         if isinstance(base_eos_token_id, list):
             eos_token_ids.extend(base_eos_token_id)
         else:
             eos_token_ids.append(base_eos_token_id)
-        
+
         # Add EOT token if it's different
         if eot_token_id not in eos_token_ids:
             eos_token_ids.append(eot_token_id)
-        
+
         model.generation_config.eos_token_id = eos_token_ids
     else:
-        model.generation_config.eos_token_id = [base_eos_token_id, eot_token_id]
-    
+        model.generation_config.eos_token_id = [
+            base_eos_token_id, eot_token_id]
+
     # Log the configuration
     print(f"EOT token: '{eot_token}' (ID: {eot_token_id})")
     print(f"EOS token ID(s): {model.generation_config.eos_token_id}")
-
-
-
-    # if 'gemma' in model_cfg.name:
-    #     tokenizer.padding_side = "left"
-    #     tokenizer.truncation_side = "left"
-    #     model.generation_config.eos_token_id = [1, 107]
-    #     model.generation_config.max_length = 512
-
-    # elif 'llama' in model_cfg.name:
-    #     tokenizer.pad_token = tokenizer.eos_token
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -227,9 +218,10 @@ def init_model_tokenizer(model_cfg, auto_interp=False):
     else:
         return model, tokenizer
 
+
 def check_bbt_norm():
-    base_model='/home/cvenhoff/lora_interp/experiments/merged/google/gemma-2-2b_sft'
-    adapter_dir='/home/cvenhoff/lora_interp/experiments/gemma-2-2b_topk_dpo_r1024_k8_steps5000/final_adapter'
+    base_model = '/home/cvenhoff/lora_interp/experiments/merged/google/gemma-2-2b_sft'
+    adapter_dir = '/home/cvenhoff/lora_interp/experiments/gemma-2-2b_topk_dpo_r1024_k8_steps5000/final_adapter'
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
         torch_dtype="auto",
@@ -257,10 +249,12 @@ def check_bbt_norm():
             # Print the cosine similarity matrix
             # Check if any value is greater than 0.99
             if (sim_matrix > 0.8).any():
-                print(f"High similarity detected in {name} with value: {torch.ones_like(sim_matrix)[sim_matrix > 0.8].sum()-1024} non-diagonal elements")
-                # print(torch.nonzero(sim_matrix[sim_matrix > 0.99]))   
-                    
+                print(
+                    f"High similarity detected in {name} with value: {torch.ones_like(sim_matrix)[sim_matrix > 0.8].sum()-1024} non-diagonal elements")
+                # print(torch.nonzero(sim_matrix[sim_matrix > 0.99]))
+
             print("-" * 40)
+
 
 def metrics():
     def eval_metrics(cfg):
@@ -332,8 +326,8 @@ def metrics():
 
                 pred = 1 if logp_B > logp_A else 0
                 if i % 10 == 0:
-                    print(f"[EX {i}] GOLD={gold_idx} | logp_A={logp_A:.4f} | logp_B={logp_B:.4f} | pred={pred}")
-
+                    print(
+                        f"[EX {i}] GOLD={gold_idx} | logp_A={logp_A:.4f} | logp_B={logp_B:.4f} | pred={pred}")
 
                 metric_global.add(prediction=pred, reference=gold_idx)
                 metrics_by_subset[ex["subset"]].add(
@@ -354,14 +348,17 @@ def metrics():
 
 def auto_interp():
     def eval_auto_interp(cfg):
-        model, tokenizer, _ = init_model_tokenizer(cfg.model, True)
-        analyse_model(cfg, model, tokenizer)
+        model, tokenizer, wrapped_modules = init_model_tokenizer(
+            cfg.model, True)
+        # analyse_model(cfg, model, tokenizer, wrapped_modules)
+        delphi_score(cfg, model, tokenizer, wrapped_modules)
         return
         print('Evaluating auto interp')
         if 'sft' in cfg.model.adapter_checkpoint_dir:
             print('SFT model, skipping auto interp...')
             return
-        model, tokenizer, topk_modules = init_model_tokenizer(cfg.model, auto_interp=True)
+        model, tokenizer, topk_modules = init_model_tokenizer(
+            cfg.model, auto_interp=True)
 
         topk_store = defaultdict(
             lambda: defaultdict(lambda: {"pos": [], "neg": []})
@@ -469,7 +466,7 @@ def auto_interp():
         #     print('succesfully loaded neuron interp from cache')
         # except FileNotFoundError:
         #    print('neuron interp not found in cache, regenerating...')
-        
+
         # json_blob = autointerp_build_lora_json_with_responses(
         #     adapters_pos_map,
         #     flat_ds, tokenizer,
@@ -536,7 +533,106 @@ def auto_interp():
 
 def toxicity():
     def eval_toxicity(cfg):
-        model, tokenizer = init_model_tokenizer(cfg.model)
+        if cfg.evals.toxicity.eval_base_model:
+            print('Evaluating toxicity on the base model...')
+            tokenizer = AutoTokenizer.from_pretrained(
+                cfg.model.base_model,
+                use_fast=True
+            )
+            model = AutoModelForCausalLM.from_pretrained(
+                cfg.model.base_model,
+                torch_dtype="auto",
+                device_map="cpu"
+            )
+
+            if not getattr(tokenizer, "chat_template", None):
+                logging.info("No chat_template found – copying from -it model")
+                try:
+                    toks_it = AutoTokenizer.from_pretrained(
+                        cfg.model.model_it_name,
+                        use_fast=False
+                    )
+                    if getattr(toks_it, "chat_template", None):
+                        tokenizer.chat_template = toks_it.chat_template
+                        logging.info("chat_template copied successfully")
+                    # Merge additional special tokens if needed
+                    extra = toks_it.special_tokens_map.get(
+                        "additional_special_tokens", []
+                    )
+                    if extra:
+                        new_tokens = [
+                            t for t in extra if t not in tokenizer.get_vocab()
+                        ]
+                        if new_tokens:
+                            tokenizer.add_special_tokens(
+                                {"additional_special_tokens": new_tokens}
+                            )
+                            model.resize_token_embeddings(len(tokenizer))
+                            logging.info(
+                                "Added %d extra special tokens",
+                                len(new_tokens)
+                            )
+                except Exception as exc:  # noqa: BLE001
+                    logging.warning("Failed to copy -it tokenizer: %s", exc)
+
+            model.to(device)
+            model.eval()
+
+            print(f"Adapter SHA256 hash: {hash_lora_weights(model)}")
+
+            eot_token = (
+                tokenizer.special_tokens_map.get(
+                    "additional_special_tokens", [tokenizer.eos_token])[1]
+                if len(tokenizer.special_tokens_map.get("additional_special_tokens", [])) > 1
+                else tokenizer.eos_token
+            )
+
+            # Convert to ID
+            eot_token_id = tokenizer.convert_tokens_to_ids(eot_token)
+
+            # Get the base EOS token ID
+            base_eos_token_id = tokenizer.eos_token_id
+
+            # Update generation config with both EOS and EOT tokens
+            if hasattr(model.generation_config, 'eos_token_id'):
+                # Create a list of both tokens
+                eos_token_ids = []
+
+                # Add base EOS token
+                if isinstance(base_eos_token_id, list):
+                    eos_token_ids.extend(base_eos_token_id)
+                else:
+                    eos_token_ids.append(base_eos_token_id)
+
+                # Add EOT token if it's different
+                if eot_token_id not in eos_token_ids:
+                    eos_token_ids.append(eot_token_id)
+
+                model.generation_config.eos_token_id = eos_token_ids
+            else:
+                model.generation_config.eos_token_id = [
+                    base_eos_token_id, eot_token_id]
+
+            # Log the configuration
+            print(f"EOT token: '{eot_token}' (ID: {eot_token_id})")
+            print(f"EOS token ID(s): {model.generation_config.eos_token_id}")
+
+            # if 'gemma' in model_cfg.name:
+            #     tokenizer.padding_side = "left"
+            #     tokenizer.truncation_side = "left"
+            #     model.generation_config.eos_token_id = [1, 107]
+            #     model.generation_config.max_length = 512
+
+            # elif 'llama' in model_cfg.name:
+            #     tokenizer.pad_token = tokenizer.eos_token
+
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+        else:
+            print('Evaluating toxicity on the adapter model...')
+            model, tokenizer = init_model_tokenizer(cfg.model)
+            print(model)
+            # assert False
 
         client = discovery.build(
             "commentanalyzer",
@@ -586,6 +682,7 @@ def toxicity():
                 batch_prompts,
                 return_tensors="pt",
                 padding=True,
+                max_length=256,
                 truncation=True,
             ).to(device)
 
@@ -648,7 +745,7 @@ def toxicity():
                 'summary': {},
                 'details': []
             }
-        for text in completions_only:
+        for text in tqdm(completions_only, desc='Collecting toxicity evals'):
             response = analyze_text_toxicity_eval(
                 text, requested_attributes, client
             )
@@ -660,7 +757,7 @@ def toxicity():
                     'score': toxicity_score
                 })
             # printing first 30 chars because terminal gets flooded otherwise
-            print(f"Text: {repr(text)[:30]}...\n Score: {toxicity_score}\n")
+            # print(f"Text: {repr(text)[:30]}...\n Score: {toxicity_score}\n")
         print(f"Overall Toxicity: {(np.array(toxicity_scores) > 0.5).mean()} ")
         print(toxicity_scores)
         if cfg.evals.toxicity.dump_analysis:
@@ -673,9 +770,24 @@ def toxicity():
             # ensure the directory exists before dumping
             path = Path(cfg.evals.toxicity.dump_path)
             path.mkdir(parents=True, exist_ok=True)
+            if not cfg.evals.toxicity.eval_base_model:
+                with open(cfg.model.adapter_checkpoint_dir + '/../hparams.json', 'r') as f:
+                    model_hparams = json.load(f)
+                r = model_hparams['lora_topk']['r']
+                k = model_hparams['lora_topk']['k_final']
+
+            # ensure the directory exists before dumping
+            os.makedirs(
+                f'{cfg.evals.toxicity.dump_path}_{"base" if cfg.evals.toxicity.eval_base_model else f"adapter_{r}_{k}"}',
+                exist_ok=True
+            )
+            # dump the analysis
+            print(
+                f"Dumping toxicity analysis to: {cfg.evals.toxicity.dump_path}_{'base' if cfg.evals.toxicity.eval_base_model else f'adapter_{r}_{k}'}"
+            )
             with open(
                 os.path.join(
-                    cfg.evals.toxicity.dump_path,
+                    f'{cfg.evals.toxicity.dump_path}_{"base" if cfg.evals.toxicity.eval_base_model else f"adapter_{r}_{k}"}',
                     'toxicity_analysis.json'
                 ), 'w+'
             ) as f:
@@ -695,7 +807,106 @@ def toxicity():
 
 def instruction_following():
     def eval_instruction_following(cfg):
-        model, tokenizer = init_model_tokenizer(cfg.model)
+        # model, tokenizer = init_model_tokenizer(cfg.model)
+        if cfg.evals.instruction_following.eval_base_model:
+            print('Evaluating instruction following on the base model...')
+            tokenizer = AutoTokenizer.from_pretrained(
+                cfg.model.base_model,
+                use_fast=True
+            )
+            model = AutoModelForCausalLM.from_pretrained(
+                cfg.model.base_model,
+                torch_dtype="auto",
+                device_map="cpu"
+            )
+
+            if not getattr(tokenizer, "chat_template", None):
+                logging.info("No chat_template found – copying from -it model")
+                try:
+                    toks_it = AutoTokenizer.from_pretrained(
+                        cfg.model.model_it_name,
+                        use_fast=False
+                    )
+                    if getattr(toks_it, "chat_template", None):
+                        tokenizer.chat_template = toks_it.chat_template
+                        logging.info("chat_template copied successfully")
+                    # Merge additional special tokens if needed
+                    extra = toks_it.special_tokens_map.get(
+                        "additional_special_tokens", []
+                    )
+                    if extra:
+                        new_tokens = [
+                            t for t in extra if t not in tokenizer.get_vocab()
+                        ]
+                        if new_tokens:
+                            tokenizer.add_special_tokens(
+                                {"additional_special_tokens": new_tokens}
+                            )
+                            model.resize_token_embeddings(len(tokenizer))
+                            logging.info(
+                                "Added %d extra special tokens",
+                                len(new_tokens)
+                            )
+                except Exception as exc:  # noqa: BLE001
+                    logging.warning("Failed to copy -it tokenizer: %s", exc)
+
+            model.to(device)
+            model.eval()
+
+            print(f"Adapter SHA256 hash: {hash_lora_weights(model)}")
+
+            eot_token = (
+                tokenizer.special_tokens_map.get(
+                    "additional_special_tokens", [tokenizer.eos_token])[1]
+                if len(tokenizer.special_tokens_map.get("additional_special_tokens", [])) > 1
+                else tokenizer.eos_token
+            )
+
+            # Convert to ID
+            eot_token_id = tokenizer.convert_tokens_to_ids(eot_token)
+
+            # Get the base EOS token ID
+            base_eos_token_id = tokenizer.eos_token_id
+
+            # Update generation config with both EOS and EOT tokens
+            if hasattr(model.generation_config, 'eos_token_id'):
+                # Create a list of both tokens
+                eos_token_ids = []
+
+                # Add base EOS token
+                if isinstance(base_eos_token_id, list):
+                    eos_token_ids.extend(base_eos_token_id)
+                else:
+                    eos_token_ids.append(base_eos_token_id)
+
+                # Add EOT token if it's different
+                if eot_token_id not in eos_token_ids:
+                    eos_token_ids.append(eot_token_id)
+
+                model.generation_config.eos_token_id = eos_token_ids
+            else:
+                model.generation_config.eos_token_id = [
+                    base_eos_token_id, eot_token_id]
+
+            # Log the configuration
+            print(f"EOT token: '{eot_token}' (ID: {eot_token_id})")
+            print(f"EOS token ID(s): {model.generation_config.eos_token_id}")
+
+            # if 'gemma' in model_cfg.name:
+            #     tokenizer.padding_side = "left"
+            #     tokenizer.truncation_side = "left"
+            #     model.generation_config.eos_token_id = [1, 107]
+            #     model.generation_config.max_length = 512
+
+            # elif 'llama' in model_cfg.name:
+            #     tokenizer.pad_token = tokenizer.eos_token
+
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+        else:
+            print('Evaluating toxicity on the adapter model...')
+            model, tokenizer = init_model_tokenizer(cfg.model)
+
         evaluator = Evaluator(instruction_registry)
         input_examples = get_default_dataset("en")
 

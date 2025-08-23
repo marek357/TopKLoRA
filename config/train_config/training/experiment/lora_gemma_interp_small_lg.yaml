@@ -1,0 +1,17 @@
+size: "small"
+lora:
+  r: 1024
+  bias: 'none'
+  alpha: 8
+  dropout: 0.05
+  top_k_experiment: True
+  k: 8
+  temperature: 0.1
+  target_modules:
+    - layers.11.self_attn.q_proj
+    - layers.11.self_attn.k_proj
+    - layers.11.self_attn.v_proj
+    - layers.11.self_attn.o_proj
+    - layers.11.mlp.gate_proj
+    - layers.11.mlp.up_proj
+    - layers.11.mlp.down_proj

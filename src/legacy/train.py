@@ -26,8 +26,14 @@ from peft import PeftModelForCausalLM, PeftModel
 import numpy as np
 import logging
 
+
+local_rank = int(os.environ.get("LOCAL_RANK", 0))
+torch.cuda.set_device(local_rank)
+
 device = 'cuda' if torch.cuda.is_available() else \
     'mps' if torch.mps.is_available() else 'cpu'
+
+
 
 
 def compute_metrics(eval_pred):
@@ -160,7 +166,8 @@ def lukas_sft(cfg):
             attn_implementation='eager',
             # quantization doesn't work on Apple Metal
             quantization_config=quant_cfg if device != 'mps' else None,
-            device_map="auto",
+            # device_map="auto",
+            device_map={"": local_rank},
             trust_remote_code=True
         )
     else:
@@ -168,7 +175,8 @@ def lukas_sft(cfg):
             cfg.training.model.model_name,
             # quantization doesn't work on Apple Metal
             quantization_config=quant_cfg if device != 'mps' else None,
-            device_map="auto",
+            # device_map="auto",
+            device_map={"": local_rank},
             trust_remote_code=True
         )
 
@@ -203,6 +211,44 @@ def lukas_sft(cfg):
                     )
         except Exception as exc:  # noqa: BLE001
             logging.warning("Failed to copy -it tokenizer: %s", exc)
+
+    # eot_token = (
+    #     tokenizer.special_tokens_map.get(
+    #         "additional_special_tokens", [tokenizer.eos_token])[1]
+    #     if len(tokenizer.special_tokens_map.get("additional_special_tokens", [])) > 1
+    #     else tokenizer.eos_token
+    # )
+
+    # # Convert to ID
+    # eot_token_id = tokenizer.convert_tokens_to_ids(eot_token)
+
+    # # Get the base EOS token ID
+    # base_eos_token_id = tokenizer.eos_token_id
+
+    # # Update generation config with both EOS and EOT tokens
+    # if hasattr(model.generation_config, 'eos_token_id'):
+    #     # Create a list of both tokens
+    #     eos_token_ids = []
+
+    #     # Add base EOS token
+    #     if isinstance(base_eos_token_id, list):
+    #         eos_token_ids.extend(base_eos_token_id)
+    #     else:
+    #         eos_token_ids.append(base_eos_token_id)
+
+    #     # Add EOT token if it's different
+    #     if eot_token_id not in eos_token_ids:
+    #         eos_token_ids.append(eot_token_id)
+
+    #     model.generation_config.eos_token_id = eos_token_ids
+    # else:
+    #     model.generation_config.eos_token_id = [
+    #         base_eos_token_id, eot_token_id]
+
+    # # Log the configuration
+    # print(f"EOT token: '{eot_token}' (ID: {eot_token_id})")
+    # print(f"EOS token ID(s): {model.generation_config.eos_token_id}")
+
 
     # dataset = load_dataset(
     #     cfg.training.sft_dataset.huggingface_dataset_id,
