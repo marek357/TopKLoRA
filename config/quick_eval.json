@@ -1,0 +1,57 @@
+{
+  "experiment_name": "topk_lora_quick_eval",
+  "random_seed": 42,
+  "run_comparative_analysis": true,
+  "generate_recommendations": true,
+  "models": [
+    {
+      "model_name": "topk_lora_variant_1",
+      "adapter_path": "/scratch/network/ssd/marek/lora_interp/models/dpo/google/gemma-2-2b/google-gemma-2-2b_topk_dpo_20250813_110632_3030316f/final_adapter",
+      "base_model": "google/gemma-2-2b",
+      "r": null,
+      "k": null
+    },
+    {
+      "model_name": "topk_lora_variant_2",
+      "adapter_path": "/scratch/network/ssd/marek/lora_interp/models/dpo/google/gemma-2-2b/google-gemma-2-2b_topk_dpo_20250813_111634_62b5fb0f/final_adapter",
+      "base_model": "google/gemma-2-2b",
+      "r": null,
+      "k": null
+    },
+    {
+      "model_name": "topk_lora_variant_3",
+      "adapter_path": "/scratch/network/ssd/marek/lora_interp/models/dpo/google/gemma-2-2b/google-gemma-2-2b_topk_dpo_20250813_112006_3797c9bd/final_adapter",
+      "base_model": "google/gemma-2-2b",
+      "r": null,
+      "k": null
+    }
+  ],
+  "interpretability": {
+    "enable_autointerp": true,
+    "autointerp_model": "Qwen/Qwen2.5-32B-Instruct-AWQ",
+    "max_examples_per_latent": 20,
+    "min_effect_rate": 0.1,
+    "enable_delphi": false,
+    "max_latents_per_module": 20
+  },
+  "quality": {
+    "enable_quality_metrics": true,
+    "enable_sae_bench": false,
+    "sae_bench_evaluations": [
+      "feature_absorption",
+      "l0_loss_recovered",
+      "sparse_probing"
+    ],
+    "enable_performance_benchmarks": false
+  },
+  "compute": {
+    "device": "cuda",
+    "batch_size": 8,
+    "max_concurrent_evaluations": 4
+  },
+  "output": {
+    "base_output_dir": "evaluation_results",
+    "save_intermediate_results": true,
+    "generate_plots": true
+  }
+}

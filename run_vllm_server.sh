@@ -1,0 +1,2 @@
+VLLM_LOGGING_LEVEL=DEBUG PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True vllm serve Qwen/Qwen2.5-32B-Instruct-AWQ --gpu-memory-utilization 0.8 --max-num-seqs 4 --no-enable-prefix-caching --port 8080
+# VLLM_LOGGING_LEVEL=DEBUG PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True vllm serve Qwen/Qwen2.5-32B-Instruct-AWQ --gpu-memory-utilization 0.8 --max-num-seqs 4 --no-enable-prefix-caching --port 8081
