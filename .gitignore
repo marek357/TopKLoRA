@@ -194,3 +194,16 @@ models/
 temp/
 lora_neuron_info.json
 adapters_pos_map_topk.json
+
+scores/
+scores*
+SAEBench/
+*results*/
+*cache*/
+explanations*/
+original_files/
+*_analysis/
+analysis_*/
+logs/
+interpretable_latents_detailed_analysis.json
+latent_interpretability_analysis.json

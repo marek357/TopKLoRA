@@ -2,6 +2,6 @@ name: "gemma"
 version: 1.0
 size: "2B"
 type: dpo_model
-k: 10
+k: 8
 base_model: "google/gemma-2b"
 adapter_checkpoint_dir: "/home/cvenhoff/lora_interp/experiments/gemma_1.0_2B_dpo/final_adapter"
