@@ -2,11 +2,17 @@ defaults:
   - _self_
   - logger: wandb_disabled
   # - evals/metrics@evals.metrics
-  - evals/auto-interpret@evals.auto_interp
+  # - evals/auto-interpret@evals.auto_interp
   - evals/toxicity@evals.toxicity
   # - evals/instruction_following@evals.instruction_following
-  - model: dpo_gemma_2b
+  # - model: interp_dpo_gemma_large
+  # - model: dpo_512_lg_start_sm_end
+  # - model: dpo_512_sm_start_lg_end
+  - model: dense
+  # - model: dpo_1024
+  # - model: interp_dpo_gemma_large_5k
   # - override hydra/launcher: submitit_slurm
 seed: 42
 checkpoint_dir: adapter
 experiment_name: ${evals}_eval
+
