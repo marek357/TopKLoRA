@@ -1,6 +1,10 @@
+from __future__ import annotations
 import json
 import random
 import re
+import os
+import pickle
+import hashlib
 from typing import Dict, Any, List, Mapping, Optional, Tuple
 from tqdm import tqdm
 from transformers import (
@@ -11,7 +15,7 @@ from transformers import (
 from openai import OpenAI
 
 from trl import apply_chat_template
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from peft import PeftModel
 import torch
 import heapq
@@ -1097,3 +1101,465 @@ def analyze_text_toxicity_eval(text, requested_attributes, client):
 
     response = client.comments().analyze(body=analyze_request).execute()
     return response
+
+
+from typing import List, Dict, Tuple
+from datasets import Dataset as HFDataset, concatenate_datasets, load_dataset
+from transformers import PreTrainedTokenizerBase
+import os
+import pickle
+import hashlib
+import json
+
+Message = Dict[str, str]  # {"role": "user"|"assistant", "content": str}
+
+def setup_tokenizer_for_chat(tokenizer):
+    """Setup tokenizer with proper chat template and padding token."""
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    # Load chat template from IT version if not present
+    if tokenizer.chat_template is None:
+        from transformers import AutoTokenizer
+        it_tokenizer = AutoTokenizer.from_pretrained("google/gemma-2-2b-it", use_fast=True)
+        if it_tokenizer.chat_template is not None:
+            tokenizer.chat_template = it_tokenizer.chat_template
+            print("Loaded chat template from google/gemma-2-2b-it")
+        else:
+            raise Exception("Could not load IT tokenizer chat template")
+    
+    return tokenizer
+
+def _make_cache_key(
+    tokenizer_name: str,
+    max_length: int,
+    datasets_to_use: Tuple[str, ...],
+    eval_holdout_ratio: float,
+    seed: int,
+    pack_sequences: bool,
+) -> str:
+    """Create a deterministic cache key based on dataset parameters."""
+    key_dict = {
+        "tokenizer_name": tokenizer_name,
+        "max_length": max_length,
+        "datasets_to_use": sorted(datasets_to_use),  # Sort for consistency
+        "eval_holdout_ratio": eval_holdout_ratio,
+        "seed": seed,
+        "pack_sequences": pack_sequences,
+        "version": "v1",  # Increment this if data processing changes
+    }
+    key_str = json.dumps(key_dict, sort_keys=True)
+    return hashlib.md5(key_str.encode()).hexdigest()
+
+def _get_cache_path(cache_key: str) -> str:
+    """Get the cache file path for a given cache key."""
+    cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "topk_lora_datasets")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, f"sft_datasets_{cache_key}.pkl")
+
+def _save_datasets_to_cache(train_ds: HFDataset, eval_ds: HFDataset, cache_path: str) -> None:
+    """Save datasets to cache file efficiently with disk-based format for streaming."""
+    print(f"💾 Saving datasets to cache: {cache_path}")
+    
+    # Save in multiple formats for flexibility
+    cache_data = {
+        "train": {
+            "data": train_ds.to_list(),
+            "features": train_ds.features,
+        },
+        "eval": {
+            "data": eval_ds.to_list(),
+            "features": eval_ds.features,
+        }
+    }
+    
+    # Save pickle format (legacy compatibility)
+    with open(cache_path, "wb") as f:
+        pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    
+    # Save disk format for efficient streaming
+    train_cache_dir = cache_path.replace('.pkl', '_train_dir')
+    eval_cache_dir = cache_path.replace('.pkl', '_eval_dir')
+    
+    try:
+        train_ds.save_to_disk(train_cache_dir)
+        eval_ds.save_to_disk(eval_cache_dir)
+        print(f"💾 Also saved disk format for efficient streaming")
+    except Exception as e:
+        print(f"⚠️ Failed to save disk format: {e}")
+    
+    print(f"✅ Datasets cached successfully ({len(train_ds)} train, {len(eval_ds)} eval)")
+
+def _load_datasets_from_cache(cache_path: str, streaming: bool = True) -> Tuple[HFDataset, HFDataset]:
+    """Load datasets from cache file with true streaming support."""
+    print(f"📁 Loading datasets from cache: {cache_path}")
+    
+    # Check if we have disk-based cache directories (best for streaming)
+    train_cache_dir = cache_path.replace('.pkl', '_train_dir')
+    eval_cache_dir = cache_path.replace('.pkl', '_eval_dir')
+    
+    if os.path.exists(train_cache_dir) and os.path.exists(eval_cache_dir):
+        print(f"🔄 Loading datasets from disk cache with streaming={streaming}")
+        from datasets import load_from_disk
+        train_ds = load_from_disk(train_cache_dir)
+        eval_ds = load_from_disk(eval_cache_dir)
+        
+        if streaming:
+            # Only convert training dataset to streaming - keep eval as regular dataset
+            # This avoids issues with evaluation loops that expect finite datasets
+            train_ds = train_ds.to_iterable_dataset()
+            print(f"✅ Training dataset streaming enabled, eval dataset kept as regular dataset")
+        else:
+            print(f"✅ Datasets loaded from disk cache ({len(train_ds)} train, {len(eval_ds)} eval)")
+        return train_ds, eval_ds
+    
+    # Check if we have Arrow format files (fallback)
+    train_cache_path = cache_path.replace('.pkl', '_train.arrow')
+    eval_cache_path = cache_path.replace('.pkl', '_eval.arrow')
+    
+    if os.path.exists(train_cache_path) and os.path.exists(eval_cache_path):
+        # Load from Arrow format - still loads to memory but more efficient
+        train_ds = HFDataset.from_file(train_cache_path)
+        eval_ds = HFDataset.from_file(eval_cache_path)
+        
+        if streaming:
+            # Only convert training dataset to streaming
+            train_ds = train_ds.to_iterable_dataset()
+            print(f"✅ Training dataset streaming enabled from Arrow cache, eval dataset regular")
+        else:
+            print(f"✅ Datasets loaded from Arrow cache ({len(train_ds)} train, {len(eval_ds)} eval)")
+        return train_ds, eval_ds
+    
+    # Fallback to pickle format (legacy)
+    with open(cache_path, "rb") as f:
+        cache_data = pickle.load(f)
+    
+    train_ds = HFDataset.from_list(cache_data["train"]["data"], features=cache_data["train"]["features"])
+    eval_ds = HFDataset.from_list(cache_data["eval"]["data"], features=cache_data["eval"]["features"])
+    
+    # Save in disk format for future efficient streaming
+    try:
+        train_ds.save_to_disk(train_cache_dir)
+        eval_ds.save_to_disk(eval_cache_dir)
+        print(f"💾 Converted cache to disk format for future streaming")
+    except Exception as e:
+        print(f"⚠️ Failed to convert to disk format: {e}")
+    
+    if streaming:
+        # Only convert training dataset to streaming
+        train_ds = train_ds.to_iterable_dataset()
+        print(f"✅ Training dataset streaming enabled from pickle cache, eval dataset regular")
+    else:
+        print(f"✅ Datasets loaded from pickle cache ({len(train_ds)} train, {len(eval_ds)} eval)")
+    return train_ds, eval_ds
+
+def _ensure_roles(messages: List[Message]) -> List[Message]:
+    """Ensure roles are valid and alternating for Gemma chat template."""
+    out = []
+    for m in messages:
+        role = m.get("role", "user")
+        if role not in ("user", "assistant"):
+            role = "assistant" if role == "system" else "user"
+        out.append({"role": role, "content": m.get("content", "")})
+    
+    # Ensure alternating user/assistant pattern required by Gemma-IT
+    if not out:
+        return out
+    
+    # Fix alternation: must start with user and alternate
+    cleaned = []
+    expected_role = "user"
+    
+    for msg in out:
+        if msg["role"] == expected_role:
+            cleaned.append(msg)
+            expected_role = "assistant" if expected_role == "user" else "user"
+        elif expected_role == "assistant" and msg["role"] == "assistant":
+            # This is good, add it
+            cleaned.append(msg)
+            expected_role = "user"
+        # Skip messages that break the alternating pattern
+    
+    # Ensure we end with an assistant message for training
+    if cleaned and cleaned[-1]["role"] == "user":
+        # Remove the last user message if there's no assistant response
+        cleaned = cleaned[:-1]
+    
+    return cleaned
+
+def _encode_with_assistant_mask(
+    tokenizer: PreTrainedTokenizerBase,
+    messages: List[Message],
+    max_length: int,
+) -> Dict[str, List[int]]:
+    """
+    Apply Gemma chat template and create labels with -100 on non-assistant tokens.
+    """
+    messages = _ensure_roles(messages)
+    if not messages:
+        # Return empty sequence for empty messages
+        return {"input_ids": [], "labels": [], "attention_mask": []}
+    
+    full_ids: List[int] = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=False,
+    )
+    labels = [-100] * len(full_ids)
+
+    # Mark assistant spans
+    for j, msg in enumerate(messages):
+        if msg["role"] != "assistant":
+            continue
+        # Handle empty prefix case
+        prefix_ids: List[int] = []
+        if j > 0:
+            prefix_ids = tokenizer.apply_chat_template(
+                messages[:j], tokenize=True, add_generation_prompt=True
+            )
+        upto_ids: List[int] = tokenizer.apply_chat_template(
+            messages[: j + 1], tokenize=True, add_generation_prompt=False
+        )
+        start = len(prefix_ids)
+        end = min(len(upto_ids), len(full_ids))
+        for t in range(start, end):
+            labels[t] = full_ids[t]
+
+    # Left trim to max_length (keep rightmost)
+    if len(full_ids) > max_length:
+        full_ids = full_ids[-max_length:]
+        labels = labels[-max_length:]
+    attn_mask = [1] * len(full_ids)
+    return {"input_ids": full_ids, "labels": labels, "attention_mask": attn_mask}
+
+def load_dolly(split: str = "train") -> HFDataset:
+    ds = load_dataset("databricks/databricks-dolly-15k", split=split)
+    def to_messages(ex):
+        instr = (ex.get("instruction") or "").strip()
+        ctx = (ex.get("context") or "").strip()
+        user = instr if not ctx else f"{instr}\n\nContext:\n{ctx}"
+        resp = (ex.get("response") or "").strip()
+        return {"messages": [{"role": "user", "content": user}, {"role": "assistant", "content": resp}]}
+    return ds.map(to_messages, remove_columns=[c for c in ds.column_names if c != "messages"])  # type: ignore
+
+def load_ultrachat(split: str = "train_sft") -> HFDataset:
+    ds = load_dataset("HuggingFaceH4/ultrachat_200k", split=split)
+    def clean(ex):
+        msgs = ex.get("messages") or []
+        cleaned = []
+        for m in msgs:
+            role = m.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            content = (m.get("content") or "").strip()
+            if content:
+                cleaned.append({"role": role, "content": content})
+        has_assistant = any(m["role"] == "assistant" for m in cleaned)
+        return {"messages": cleaned if has_assistant else None}
+    ds = ds.map(clean)
+    ds = ds.filter(lambda ex: ex["messages"] is not None)
+    return ds  # type: ignore
+
+def load_oasst1(split: str = "train") -> HFDataset:
+    ds = load_dataset("OpenAssistant/oasst1", split=split)
+    def keep(ex):
+        if ex.get("deleted", False):
+            return False
+        if ex.get("lang") not in (None, "en"):
+            return False
+        role = ex.get("role")
+        if role not in ("prompter", "assistant"):
+            return False
+        txt = ex.get("text") or ""
+        return len(txt.strip()) > 0
+    ds = ds.filter(keep)
+    rows = ds.to_list()
+    by_id = {r["message_id"]: r for r in rows}
+    from collections import defaultdict
+    children = defaultdict(list)
+    for r in rows:
+        pid = r.get("parent_id")
+        if pid in by_id:
+            children[pid].append(r["message_id"])
+    leaves = [mid for mid in by_id.keys() if len(children.get(mid, [])) == 0]
+    conversations: List[Dict[str, List[Message]]] = []
+    for leaf in leaves:
+        path = []
+        cur = leaf
+        seen = set()
+        while cur and cur in by_id and cur not in seen:
+            seen.add(cur)
+            path.append(by_id[cur])
+            cur = by_id[cur].get("parent_id")
+        path.reverse()
+        msgs: List[Message] = []
+        for node in path:
+            role = node.get("role")
+            r = "user" if role == "prompter" else ("assistant" if role == "assistant" else None)
+            if r is None:
+                continue
+            content = (node.get("text") or "").strip()
+            if content:
+                msgs.append({"role": r, "content": content})
+        if any(m["role"] == "assistant" for m in msgs):
+            conversations.append({"messages": msgs})
+    return HFDataset.from_list(conversations)
+
+def build_sft_dataset(
+    tokenizer: PreTrainedTokenizerBase,
+    max_length: int = 8192,
+    datasets_to_use: Tuple[str, ...] = ("oasst1", "dolly", "ultrachat"),
+) -> HFDataset:
+    pieces = []
+    if "oasst1" in datasets_to_use: pieces.append(load_oasst1("train"))
+    if "dolly"  in datasets_to_use: pieces.append(load_dolly("train"))
+    if "ultrachat" in datasets_to_use: pieces.append(load_ultrachat("train_sft"))
+    if not pieces:
+        raise ValueError("No datasets selected.")
+    mixed = concatenate_datasets(pieces)
+    
+    # Filter out empty conversations
+    def is_valid(ex):
+        messages = ex.get("messages", [])
+        if not messages:
+            return False
+        # Must have at least one assistant message
+        has_assistant = any(m.get("role") == "assistant" for m in messages if m.get("content", "").strip())
+        return has_assistant
+    
+    mixed = mixed.filter(is_valid)
+    
+    def tokenize_example(ex):
+        messages: List[Message] = ex["messages"]
+        return _encode_with_assistant_mask(tokenizer, messages, max_length)
+    tokenized = mixed.map(tokenize_example, remove_columns=[c for c in mixed.column_names if c != "messages"])
+    
+    # Filter out sequences that became empty after tokenization
+    tokenized = tokenized.filter(lambda ex: len(ex["input_ids"]) > 0)
+    return tokenized
+
+def pack_tokenized_dataset(
+    tokenized: HFDataset,
+    *,
+    max_length: int,
+    pad_token_id: int,
+    eos_token_id: int,
+) -> HFDataset:
+    """Pack multiple tokenized examples into <=max_length sequences. Insert EOS between examples and set its label to -100."""
+    buffers = {"input_ids": [], "labels": [], "attention_mask": []}
+    packed = []
+    def flush():
+        if not buffers["input_ids"]: return
+        packed.append({k: v[:] for k, v in buffers.items()})
+        for k in buffers: buffers[k].clear()
+    cur_len = 0
+    for ex in tokenized:
+        ids = list(ex["input_ids"]); labs = list(ex["labels"]); attn = list(ex["attention_mask"])
+        need = len(ids) + (1 if cur_len > 0 else 0)
+        if cur_len + need > max_length:
+            flush(); cur_len = 0
+        if cur_len > 0:
+            buffers["input_ids"].append(eos_token_id)
+            buffers["labels"].append(-100)
+            buffers["attention_mask"].append(1)
+            cur_len += 1
+        if len(ids) > max_length:
+            ids, labs, attn = ids[-max_length:], labs[-max_length:], attn[-max_length:]
+        buffers["input_ids"].extend(ids)
+        buffers["labels"].extend(labs)
+        buffers["attention_mask"].extend(attn)
+        cur_len += len(ids)
+        if cur_len >= max_length:
+            flush(); cur_len = 0
+    flush()
+    return HFDataset.from_list(packed)
+
+def build_sft_datasets(
+    tokenizer: PreTrainedTokenizerBase,
+    max_length: int = 8192,
+    datasets_to_use: Tuple[str, ...] = ("oasst1", "dolly", "ultrachat"),
+    eval_holdout_ratio: float = 0.01,
+    seed: int = 42,
+    pack_sequences: bool = True,
+    use_cache: bool = True,
+    streaming: bool = True,  # New parameter for streaming
+) -> Tuple[HFDataset, HFDataset]:
+    """
+    Build SFT datasets with caching and streaming support.
+    
+    Args:
+        tokenizer: Tokenizer to use for encoding
+        max_length: Maximum sequence length
+        datasets_to_use: Tuple of dataset names to include
+        eval_holdout_ratio: Fraction of data to use for evaluation
+        seed: Random seed for train/eval split
+        pack_sequences: Whether to pack sequences together
+        use_cache: Whether to use cached datasets if available
+        streaming: Whether to return streaming datasets (memory efficient)
+    
+    Returns:
+        Tuple of (train_dataset, eval_dataset)
+    """
+    # Create cache key based on all parameters that affect the output
+    tokenizer_name = getattr(tokenizer, 'name_or_path', 'unknown_tokenizer')
+    cache_key = _make_cache_key(
+        tokenizer_name=tokenizer_name,
+        max_length=max_length,
+        datasets_to_use=datasets_to_use,
+        eval_holdout_ratio=eval_holdout_ratio,
+        seed=seed,
+        pack_sequences=pack_sequences,
+    )
+    
+    cache_path = _get_cache_path(cache_key)
+    
+    # Try to load from cache first
+    if use_cache and os.path.exists(cache_path):
+        try:
+            return _load_datasets_from_cache(cache_path, streaming=streaming)
+        except Exception as e:
+            print(f"⚠️ Failed to load from cache ({e}), rebuilding datasets...")
+            # Remove corrupted cache file
+            # try:
+            #     os.remove(cache_path)
+            # except:
+            #     pass
+    
+    # Build datasets from scratch
+    print("🔨 Building datasets from scratch (this may take a while)...")
+    full = build_sft_dataset(tokenizer, max_length=max_length, datasets_to_use=datasets_to_use)
+    split = full.train_test_split(test_size=eval_holdout_ratio, seed=seed)
+    train_ds, eval_ds = split["train"], split["test"]
+    
+    # Safety check: ensure eval dataset is not empty
+    if len(eval_ds) == 0:
+        print("⚠️ Evaluation dataset is empty, adjusting holdout ratio...")
+        # Use a minimum of 10 examples for evaluation or 1% of data, whichever is larger
+        min_eval_size = max(10, int(len(full) * 0.01))
+        adjusted_ratio = min(min_eval_size / len(full), 0.1)  # Cap at 10%
+        split = full.train_test_split(test_size=adjusted_ratio, seed=seed)
+        train_ds, eval_ds = split["train"], split["test"]
+        print(f"📊 Adjusted eval dataset size: {len(eval_ds)} examples ({adjusted_ratio:.3f} ratio)")
+    
+    if pack_sequences:
+        pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
+        eos_id = tokenizer.eos_token_id or pad_id
+        print("📦 Packing training sequences...")
+        train_ds = pack_tokenized_dataset(train_ds, max_length=max_length, pad_token_id=pad_id, eos_token_id=eos_id)
+        print("📦 Packing evaluation sequences...")
+        eval_ds = pack_tokenized_dataset(eval_ds, max_length=max_length, pad_token_id=pad_id, eos_token_id=eos_id)
+    
+    # Save to cache for future use
+    if use_cache:
+        try:
+            _save_datasets_to_cache(train_ds, eval_ds, cache_path)
+        except Exception as e:
+            print(f"⚠️ Failed to save to cache ({e}), continuing without caching...")
+    
+    # Convert to streaming if requested (only for training dataset)
+    if streaming:
+        train_ds = train_ds.to_iterable_dataset()
+        # Keep eval_ds as regular dataset for compatibility with evaluation loops
+        print(f"✅ Training dataset converted to streaming format, eval dataset kept regular")
+    
+    return train_ds, eval_ds
