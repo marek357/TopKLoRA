@@ -1,0 +1,112 @@
+# Example configuration for enhanced SFT dataset loading
+# This shows how to enable the new multi-dataset functionality
+
+training:
+  sft_dataset:
+    # Enable enhanced dataset loading (set to false to use original approach)
+    use_enhanced_datasets: true
+    
+    # Dataset selection - can include: "oasst1", "dolly", "ultrachat"
+    datasets_to_use:
+      - "oasst1"      # OpenAssistant conversations
+      - "dolly"       # Databricks Dolly instruction tuning dataset  
+      - "ultrachat"   # HF UltraChat 200k dataset
+    
+    # Evaluation holdout ratio (fraction of data for eval)
+    eval_holdout_ratio: 0.01  # 1% for evaluation
+    
+    # Random seed for reproducible train/eval splits
+    seed: 42
+    
+    # Whether to pack multiple conversations into single sequences
+    pack_sequences: true
+    
+    # Whether to use filesystem caching for faster subsequent runs
+    use_cache: true
+    
+    # Legacy options (only used when use_enhanced_datasets: false)
+    huggingface_dataset_id: "yahma/alpaca-cleaned"
+    split: "train"
+    name: "alpaca"
+  
+  sft_experiment:
+    lora:
+      # Enable TopK LoRA (requires use_topk: true)
+      use_topk: true
+      r: 64
+      k: 32              # Keep top 32 latents active (50% sparsity)
+      alpha: 64
+      dropout: 0.05
+      target_modules:
+        - "q_proj"
+        - "k_proj" 
+        - "v_proj"
+        - "o_proj"
+        - "gate_proj"
+        - "up_proj"
+        - "down_proj"
+      
+      # TopK-specific parameters
+      temperature: 1.0              # Initial temperature for soft masking
+      temperature_final: 0.1        # Final temperature 
+      temperature_schedule: "linear" # "linear", "cubic", "exp", "constant"
+      k_schedule: "constant"        # "linear", "cubic", "exp", "constant"
+      k_final: 32                   # Final k value (if k_schedule != "constant")
+      
+      # Dead latent monitoring
+      log_dead_latents: true
+      dead_latents_log_every: 500
+  
+  sft:
+    max_seq_length: 8192      # Should match the enhanced dataset max_length
+    packing: false            # Set to false when using enhanced datasets with pack_sequences: true
+    completion_only_loss: true # Only compute loss on assistant responses
+    num_epochs: 3
+    batch_size_train: 2
+    batch_size_eval: 4
+    gradient_accumulation_steps: 8
+    learning_rate: 2e-5
+    warmup_ratio: 0.1
+    max_steps: -1  # Set to positive number to override num_epochs
+    
+    # Evaluation settings
+    eval_strategy: "steps"
+    eval_steps: 500
+    do_eval: true
+    
+    # Saving settings
+    save_strategy: "steps"
+    save_steps: 1000
+    save_total_limit: 3
+    
+    # Other training settings
+    bf16: true
+    fp16: false
+    gradient_checkpointing: true
+    max_grad_norm: 1.0
+    weight_decay: 0.01
+    push_to_hub: false
+
+# Model configuration
+training:
+  model:
+    model_name: "google/gemma-2-2b"
+    model_it_name: "google/gemma-2-2b-it"  # For chat template fallback
+    name: "gemma"
+    version: "2"
+    size: "2b"
+  
+  quantization:
+    load_in_4bit: true
+    bnb_4bit_compute_dtype: "bfloat16"
+    bnb_4bit_use_double_quant: true
+    bnb_4bit_quant_type: "nf4"
+
+# Logging configuration  
+logger:
+  report_to: ["wandb"]
+  logging_steps: 10
+  wandb_mode: "online"  # or "disabled" for no wandb
+
+lr_scheduler:
+  type: "cosine"

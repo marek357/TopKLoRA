@@ -1,0 +1,42 @@
+method: "sft"
+
+defaults:
+  - model: gemma_2_2b
+  - experiment/topk_enhanced_balanced@sft_experiment
+  - experiment/topk_enhanced_balanced@dpo_experiment  # fallback for DPO if needed
+  - dataset/enhanced_oasst1@sft_dataset
+  - dataset/hh-rlhf@dpo_dataset
+  - base_sft_merged_model: gemma_2_2b
+  - quantization: 4bit
+
+dump_trained_model: True
+dump_path: "models/sft_enhanced_balanced/${training.model.model_name}"
+
+sft:
+  enabled: True
+  packing: False              # Disabled since enhanced datasets handle packing
+  completion_only_loss: True  # Enhanced datasets already mask non-assistant tokens
+  max_seq_length: 4096        # Match dataset max_length
+  num_epochs: 3               # More epochs for single dataset
+  batch_size_train: 6         # Balanced batch size
+  gradient_accumulation_steps: 6
+  gradient_checkpointing: True
+  optim: "adamw_torch"
+  lr: 2.5e-5                  # Balanced learning rate
+  warmup_ratio: 0.08          # Moderate warmup
+  bf16: True
+  fp16: False
+  max_grad_norm: 0.8          # Moderate grad norm clipping
+  save_strategy: "steps"
+  save_steps: 750
+  save_total_limit: 4
+  eval_steps: 375
+  eval_strategy: "steps"
+  max_steps: -1
+  batch_size_eval: 6
+  weight_decay: 0.008         # Moderate weight decay
+  push_to_hub: False
+  do_eval: True
+
+dpo:
+  enabled: False

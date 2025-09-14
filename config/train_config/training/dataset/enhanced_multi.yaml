@@ -1,0 +1,34 @@
+# Enhanced multi-dataset configuration for SFT training
+# Uses the new datasets.py functionality with caching and packing
+
+# Enable the enhanced dataset system  
+use_enhanced_datasets: true
+
+# Dataset selection - available: "oasst1", "dolly", "ultrachat"
+datasets_to_use:
+  - "oasst1"      # OpenAssistant conversations
+  - "dolly"       # Databricks Dolly instruction tuning dataset  
+  - "ultrachat"   # HF UltraChat 200k dataset
+
+# Sequence length for the enhanced system
+max_length: 4096
+
+# Evaluation holdout ratio (fraction of data for eval)
+eval_holdout_ratio: 0.01  # 1% for evaluation
+
+# Random seed for reproducible train/eval splits
+seed: 42
+
+# Whether to pack multiple conversations into single sequences
+pack_sequences: false
+
+# Whether to use filesystem caching for faster subsequent runs
+use_cache: true
+
+# Whether to enable streaming mode (reduces VRAM usage)
+streaming: true
+
+# Legacy fields (ignored when use_enhanced_datasets: true)
+name: "enhanced_multi"
+huggingface_dataset_id: "unused"
+split: "unused"

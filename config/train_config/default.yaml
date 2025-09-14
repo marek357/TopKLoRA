@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - training: dpo
+  - training: sft_enhanced_sparse
   - lr_scheduler: cosine
   - logger: wandb
   # - override hydra/launcher: submitit_slurm
