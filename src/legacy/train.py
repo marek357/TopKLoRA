@@ -38,11 +38,11 @@ device = 'cuda' if torch.cuda.is_available() else \
 
 class EnhancedSFTTrainer(SFTTrainer):
     """
-    Enhanced SFT Trainer with TopK monitoring and logging similar to EnhancedDPOTrainer
+    Enhanced SFT Trainer with TopK monitoring and optional regularization.
+    Critical fix: correctly handle `return_outputs` in compute_loss (HF eval expects (loss, outputs)).
     """
-    
+
     def __init__(self, *args, **kwargs):
-        # Extract our custom parameters
         self.reg_cfg = kwargs.pop('reg_cfg', {
             "log_every": 50,
             "L_DECORR": 1e-4,
@@ -56,67 +56,76 @@ class EnhancedSFTTrainer(SFTTrainer):
             "schedule_ent": True,
             "schedule_ortho": True
         })
-        self.reg_mode = kwargs.pop('reg_mode', "off")  # Can be "off", "z_only", or "z_plus_ortho"
+        # "off" | "z_only" | "z_plus_ortho"
+        self.reg_mode = kwargs.pop('reg_mode', "off")
         super().__init__(*args, **kwargs)
 
-    def _sched_scalar(self, t):
-        """Schedule weight from 0→1 over training progress"""
+    # ---------- helpers ----------
+    def _sched_scalar(self, t: float) -> float:
+        """Schedule weight from 0→1 over training progress (cubic)."""
         if t <= 0.0:
             return 0.0
         if t >= 1.0:
             return 1.0
-        # cubic schedule by default
         return t ** 3
 
     def _active(self, L: float, scheduled_flag: bool, w_sched: float) -> bool:
-        """Check if a regularization term should be active"""
+        """Is a regularizer active under current schedule/weight?"""
         if L <= 0.0:
             return False
         if not scheduled_flag:
             return True
         return w_sched > 0.0
 
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        """Enhanced compute_loss with TopK monitoring similar to EnhancedDPOTrainer"""
-        # Base SFT loss
-        loss = super().compute_loss(model, inputs, return_outputs=False, **kwargs)
-        
+    def _clear_topk_caches(self, model):
+        # Drop live caches to avoid cross-step graph retention
+        from types import SimpleNamespace  # just to reduce overhead if absent
+        for m in model.modules():
+            # isinstance check is cheap; avoids hasattr chain when irrelevant
+            if m.__class__.__name__ == "TopKLoRALinearSTE":
+                if hasattr(m, "_z_live"):
+                    m._z_live = None
+                if hasattr(m, "_g_soft_live"):
+                    m._g_soft_live = None
+
+    # ---------- main ----------
+    def compute_loss(self, model, inputs, return_outputs: bool = False, **kwargs):
+        """
+        HF expects:
+          - when return_outputs=False → a scalar loss tensor
+          - when return_outputs=True  → (loss, outputs)
+        """
+        # Get base loss/outputs from TRL/HF
+        base = super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+        if return_outputs:
+            base_loss, base_outputs = base
+        else:
+            base_loss, base_outputs = base, None
+
         step = int(self.state.global_step or 0)
         max_steps = int(self.state.max_steps or 1)
 
-        # Log TopK gate statistics periodically
+        # --- TopK gate stats logging (lightweight, first matching layer) ---
         log_every = int(self.reg_cfg.get("log_every", 50))
-        if step % log_every == 0:
+        if log_every > 0 and (step % log_every == 0):
             for name, m in model.named_modules():
-                if isinstance(m, TopKLoRALinearSTE):
-                    st = m.get_gate_stats()
+                if m.__class__.__name__ == "TopKLoRALinearSTE":
+                    st = getattr(m, "get_gate_stats", lambda: {})()
                     if st:
                         self.log({
-                            f"{name}.k": st["k"],
-                            f"{name}.tau": st["tau"],
-                            f"{name}.frac_active_vs_target": st["frac_active_vs_target"],
+                            f"{name}.k": st.get("k", 0),
+                            f"{name}.tau": st.get("tau", 0.0),
+                            f"{name}.frac_active_vs_target": st.get("frac_active_vs_target", 0.0),
                         })
                         break
 
-        # print("Step:", step, "Loss:", loss.item())
-        return loss
-
-
-        # If regularization is off, just return base loss
+        # If regularization is off, just clear caches and return the base
         if self.reg_mode == "off":
-            # Clear live caches to avoid cross-step graph retention
-            for m in model.modules():
-                if isinstance(m, TopKLoRALinearSTE):
-                    if hasattr(m, "_z_live"):
-                        m._z_live = None
-                    if hasattr(m, "_g_soft_live"):
-                        m._g_soft_live = None
-            return loss
+            self._clear_topk_caches(model)
+            return (base_loss, base_outputs) if return_outputs else base_loss
 
-        # Regularization terms (similar to DPO trainer)
-        reg = loss.new_tensor(0.0)
-        
-        # Logging accumulators
+        # -------- Regularization path --------
+        reg = base_loss.new_tensor(0.0)
         do_log = (log_every > 0) and (step % log_every == 0)
         acc = {
             "reg/decorr": 0.0,
@@ -129,16 +138,16 @@ class EnhancedSFTTrainer(SFTTrainer):
         n_layers = 0
 
         # Pull config once
-        L_DECORR = float(self.reg_cfg["L_DECORR"])
-        L_MASS = float(self.reg_cfg["L_MASS"])
-        L_ENTROPY = float(self.reg_cfg["L_ENTROPY"])
-        L_ORTHO_A = float(self.reg_cfg["L_ORTHO_A"])
-        L_ORTHO_B = float(self.reg_cfg["L_ORTHO_B"])
-        ORTHO_EVERY = int(self.reg_cfg["ORTHO_EVERY"])
+        L_DECORR = float(self.reg_cfg.get("L_DECORR", 0.0))
+        L_MASS   = float(self.reg_cfg.get("L_MASS",   0.0))
+        L_ENTROPY= float(self.reg_cfg.get("L_ENTROPY",0.0))
+        L_ORTHO_A= float(self.reg_cfg.get("L_ORTHO_A",0.0))
+        L_ORTHO_B= float(self.reg_cfg.get("L_ORTHO_B",0.0))
+        ORTHO_EVERY = int(self.reg_cfg.get("ORTHO_EVERY", 0))
 
         try:
             for m in model.modules():
-                if not isinstance(m, TopKLoRALinearSTE):
+                if m.__class__.__name__ != "TopKLoRALinearSTE":
                     continue
 
                 # Live tensors from forward pass
@@ -146,51 +155,57 @@ class EnhancedSFTTrainer(SFTTrainer):
                 if z_live is None:
                     continue
 
-                # Layer progress & schedule weight
+                # Progress & schedule weight
                 try:
-                    p_layer = float(m.progress)
+                    p_layer = float(getattr(m, "progress", 0.0))
                 except Exception:
                     p_layer = step / max(1, max_steps)
                 w_sched = self._sched_scalar(p_layer)
 
-                # Check which terms are active
                 need_decorr = self._active(L_DECORR, self.reg_cfg.get("schedule_decorr", True), w_sched)
-                need_mass = self._active(L_MASS, self.reg_cfg.get("schedule_mass", True), w_sched)
-                need_ent = self._active(L_ENTROPY, self.reg_cfg.get("schedule_ent", True), w_sched)
-                need_orthoA = (self.reg_mode == "z_plus_ortho") and ORTHO_EVERY > 0 and (step % ORTHO_EVERY == 0) \
-                    and self._active(L_ORTHO_A, self.reg_cfg.get("schedule_ortho", True), w_sched)
-                need_orthoB = (self.reg_mode == "z_plus_ortho") and ORTHO_EVERY > 0 and (step % ORTHO_EVERY == 0) \
-                    and self._active(L_ORTHO_B, self.reg_cfg.get("schedule_ortho", True), w_sched)
+                need_mass   = self._active(L_MASS,   self.reg_cfg.get("schedule_mass", True),   w_sched)
+                need_ent    = self._active(L_ENTROPY,self.reg_cfg.get("schedule_ent", True),    w_sched)
 
-                # Skip if all terms are scheduled and weight is 0
+                need_orthoA = (
+                    self.reg_mode == "z_plus_ortho" and ORTHO_EVERY > 0 and (step % ORTHO_EVERY == 0) and
+                    self._active(L_ORTHO_A, self.reg_cfg.get("schedule_ortho", True), w_sched)
+                )
+                need_orthoB = (
+                    self.reg_mode == "z_plus_ortho" and ORTHO_EVERY > 0 and (step % ORTHO_EVERY == 0) and
+                    self._active(L_ORTHO_B, self.reg_cfg.get("schedule_ortho", True), w_sched)
+                )
+
                 all_sched = (
                     self.reg_cfg.get("schedule_decorr", True) and
                     self.reg_cfg.get("schedule_mass", True) and
                     self.reg_cfg.get("schedule_ent", True) and
                     (self.reg_mode != "z_plus_ortho" or self.reg_cfg.get("schedule_ortho", True))
                 )
-                if all_sched and (not (need_decorr or need_mass or need_ent or need_orthoA or need_orthoB)):
+                if all_sched and not (need_decorr or need_mass or need_ent or need_orthoA or need_orthoB):
                     if do_log:
                         acc["reg/sched_w"] += w_sched
                         n_layers += 1
                     continue
 
-                # Prepare gates once
-                k_now = m._current_k()
-                tau = m._tau()
+                # Prepare gates (reuse live soft gate when available)
+                k_now = getattr(m, "_current_k")()
+                tau   = getattr(m, "_tau")()
                 g_soft_live = getattr(m, "_g_soft_live", None)
-                
-                # Import the helper function for soft topk
-                from src.train import _soft_topk_mass
-                g_soft = g_soft_live if g_soft_live is not None else _soft_topk_mass(z_live, k_now, tau)
 
-                # Z-based regularization
+                if g_soft_live is None:
+                    # Local import to avoid circulars (matches your original code pattern)
+                    from src.train import _soft_topk_mass
+                    g_soft = _soft_topk_mass(z_live, k_now, tau)
+                else:
+                    g_soft = g_soft_live
+
+                # ---- Z-based regularizers ----
                 if need_decorr:
                     Z = z_live.reshape(-1, z_live.size(-1)).float()
                     Z = Z - Z.mean(dim=0, keepdim=True)
                     C = (Z.T @ Z) / (Z.size(0) + 1e-6)
                     off = C - torch.diag(torch.diag(C))
-                    r_decorr = (off ** 2).mean().to(loss.dtype)
+                    r_decorr = (off ** 2).mean().to(base_loss.dtype)
                     if self.reg_cfg.get("schedule_decorr", True):
                         r_decorr = r_decorr * r_decorr.new_tensor(w_sched)
                     reg = reg + L_DECORR * r_decorr
@@ -207,20 +222,21 @@ class EnhancedSFTTrainer(SFTTrainer):
                             acc["reg/mass"] += float(r_mass.detach().cpu())
 
                     if need_ent:
-                        r_ent = -(g_soft.clamp_min(1e-8) * g_soft.clamp_min(1e-8).log()).sum(dim=-1).mean()
+                        g_safe = g_soft.clamp_min(1e-8)
+                        r_ent = -(g_safe * g_safe.log()).sum(dim=-1).mean()
                         if self.reg_cfg.get("schedule_ent", True):
                             r_ent = r_ent * r_ent.new_tensor(w_sched)
                         reg = reg + L_ENTROPY * r_ent
                         if do_log:
                             acc["reg/entropy"] += float(r_ent.detach().cpu())
 
-                # Orthogonality regularization (only in "z_plus_ortho" mode)
+                # ---- Orthogonality (only in z_plus_ortho) ----
                 if need_orthoA:
                     Aw = m.A_module.weight
                     A_rows = F.normalize(Aw.float(), p=2, dim=1)
                     GA = A_rows @ A_rows.T
                     GA_off = GA - torch.diag(torch.diag(GA))
-                    r_oa = (GA_off ** 2).mean().to(loss.dtype)
+                    r_oa = (GA_off ** 2).mean().to(base_loss.dtype)
                     if self.reg_cfg.get("schedule_ortho", True):
                         r_oa = r_oa * r_oa.new_tensor(w_sched)
                     reg = reg + L_ORTHO_A * r_oa
@@ -232,7 +248,7 @@ class EnhancedSFTTrainer(SFTTrainer):
                     B_cols = F.normalize(Bw.float(), p=2, dim=0)
                     GB = B_cols.T @ B_cols
                     GB_off = GB - torch.diag(torch.diag(GB))
-                    r_ob = (GB_off ** 2).mean().to(loss.dtype)
+                    r_ob = (GB_off ** 2).mean().to(base_loss.dtype)
                     if self.reg_cfg.get("schedule_ortho", True):
                         r_ob = r_ob * r_ob.new_tensor(w_sched)
                     reg = reg + L_ORTHO_B * r_ob
@@ -243,42 +259,37 @@ class EnhancedSFTTrainer(SFTTrainer):
                     acc["reg/sched_w"] += w_sched
                     n_layers += 1
 
-                # Additional regularization terms
+                # Extra gentle priors
                 L1 = 1e-5
                 reg = reg + L1 * z_live.abs().mean()
                 usage = g_soft.mean(dim=(0, 1))  # [r]
-                cov = ((usage - usage.mean())**2).mean()
+                cov = ((usage - usage.mean()) ** 2).mean()
                 reg = reg + 1e-4 * cov
 
         finally:
-            # Critical: drop live caches every step to avoid cross-step graphs
-            for m in model.modules():
-                if isinstance(m, TopKLoRALinearSTE):
-                    if hasattr(m, "_z_live"):
-                        m._z_live = None
-                    if hasattr(m, "_g_soft_live"):
-                        m._g_soft_live = None
+            # Always clear caches
+            self._clear_topk_caches(model)
 
-        loss = loss + reg
+        total_loss = base_loss + reg
 
+        # Log aggregate regs + one layer’s gate stats
         if do_log and n_layers > 0:
             for k in acc:
                 acc[k] /= n_layers
-            # Log one layer's gate stats
+            # attach some gate stats for one layer
             for name, m in model.named_modules():
-                if isinstance(m, TopKLoRALinearSTE):
-                    st = m.get_gate_stats()
+                if m.__class__.__name__ == "TopKLoRALinearSTE":
+                    st = getattr(m, "get_gate_stats", lambda: {})()
                     if st:
                         acc.update({
                             f"gate/{name}.active_latents": st.get("active_latents", 0),
-                            f"gate/{name}.dead_latents": st.get("dead_latents", 0),
-                            f"gate/{name}.avg_usage": st.get("avg_usage", 0.0),
+                            f"gate/{name}.dead_latents":   st.get("dead_latents", 0),
+                            f"gate/{name}.avg_usage":      st.get("avg_usage", 0.0),
                         })
                         break
             self.log(acc)
 
-        return loss
-
+        return (total_loss, base_outputs) if return_outputs else total_loss
 
 def enable_topk_lora_grads(model):
     # mark only A/B weights trainable; freeze everything else
@@ -708,8 +719,8 @@ def lukas_sft(cfg):
         peft_config=None,
         callbacks=[MemoryClearCallback()],
         reg_cfg=reg_cfg,
-        # reg_mode=reg_mode,
-        reg_mode="off",  # Temporarily disable regularization to debug TopK issues
+        reg_mode=reg_mode,
+        # reg_mode="off",  # Temporarily disable regularization to debug TopK issues
         optimizers=(optimizer, None),
     )
 
@@ -1034,11 +1045,8 @@ def lukas_sft(cfg):
 
     # add it
     trainer.add_callback(ABProbe(every=10))
+    print('REG MODE:', trainer.reg_mode)
 
-
-    trainer.train()
-
-    assert False
 
 
     # ------------------------------- Training ------------------------------
