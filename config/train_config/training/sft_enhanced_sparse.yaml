@@ -30,9 +30,9 @@ sft:
   save_strategy: "steps"
   save_steps: 500
   save_total_limit: 5
-  eval_steps: 50 # for testing             
+  eval_steps: 250 # for testing             
   eval_strategy: "steps"
-  max_steps: 7500
+  max_steps: 10000
   batch_size_eval: 1          
   weight_decay: 0.005         
   push_to_hub: False
