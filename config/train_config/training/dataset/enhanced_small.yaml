@@ -1,0 +1,30 @@
+# Enhanced dataset configuration with smaller sequence length
+# For faster training and memory efficiency
+
+# Enable the enhanced dataset system  
+use_enhanced_datasets: true
+
+# Dataset selection - just OASST1 and Dolly for faster processing
+datasets_to_use:
+  - "oasst1"      # OpenAssistant conversations
+  - "dolly"       # Databricks Dolly instruction tuning dataset  
+
+# Shorter sequence length for efficiency
+max_length: 2048
+
+# Evaluation holdout ratio
+eval_holdout_ratio: 0.02  # 2% for evaluation
+
+# Random seed for reproducible train/eval splits
+seed: 42
+
+# Whether to pack multiple conversations into single sequences
+pack_sequences: true
+
+# Whether to use filesystem caching
+use_cache: true
+
+# Legacy fields (ignored when use_enhanced_datasets: true)
+name: "enhanced_small"
+huggingface_dataset_id: "unused"
+split: "unused"
