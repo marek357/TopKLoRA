@@ -1,0 +1,7 @@
+name: auto-interpret
+layer_idx: 13
+k: ${model.k}
+r: ${model.r}
+dataset_name: "ultrachat"
+build_eval_function:
+  _target_: src.evals.causal_auto_interp

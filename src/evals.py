@@ -7,7 +7,7 @@ from googleapiclient import discovery
 from collections import defaultdict
 import numpy as np
 from openai import OpenAI
-from src.delphi_autointerp import delphi_score
+from src.delphi_autointerp import delphi_collect_activations, delphi_score
 from src.models import TopKLoRALinear
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import (
@@ -28,23 +28,8 @@ import torch
 import os
 import logging
 from src.utils import (
-    AutointerpChatCollator,
     analyze_text_toxicity_eval,
-    autointerp_build_activation_prompt,
-    autointerp_build_dataset,
-    autointerp_build_lora_json_with_responses,
-    autointerp_build_lora_json_with_responses_local,
-    autointerp_build_prompt,
-    autointerp_collapse_heaps,
-    autointerp_evaluate,
-    autointerp_extract_digit,
-    autointerp_is_valid_dpo_pair,
-    autointerp_make_topk_hook,
-    autointerp_preprocess_to_messages,
-    autointerp_token_windows_dict,
-    autointerp_violates_alternation,
     build_metrics_eval_messages,
-    build_quant_config,
     preprocess_to_perspective_message
 )
 
@@ -350,183 +335,12 @@ def auto_interp():
     def eval_auto_interp(cfg):
         model, tokenizer, wrapped_modules = init_model_tokenizer(
             cfg.model, True)
-        # analyse_model(cfg, model, tokenizer, wrapped_modules)
+        if cfg.evals.auto_interp.collect_activations:
+            print('Collecting activations...')
+            torch.set_float32_matmul_precision('high')
+            delphi_collect_activations(cfg, model, tokenizer, wrapped_modules)
         delphi_score(cfg, model, tokenizer, wrapped_modules)
         return
-        print('Evaluating auto interp')
-        if 'sft' in cfg.model.adapter_checkpoint_dir:
-            print('SFT model, skipping auto interp...')
-            return
-        model, tokenizer, topk_modules = init_model_tokenizer(
-            cfg.model, auto_interp=True)
-
-        topk_store = defaultdict(
-            lambda: defaultdict(lambda: {"pos": [], "neg": []})
-        )
-        example_counter = 0        # global running index over all examples
-
-        # TODO: do NOT rely on global state
-        current_vals = {
-            'current_ex_offset': 0,
-            'current_pad_mask': None  # will be set per batch
-        }
-
-        for name, mod in topk_modules.items():
-            print(f"Hooking: {name} of type {type(mod)}")
-            mod.register_forward_hook(
-                autointerp_make_topk_hook(
-                    name, cfg, topk_store, current_vals
-                )
-            )
-        print(f"✔ registered hooks for {len(topk_modules)} LoRA blocks")
-
-        raw_ds = load_dataset(
-            cfg.evals.auto_interp.dataset_name,
-            split="train"
-        )
-
-        _TAG_RE = re.compile(r"(Human|Assistant):")
-        _ROLE_MAP = {"Human": "user", "Assistant": "assistant"}
-
-        msg_ds = raw_ds.map(
-            autointerp_preprocess_to_messages,
-            remove_columns=raw_ds.column_names
-        )
-
-        msg_ds = msg_ds.filter(
-            lambda ex:
-            not autointerp_violates_alternation(ex["chosen"]) and
-            not autointerp_violates_alternation(ex["rejected"]) and
-            autointerp_is_valid_dpo_pair(ex["chosen"]) and
-            autointerp_is_valid_dpo_pair(ex["rejected"])
-        )
-
-        chosen_ds = msg_ds.rename_column(
-            "chosen", "input"
-        ).remove_columns(["rejected"])
-
-        rejected_ds = msg_ds.rename_column(
-            "rejected", "input"
-        ).remove_columns(["chosen"])
-
-        flat_ds = concatenate_datasets(
-            [chosen_ds, rejected_ds]
-        ).shuffle(seed=cfg.seed)
-
-        print(f"Dataset size after flattening: {len(flat_ds):,}")
-
-        autointerp_collate_chat = AutointerpChatCollator(tokenizer, device)
-        loader = DataLoader(
-            flat_ds,
-            batch_size=cfg.evals.auto_interp.batch_size,
-            shuffle=False,
-            collate_fn=autointerp_collate_chat,
-            drop_last=False
-        )
-
-        if cfg.evals.auto_interp.max_rows == -1:
-            MAX_BATCHES = len(loader)
-        else:
-            MAX_BATCHES = int(
-                cfg.evals.auto_interp.max_rows/cfg.evals.auto_interp.batch_size
-            )
-
-        # take only the first MAX_BATCHES batches
-        limited_loader = islice(loader, MAX_BATCHES)
-
-        for row_idx, batch in enumerate(
-            tqdm(limited_loader, total=MAX_BATCHES), start=0
-        ):
-            input_ids = batch["input_ids"].to(device)
-            current_vals['current_pad_mask'] = batch["attention_mask"].to(
-                torch.bool
-            )
-            B = input_ids.size(0)
-
-            _ = model(input_ids)             # hooks fire here
-
-            current_vals['current_pad_mask'] = None         # clear reference
-            current_vals['current_ex_offset'] += B
-
-        adapters_pos_map = autointerp_collapse_heaps(topk_store)
-
-        os.makedirs('temp', exist_ok=True)
-        if cfg.evals.auto_interp.dump_generated:
-            with open(
-                "temp/adapters_pos_map_topk.json", "w", encoding="utf-8"
-            ) as f:
-                json.dump(
-                    adapters_pos_map, f,
-                    indent=2, ensure_ascii=False
-                )
-
-        # try:
-        #     with open('temp/lora_neuron_info.json', 'r') as f:
-        #         json_blob = json.load(f)
-        #     print('succesfully loaded neuron interp from cache')
-        # except FileNotFoundError:
-        #    print('neuron interp not found in cache, regenerating...')
-
-        # json_blob = autointerp_build_lora_json_with_responses(
-        #     adapters_pos_map,
-        #     flat_ds, tokenizer,
-        #     model="gpt-4o-mini",
-        #     include_cot=False,
-        #     include_few_shot=False
-        # )
-
-        json_blob = autointerp_build_lora_json_with_responses_local(
-            adapters_pos_map, flat_ds, tokenizer,
-            model_name="deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
-            include_cot=False,
-            include_few_shot=False,
-            temperature=0.0
-        )
-
-        activations = adapters_pos_map
-        lora_info = json_blob
-        examples = flat_ds
-        dataset = autointerp_build_dataset(
-            activations,
-            lora_info,
-            examples,
-            cfg.model.adapter_checkpoint_dir,
-            window=cfg.evals.auto_interp.context_size_each_side,
-        )
-
-        print(f"Generated {len(dataset)} test items.")
-
-        print(autointerp_build_prompt(dataset[0]))
-
-        client = OpenAI()
-        predictions, correct = [], 0
-        bar = tqdm(dataset, desc="Evaluating", unit="ex")
-        for i, ex in enumerate(bar, 1):
-            user_prompt = autointerp_build_prompt(ex)
-            resp = client.chat.completions.create(
-                model=cfg.evals.auto_interp.chat_model,
-                temperature=cfg.evals.auto_interp.chat_model_temperature,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": cfg.evals.auto_interp.chat_system_prompt
-                    },
-                    {
-                        "role": "user",
-                        "content": user_prompt
-                    },
-                ],
-            )
-            reply = resp.choices[0].message.content.strip()
-            pred = autointerp_extract_digit(reply)
-            predictions.append(pred)
-            if pred == ex["answer"]:
-                correct += 1
-            bar.set_postfix(acc=f"{correct / i:.3f}")
-            time.sleep(cfg.evals.auto_interp.sleep_sec)
-
-        metrics = autointerp_evaluate(predictions, dataset)
-        print("Evaluation metrics:", metrics)
 
     return eval_auto_interp
 
@@ -795,14 +609,6 @@ def toxicity():
         return toxicity_scores
 
     return eval_toxicity
-
-
-# Final accuracy summary
-# overall: 67.873%
-# harmless: 62.069%
-# helpful: 72.881%
-# honest: 72.131%
-# other: 62.791%
 
 
 def instruction_following():
