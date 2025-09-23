@@ -1,34 +1,65 @@
-# Enhanced TopK LoRA experiment with aggressive sparsity
-# High sparsity with temperature annealing
+# # Enhanced TopK LoRA experiment with aggressive sparsity
+# # High sparsity with temperature annealing
 
-size: "enhanced_sparse"
+# size: "enhanced_sparse"
+# lora:
+#   r: 1024
+#   bias: 'none'
+#   alpha: 1024
+#   dropout: 0.05
+  
+#   # Enable TopK functionality with high sparsity
+#   use_topk: true
+#   k: 64              # Keep top 16 latents active (87.5% sparsity)
+#   k_final: 8         # Final k value (even sparser)
+#   k_schedule: "linear"  # Cubic schedule for gradual sparsification
+  
+#   # Aggressive temperature scheduling
+#   temperature: 1.0              # Higher initial temperature
+#   temperature_final: 0.01       # Very low final temperature 
+#   temperature_schedule: "cubic"   # Exponential decay for sharp transitions
+  
+#   # Enhanced monitoring
+#   log_dead_latents: false
+#   dead_latents_log_every: 250   # More frequent logging
+  
+#   # Target single layer for focused analysis
+#   target_modules:
+#     - layers.13.self_attn.q_proj
+#     - layers.13.self_attn.k_proj
+#     - layers.13.self_attn.v_proj
+#     - layers.13.self_attn.o_proj
+#     - layers.13.mlp.gate_proj
+#     - layers.13.mlp.up_proj
+#     - layers.13.mlp.down_proj
+
+
 lora:
-  r: 1024
+  r: 512            # was 1024
+  alpha: 512
   bias: 'none'
-  alpha: 1024
-  dropout: 0.05
-  
-  # Enable TopK functionality with high sparsity
+  dropout: 0.02     # lower noise for interpretability
+
   use_topk: true
-  k: 64              # Keep top 16 latents active (87.5% sparsity)
-  k_final: 8         # Final k value (even sparser)
-  k_schedule: "cubic"  # Cubic schedule for gradual sparsification
-  
-  # Aggressive temperature scheduling
-  temperature: 1.0              # Higher initial temperature
-  temperature_final: 0.01       # Very low final temperature 
-  temperature_schedule: "exp"   # Exponential decay for sharp transitions
-  
+  k: 64
+  k_final: 4
+  k_schedule: "linear"   # if unsupported, emulate via external progress scheduling
+  # Hold 64 for ~40% of steps, cosine to 8 over last ~50–60%.
+  k_warmup_fraction: 0.3  # new, fraction of training for k to reach k_final
+
+  temperature: 1.0
+  temperature_final: 0.05     # was 0.01
+  temperature_schedule: "cubic"
   # Enhanced monitoring
   log_dead_latents: false
   dead_latents_log_every: 250   # More frequent logging
   
   # Target single layer for focused analysis
   target_modules:
-    # - layers.13.self_attn.q_proj
-    # - layers.13.self_attn.k_proj
-    # - layers.13.self_attn.v_proj
-    # - layers.13.self_attn.o_proj
+    - layers.13.self_attn.q_proj
+    - layers.13.self_attn.k_proj
+    - layers.13.self_attn.v_proj
+    - layers.13.self_attn.o_proj
     - layers.13.mlp.gate_proj
     - layers.13.mlp.up_proj
     - layers.13.mlp.down_proj
