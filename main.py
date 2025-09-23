@@ -5,8 +5,8 @@ import hydra
 import random
 import numpy as np
 from transformers import set_seed, AutoModelForCausalLM
-from src.legacy.train import lukas_dpo, lukas_sft, run_sft, sanity_check
-from src.train import run_dpo
+from src.sft import run_sft
+from src.dpo import run_dpo
 from src.utils import build_quant_config
 from omegaconf import DictConfig, OmegaConf
 import logging
@@ -48,7 +48,7 @@ def main(cfg: DictConfig):
     model = None
 
     if cfg.training.sft.enabled:
-        model = lukas_sft(cfg)
+        model = run_sft(cfg)
 
     if cfg.training.dpo.enabled:
         print('Loading and merging LoRA adapter from checkpoint')

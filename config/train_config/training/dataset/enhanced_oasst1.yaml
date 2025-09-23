@@ -1,0 +1,29 @@
+# Enhanced dataset configuration with only OASST1
+# For testing and fastest processing
+
+# Enable the enhanced dataset system  
+use_enhanced_datasets: true
+
+# Dataset selection - only OASST1 for fastest processing
+datasets_to_use:
+  - "oasst1"      # OpenAssistant conversations only
+
+# Standard sequence length
+max_length: 4096
+
+# Evaluation holdout ratio
+eval_holdout_ratio: 0.05  # 5% for evaluation (smaller dataset)
+
+# Random seed for reproducible train/eval splits
+seed: 42
+
+# Whether to pack multiple conversations into single sequences
+pack_sequences: true
+
+# Whether to use filesystem caching
+use_cache: true
+
+# Legacy fields (ignored when use_enhanced_datasets: true)
+name: "enhanced_oasst1"
+huggingface_dataset_id: "unused"
+split: "unused"

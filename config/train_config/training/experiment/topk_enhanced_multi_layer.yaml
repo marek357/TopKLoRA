@@ -1,0 +1,34 @@
+# Enhanced TopK LoRA experiment configuration
+# Uses new TopKLoRALinearSTE with advanced features
+
+size: "enhanced"
+lora:
+  r: 64
+  bias: 'none'
+  alpha: 64
+  dropout: 0.05
+  
+  # Enable TopK functionality
+  use_topk: true
+  k: 32              # Keep top 32 latents active (50% sparsity)
+  k_final: 32        # Final k value (constant in this config)
+  k_schedule: "constant"  # "constant", "linear", "cubic", "exp"
+  
+  # Temperature scheduling for soft masking
+  temperature: 1.0              # Initial temperature
+  temperature_final: 0.1        # Final temperature 
+  temperature_schedule: "linear" # "linear", "cubic", "exp", "constant"
+  
+  # Dead latent monitoring
+  log_dead_latents: true
+  dead_latents_log_every: 500
+  
+  # Target all attention and MLP modules across multiple layers
+  target_modules:
+    - "q_proj"
+    - "k_proj" 
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"

@@ -298,7 +298,7 @@ class TopKLoRALinearSTE(nn.Module):
             z = z_pre
 
         # keep both: live for regs, detached for callbacks
-        self._z_live = z                         # may carry graph
+        # self._z_live = z                         # may carry graph
         self._last_z = z.detach()                # safe for logging
 
         tau = self._tau()
@@ -309,7 +309,7 @@ class TopKLoRALinearSTE(nn.Module):
         g = g_hard + g_soft - g_soft.detach()
 
         # keep both: live for regs, detached for callbacks
-        self._g_soft_live = g_soft               # may carry graph
+        # self._g_soft_live = g_soft               # may carry graph
         self._last_g_soft = g_soft.detach()
 
         self._last_ghard_mean = g.mean().detach()
@@ -1139,29 +1139,29 @@ def run_dpo(cfg, quant_cfg):
     # Inject TopK wrappers
     logging.info("Injecting TopKLoRALinearSTE wrappers...")
     replaced = 0
-    # for name, module in model.named_modules():
-    #     if getattr(module, "lora_A", None) is None and False:
-    #         continue
-    #     parent = model.get_submodule(".".join(name.split(".")[:-1]))
-    #     attr = name.split(".")[-1]
-    #     setattr(
-    #         parent, attr,
-    #         TopKLoRALinearSTE(
-    #             base=module,
-    #             layer_name=name,
-    #             k=experiment_args.lora.k,
-    #             temperature=experiment_args.lora.temperature,
-    #             temperature_schedule=experiment_args.lora.temperature_schedule,
-    #             k_schedule=experiment_args.lora.k_schedule,
-    #             k_final=experiment_args.lora.k_final,
-    #             hard_eval=True,
-    #             relu_latents=True,
-    #             alpha_over_r=True,
-    #             temperature_final=getattr(
-    #                 experiment_args.lora, 'temperature_final', None),
-    #         )
-    #     )
-    #     replaced += 1
+    for name, module in model.named_modules():
+        if getattr(module, "lora_A", None) is None and False:
+            continue
+        parent = model.get_submodule(".".join(name.split(".")[:-1]))
+        attr = name.split(".")[-1]
+        setattr(
+            parent, attr,
+            TopKLoRALinearSTE(
+                base=module,
+                layer_name=name,
+                k=experiment_args.lora.k,
+                temperature=experiment_args.lora.temperature,
+                temperature_schedule=experiment_args.lora.temperature_schedule,
+                k_schedule=experiment_args.lora.k_schedule,
+                k_final=experiment_args.lora.k_final,
+                hard_eval=True,
+                relu_latents=True,
+                alpha_over_r=True,
+                temperature_final=getattr(
+                    experiment_args.lora, 'temperature_final', None),
+            )
+        )
+        replaced += 1
 
     logging.info(f"Injected TopK STE wrappers in {replaced} layers")
     model.print_trainable_parameters()
@@ -1332,7 +1332,7 @@ def run_dpo(cfg, quant_cfg):
         processing_class=tokenizer,
         callbacks=[
             MemoryClearCallback(),
-            # TopKProgressCallback(),
+            TopKProgressCallback(),
             # DeadLatentsLoggerCallback(log_every=5),
             # GradNormLogger(every=1),
 

@@ -1,0 +1,42 @@
+method: "sft"
+
+defaults:
+  - model: gemma_2_2b
+  - experiment/topk_enhanced_multi_layer@sft_experiment
+  - experiment/topk_enhanced_multi_layer@dpo_experiment  # fallback for DPO if needed
+  - dataset/enhanced_multi@sft_dataset
+  - dataset/hh-rlhf@dpo_dataset
+  - base_sft_merged_model: gemma_2_2b
+  - quantization: 4bit
+
+dump_trained_model: True
+dump_path: "models/sft_enhanced/${training.model.model_name}"
+
+sft:
+  enabled: True
+  packing: False              # Disabled since enhanced datasets handle packing
+  completion_only_loss: True  # Enhanced datasets already mask non-assistant tokens
+  max_seq_length: 4096        # Should match dataset max_length
+  num_epochs: 2
+  batch_size_train: 4         # Smaller batch size due to longer sequences
+  gradient_accumulation_steps: 8
+  gradient_checkpointing: True
+  optim: "adamw_torch"
+  lr: 2e-5                    # Slightly lower LR for enhanced training
+  warmup_ratio: 0.1           # More warmup for stable training
+  bf16: True                  # Use bf16 for better numerical stability
+  fp16: False
+  max_grad_norm: 1.0
+  save_strategy: "steps"
+  save_steps: 1000            # Less frequent saves due to longer training
+  save_total_limit: 3
+  eval_steps: 500
+  eval_strategy: "steps"
+  max_steps: -1               # Use num_epochs instead
+  batch_size_eval: 4
+  weight_decay: 0.01
+  push_to_hub: False
+  do_eval: True
+
+dpo:
+  enabled: False

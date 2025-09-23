@@ -553,7 +553,7 @@ def save_score(result, model_str, scorer):
     return result
 
 
-def delphi_analysiss(cfg, model, tokenizer, wrapped_modules):
+def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
     print('starting analysis')
     flat_ds = load_dataset("allenai/c4", "en", split="train", streaming=True)
 
