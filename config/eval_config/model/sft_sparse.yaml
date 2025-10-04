@@ -9,5 +9,5 @@ k: 4
 r: 512
 base_model: "google/gemma-2-2b"
 model_it_name: "google/gemma-2-2b-it"
-adapter_checkpoint_dir: "/scratch/network/ssd/marek/sparselora/experiments/gemma_2.0_2B_sft_exp/final_adapter"
-train_steps: 5000
+adapter_checkpoint_dir: "/scratch/network/ssd/marek/sparselora/experiments/gemma_2.0_2B_sparse_sft/final_adapter"
+train_steps: 7500

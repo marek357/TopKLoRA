@@ -7,7 +7,7 @@ k: ${model.k}
 r: ${model.r}
 ablation_study: False
 activations_study: True
-collect_activations: False
+collect_activations: True
 train_steps: 5000
 batch_size: 10
 max_new_tokens: 125

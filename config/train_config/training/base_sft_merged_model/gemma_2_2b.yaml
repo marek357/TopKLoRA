@@ -1,2 +1,2 @@
 model_it_name: "google/gemma-2-2b-it"
-checkpoint_dir: "/scratch/network/ssd/marek/lora_interp/cache/tempartefacts/google/gemma-2-2b_sft"
+checkpoint_dir: "google/gemma-2-2b"

@@ -7,7 +7,9 @@ from googleapiclient import discovery
 from collections import defaultdict
 import numpy as np
 from openai import OpenAI
-from src.delphi_autointerp import delphi_collect_activations, delphi_score
+from src.cosine_test import aggregate_search_statistics, analyze_lora_B_patterns, cosine_top20_for_lora_B_rows, summarize_lora_B_search_results
+from src.delphi_autointerp import delphi_collect_activations, delphi_collect_activations_causal, delphi_score
+from src.models import TopKLoRALinearSTE
 from src.models import TopKLoRALinear
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import (
@@ -15,7 +17,6 @@ from datasets import (
     load_dataset,
     concatenate_datasets
 )
-from src.autointerp import analyse_model
 import torch.nn.functional as F
 from peft import PeftModel
 from torch.utils.data import DataLoader
@@ -36,6 +37,76 @@ from src.utils import (
 
 device = 'cuda' if torch.cuda.is_available() else \
     'mps' if torch.mps.is_available() else 'cpu'
+
+
+def force_load_layer13_weights(model, checkpoint_path):
+    """Force load only layer 13 LoRA weights"""
+    from safetensors.torch import load_file
+
+    weights = load_file(checkpoint_path)
+    device = next(model.parameters()).device
+
+    # Get layer 13
+    layer13 = model.base_model.model.model.layers[13]
+
+    loaded_count = 0
+    for key, value in weights.items():
+        if "layers.13" not in key:
+            continue
+
+        # Determine module and weight type
+        value = value.to(device)
+
+        if "self_attn.q_proj.lora_A" in key:
+            layer13.self_attn.q_proj.lora_A['default'].weight.data = value
+        elif "self_attn.q_proj.lora_B" in key:
+            layer13.self_attn.q_proj.lora_B['default'].weight.data = value
+        elif "self_attn.k_proj.lora_A" in key:
+            layer13.self_attn.k_proj.lora_A['default'].weight.data = value
+        elif "self_attn.k_proj.lora_B" in key:
+            layer13.self_attn.k_proj.lora_B['default'].weight.data = value
+        elif "self_attn.v_proj.lora_A" in key:
+            layer13.self_attn.v_proj.lora_A['default'].weight.data = value
+        elif "self_attn.v_proj.lora_B" in key:
+            layer13.self_attn.v_proj.lora_B['default'].weight.data = value
+        elif "self_attn.o_proj.lora_A" in key:
+            layer13.self_attn.o_proj.lora_A['default'].weight.data = value
+        elif "self_attn.o_proj.lora_B" in key:
+            layer13.self_attn.o_proj.lora_B['default'].weight.data = value
+        elif "mlp.gate_proj.lora_A" in key:
+            layer13.mlp.gate_proj.lora_A['default'].weight.data = value
+        elif "mlp.gate_proj.lora_B" in key:
+            layer13.mlp.gate_proj.lora_B['default'].weight.data = value
+        elif "mlp.up_proj.lora_A" in key:
+            layer13.mlp.up_proj.lora_A['default'].weight.data = value
+        elif "mlp.up_proj.lora_B" in key:
+            layer13.mlp.up_proj.lora_B['default'].weight.data = value
+        elif "mlp.down_proj.lora_A" in key:
+            layer13.mlp.down_proj.lora_A['default'].weight.data = value
+        elif "mlp.down_proj.lora_B" in key:
+            layer13.mlp.down_proj.lora_B['default'].weight.data = value
+        else:
+            continue
+
+        loaded_count += 1
+
+    print(f"Force-loaded {loaded_count} weight matrices for layer 13")
+
+    # Verify
+    print("\nVerification:")
+    for name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
+        module = getattr(layer13.self_attn, name)
+        a_max = module.lora_A['default'].weight.abs().max().item()
+        b_max = module.lora_B['default'].weight.abs().max().item()
+        print(f"  self_attn.{name}: A_max={a_max:.6f}, B_max={b_max:.6f}")
+
+    for name in ['gate_proj', 'up_proj', 'down_proj']:
+        module = getattr(layer13.mlp, name)
+        a_max = module.lora_A['default'].weight.abs().max().item()
+        b_max = module.lora_B['default'].weight.abs().max().item()
+        print(f"  mlp.{name}: A_max={a_max:.6f}, B_max={b_max:.6f}")
+
+    return model
 
 
 def hash_lora_weights(model):
@@ -97,7 +168,6 @@ def init_model_tokenizer(model_cfg, auto_interp=False):
         except Exception as exc:  # noqa: BLE001
             logging.warning("Failed to copy -it tokenizer: %s", exc)
 
-
     model = PeftModel.from_pretrained(
         model,
         model_cfg.adapter_checkpoint_dir,
@@ -108,28 +178,94 @@ def init_model_tokenizer(model_cfg, auto_interp=False):
         use_safetensors=True
     )
 
+    model = force_load_layer13_weights(
+        model, f"{model_cfg.adapter_checkpoint_dir}/adapter_model.safetensors")
+
+    # Check what adapters PEFT sees
+    print(f"PEFT active adapters: {model.active_adapters}")
+    print(f"PEFT adapter names: {list(model.peft_config.keys())}")
+
+    # Check the actual structure
+    for name, module in model.named_modules():
+        if hasattr(module, 'lora_B'):
+            print(f"{name}: lora_B keys = {list(module.lora_B.keys())}")
+            break  # Just check one
+
+    # Check if PEFT even tries to load the weights
+    from peft.utils import load_peft_weights
+    import warnings
+
+    # Enable all warnings to see if PEFT is complaining
+    warnings.filterwarnings("always")
+
+    # Try loading weights directly
+    try:
+        load_peft_weights(
+            model, f"{model_cfg.adapter_checkpoint_dir}/adapter_model.safetensors")
+        print("Direct weight loading succeeded")
+    except Exception as e:
+        print(f"Direct weight loading failed: {e}")
+
+    # Check what happened
+    layer13 = model.base_model.model.model.layers[13]
+    print(
+        f"After load_peft_weights: B max = {layer13.mlp.down_proj.lora_B['default'].weight.abs().max():.6f}")
+
+    # assert False
+
+    for name, module in model.named_modules():
+        if hasattr(module, 'lora_B'):
+            for adapter_name, b_module in module.lora_B.items():
+                is_zero = (b_module.weight == 0).all()
+                max_val = b_module.weight.abs().max()
+                print(
+                    f"{name}.lora_B[{adapter_name}]: all_zero={is_zero}, max={max_val:.6f}")
+
+    # replaced = 0
+    # # if model_cfg.r != model_cfg.k and False:
+    # for name, module in model.named_modules():
+    #     if isinstance(module, TopKLoRALinearSTE):
+    #         continue  # Already wrapped
+    #     if hasattr(module, "lora_A"):
+    #         parent = model.get_submodule(".".join(name.split(".")[:-1]))
+    #         attr = name.split(".")[-1]
+    #         wrapped = TopKLoRALinear(
+    #             module,
+    #             layer_name=name,
+    #             r=module.r,
+    #             alpha=module.lora_alpha,
+    #             k=model_cfg.k,
+    #             autointerp_evaluation_mode=auto_interp
+    #         )
+    #         setattr(parent, attr, wrapped)
+    #         # Add the wrapped module to the dictionary immediately
+    #         wrapped_modules[name] = wrapped
+    #         replaced += 1
     replaced = 0
     wrapped_modules = {}
-    # if model_cfg.r != model_cfg.k and False:
     for name, module in model.named_modules():
-        if isinstance(module, TopKLoRALinear):
-            continue  # Already wrapped
-        if hasattr(module, "lora_A"):
-            parent = model.get_submodule(".".join(name.split(".")[:-1]))
-            attr = name.split(".")[-1]
-            wrapped = TopKLoRALinear(
-                module,
-                layer_name=name,
-                r=module.r,
-                alpha=module.lora_alpha,
-                k=model_cfg.k,
-                autointerp_evaluation_mode=auto_interp
-            )
-            setattr(parent, attr, wrapped)
-            # Add the wrapped module to the dictionary immediately
-            wrapped_modules[name] = wrapped
-            replaced += 1
-    print(f"Wrapped {replaced} LoraLayer modules into TopKLoRALinear.")
+        if getattr(module, "lora_A", None) is None:
+            continue
+        parent = model.get_submodule(".".join(name.split(".")[:-1]))
+        attr = name.split(".")[-1]
+        wrapped = TopKLoRALinearSTE(
+            base=module,
+            layer_name=name,
+            k=model_cfg.k,
+            k_schedule='linear',  # doesn't matter in eval
+            k_final=model_cfg.k,  # eval k is fixed
+            hard_eval=True,
+            relu_latents=True,
+            alpha_over_r=True,
+            temperature_final=0.0,  # doesn't matter in eval
+            temperature=0.0,  # doesn't matter in eval
+            temperature_schedule='linear',  # doesn't matter in eval
+        )
+        setattr(parent, attr, wrapped)
+        wrapped_modules[name] = wrapped
+        replaced += 1
+
+    print(f"Wrapped {replaced} LoraLayer modules into TopKLoRALinearSTE.")
     model.to(device)
     model.eval()
 
@@ -140,7 +276,7 @@ def init_model_tokenizer(model_cfg, auto_interp=False):
         total_params = 0
         nonzero_params = 0
         for name, module in model.named_modules():
-            if isinstance(module, TopKLoRALinear):
+            if isinstance(module, TopKLoRALinearSTE):
                 for pname, param in module.lora_module.named_parameters():
                     total_params += param.numel()
                     nonzero_params += param.nonzero().size(0)
@@ -202,6 +338,60 @@ def init_model_tokenizer(model_cfg, auto_interp=False):
         return model, tokenizer, wrapped_modules
     else:
         return model, tokenizer
+
+
+def init_model_tokenizer_fixed(model_cfg):
+    """Load model with PEFT-compatible TopK wrappers"""
+
+    # Load base model and tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_cfg.adapter_checkpoint_dir,
+        use_fast=True
+    )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_cfg.base_model,
+        torch_dtype="auto",
+        device_map="cpu"
+    )
+
+    # Load the PEFT adapter (this should work now!)
+    model = PeftModel.from_pretrained(
+        model,
+        model_cfg.adapter_checkpoint_dir,
+        device_map="cpu",
+        use_safetensors=True
+    )
+
+    # NOW wrap with TopK for inference
+    wrapped_modules = {}
+    replaced = 0
+    for name, module in model.named_modules():
+        if hasattr(module, "lora_A") and not isinstance(module, TopKLoRALinearSTE):
+            parent = model.get_submodule(".".join(name.split(".")[:-1]))
+            attr = name.split(".")[-1]
+
+            # Use the PEFT-compatible wrapper
+            wrapped = TopKLoRALinearSTE(
+                base=module,
+                layer_name=name,
+                k=model_cfg.k,
+                temperature=0.0,  # Not used in eval
+                hard_eval=True,
+                relu_latents=True,
+                alpha_over_r=True,
+                k_final=model_cfg.k,
+                temperature_final=0.0
+            )
+            setattr(parent, attr, wrapped)
+            wrapped_modules[name] = wrapped
+            replaced += 1
+
+    print(f"Wrapped {replaced} LoRA modules with TopK for inference")
+    model.to(device)
+    model.eval()
+
+    return model, tokenizer, wrapped_modules
 
 
 def check_bbt_norm():
@@ -333,8 +523,9 @@ def metrics():
 
 def auto_interp():
     def eval_auto_interp(cfg):
-        model, tokenizer, wrapped_modules = init_model_tokenizer(
-            cfg.model, True)
+        model, tokenizer, wrapped_modules = init_model_tokenizer_fixed(
+            cfg.model
+        )
         if cfg.evals.auto_interp.collect_activations:
             print('Collecting activations...')
             torch.set_float32_matmul_precision('high')
@@ -343,6 +534,150 @@ def auto_interp():
         return
 
     return eval_auto_interp
+
+
+def causal_auto_interp():
+    def eval_causal_auto_interp(cfg):
+        model, tokenizer, wrapped_modules = init_model_tokenizer_fixed(
+            cfg.model
+        )
+        # sanity check below -- PEFT has a weird bug
+        # where it doesn't load the weights sometimes
+        # and initialises them to random (matrix_A)
+        # and zeros (matrix_B) instead
+        print("Sanity checking LoRA B weights...")
+        for name, module in model.named_modules():
+            if isinstance(module, TopKLoRALinearSTE):
+                b_max = module.B_module.weight.detach().abs().max()
+                a_max = module.A_module.weight.detach().abs().max()
+                assert b_max != 0, f"lora_B weights in {name} are all zero!"
+                assert a_max != 0, f"lora_A weights in {name} are all zero!"
+                print(f"{name}: B max = {b_max:.6f};  A max = {a_max:.6f}")
+
+        # cache_root = './cache/delphi_causal_cache_512_4'
+
+        # # Run the search
+        # results = cosine_top20_for_lora_B_rows(model, cache_root, topk=20)
+        # print(f"Completed cosine search for {len(results)} modules.")
+
+        # # Print summary
+        # summarize_lora_B_search_results(results, model, top_n=5)
+        # analyze_lora_B_patterns(results)
+        # aggregate_search_statistics(results)
+
+        if cfg.evals.causal_auto_interp.collect_activations:
+            print('Collecting activations...')
+            torch.set_float32_matmul_precision('high')
+            delphi_collect_activations_causal(
+                cfg, model, tokenizer, wrapped_modules
+            )
+
+        if cfg.evals.causal_auto_interp.score_activations:
+            print('Scoring activations...')
+            delphi_score(cfg, model, tokenizer, wrapped_modules)
+        return
+
+    return eval_causal_auto_interp
+
+
+def topk_lora_auto_interp():
+    """Evaluation entry point for TopKLoRA autointerp."""
+
+    def eval_topk_lora_auto_interp(cfg):
+        model, tokenizer, wrapped_modules = init_model_tokenizer_fixed(
+            cfg.model)
+
+        print("Sanity checking LoRA B weights...")
+        for name, module in model.named_modules():
+            if isinstance(module, TopKLoRALinearSTE):
+                b_max = module.B_module.weight.detach().abs().max()
+                a_max = module.A_module.weight.detach().abs().max()
+                assert b_max != 0, f"lora_B weights in {name} are all zero!"
+                assert a_max != 0, f"lora_A weights in {name} are all zero!"
+                print(f"{name}: B max = {b_max:.6f};  A max = {a_max:.6f}")
+
+        from src.topk_lora_autointerp import (
+            delphi_collect_activations_topk,
+            run_delphi_explanation_generation,
+            run_topk_decoder_similarity,
+            run_topk_hybrid_causal,
+            summarise_autointerp_run,
+            visualize_topk_results,
+        )
+
+        results = {}
+
+        if cfg.evals.topk_lora_autointerp.collect_activations:
+            print("Collecting TopKLoRA activations...")
+            torch.set_float32_matmul_precision('high')
+            delphi_collect_activations_topk(
+                cfg, model, tokenizer, wrapped_modules)
+
+        approach = cfg.evals.topk_lora_autointerp.approach
+
+        if approach in ("decoder_similarity", "both") and cfg.evals.topk_lora_autointerp.decoder_similarity.enabled:
+            print("Running decoder similarity analysis...")
+            analyzer, delphi_dataset = run_topk_decoder_similarity(
+                cfg, model, tokenizer, wrapped_modules)
+            results["decoder_similarity"] = {
+                "analyzer": analyzer,
+                "delphi_dataset": delphi_dataset,
+                "measurements": analyzer.similarity_measurements,
+            }
+
+            if cfg.evals.topk_lora_autointerp.delphi_integration.use_explainer:
+                run_delphi_explanation_generation(
+                    cfg,
+                    tokenizer,
+                    delphi_dataset,
+                    approach="decoder_similarity",
+                )
+
+            visualize_topk_results(
+                cfg,
+                {"similarities": analyzer.similarity_measurements},
+                approach="decoder_similarity",
+            )
+
+        if approach in ("hybrid_causal", "both") and cfg.evals.topk_lora_autointerp.hybrid_causal.enabled:
+            print("Running hybrid causal analysis...")
+            analyzer, delphi_dataset = run_topk_hybrid_causal(
+                cfg, model, tokenizer, wrapped_modules)
+            results["hybrid_causal"] = {
+                "analyzer": analyzer,
+                "delphi_dataset": delphi_dataset,
+                "traces": analyzer.causal_traces,
+            }
+
+            if cfg.evals.topk_lora_autointerp.delphi_integration.use_explainer:
+                run_delphi_explanation_generation(
+                    cfg,
+                    tokenizer,
+                    delphi_dataset,
+                    approach="hybrid_causal",
+                )
+
+            visualize_topk_results(
+                cfg,
+                {"traces": analyzer.causal_traces},
+                approach="hybrid_causal",
+            )
+
+        if approach == "both" and {"decoder_similarity", "hybrid_causal"}.issubset(results):
+            print(
+                "Both decoder similarity and hybrid causal analyses completed. Consider comparing outputs.")
+
+        if cfg.evals.topk_lora_autointerp.score_activations:
+            print('Scoring activations with Delphi scorers...')
+            delphi_score(cfg, model, tokenizer, wrapped_modules)
+
+        summary_path = summarise_autointerp_run(cfg, wrapped_modules)
+        print(
+            f"TopKLoRA autointerp complete. Summary written to {summary_path}")
+
+        return results
+
+    return eval_topk_lora_auto_interp
 
 
 def toxicity():

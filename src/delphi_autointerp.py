@@ -1,4 +1,5 @@
-from transformers import AutoTokenizer
+from src.utils import load_ultrachat, normalize_ultrachat_messages
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 from delphi.pipeline import process_wrapper, Pipeline
 from delphi.scorers import DetectionScorer, SurprisalScorer, OpenAISimulator, FuzzingScorer
 from delphi.explainers import DefaultExplainer, ContrastiveExplainer
@@ -17,7 +18,7 @@ import dataclasses
 import torch
 import json
 import os
-from typing import Optional, Union, Dict, Any
+from typing import Iterable, List, Optional, Union, Dict, Any
 import hashlib
 import pickle
 from functools import wraps
@@ -50,38 +51,39 @@ def get_priority_latents(interpretability_results, top_k=15):
     if not interpretability_results or True:
         print(f"No interpretability results, using default range 0-{top_k}")
         return list(range(top_k))
-    
+
     # Sort by interpretability score
     sorted_latents = sorted(
         interpretability_results,
         key=lambda x: x['interpretability_score'],
         reverse=True
     )
-    
-    priority_latents = [result['latent_id'] for result in sorted_latents[:top_k]]
-    
+
+    priority_latents = [result['latent_id']
+                        for result in sorted_latents[:top_k]]
+
     print(f"\n{'='*60}")
     print("TARGETING MOST INTERPRETABLE LATENTS")
     print(f"{'='*60}")
     print(f"Selected top {len(priority_latents)} interpretable latents:")
-    
+
     for i, result in enumerate(sorted_latents[:top_k]):
         latent_id = result['latent_id']
         score = result['interpretability_score']
         accuracy = result['metrics']['accuracy']
         activation_rate = result['metrics']['activation_rate']
-        
+
         # Try to infer function from top tokens
         top_tokens = result['metrics'].get('most_common_tokens', [])
         if top_tokens and len(top_tokens[0]) > 1:
             main_token = top_tokens[0][0] if top_tokens[0][1] > 2 else "mixed"
         else:
             main_token = "unknown"
-        
+
         print(f"  {i+1:2d}. Latent {latent_id:3d} (Score: {score:.2f}, Acc: {accuracy:.2f}, Act: {activation_rate:.2f}) - '{main_token}'")
-    
+
     print(f"{'='*60}\n")
-    
+
     return priority_latents
 
 
@@ -90,9 +92,9 @@ def _infer_function_from_tokens(metrics):
     top_tokens = metrics.get('most_common_tokens', [])
     if not top_tokens:
         return "Unknown"
-    
+
     main_token = top_tokens[0][0]
-    
+
     if main_token == ' or':
         return "Logical Disjunction (OR)"
     elif main_token in [' and', ',']:
@@ -111,26 +113,26 @@ def _infer_function_from_tokens(metrics):
 
 def create_enhanced_save_functions(model_str):
     """Create enhanced save functions that include interpretability metadata."""
-    
+
     # Load interpretability context once
     interp_results = load_interpretability_rankings()
     interp_lookup = {result['latent_id']: result for result in interp_results}
-    
+
     def enhanced_save_explanation(result, explainer_type):
         """Enhanced explanation saving with interpretability context."""
         latent_str = str(result.record.latent)
         safe = latent_str.replace(".", "_").replace(":", "_").replace(" ", "_")
-        
+
         # Extract latent ID
         match = re.search(r'(\d+)$', latent_str)
         latent_id = int(match.group(1)) if match else 0
-        
+
         # Get interpretability context
         context = interp_lookup.get(latent_id, {})
-        
+
         out_dir = f"explanations/{model_str}/" + explainer_type
         os.makedirs(out_dir, exist_ok=True)
-        
+
         # Enhanced output with interpretability metadata
         output_data = {
             "explanation": result.explanation,
@@ -145,49 +147,51 @@ def create_enhanced_save_functions(model_str):
                 "predicted_function": _infer_function_from_tokens(context.get('metrics', {}))
             }
         }
-        
+
         path = os.path.join(out_dir, f"{safe}.json")
         with open(path, "w") as f:
             json.dump(output_data, f, indent=2)
-        
+
         # Print progress with context
         score = context.get('interpretability_score', 0)
         func = _infer_function_from_tokens(context.get('metrics', {}))
-        print(f"✓ Explained Latent {latent_id} (Score: {score:.2f}, Function: {func})")
-        
+        print(
+            f"✓ Explained Latent {latent_id} (Score: {score:.2f}, Function: {func})")
+
         return result
-    
+
     def enhanced_save_score(result, scorer_type):
         """Enhanced score saving with interpretability context."""
         latent_str = str(result.record.latent)
         safe = latent_str.replace(".", "_").replace(":", "_").replace(" ", "_")
-        
+
         # Extract latent ID
         match = re.search(r'(\d+)$', latent_str)
         latent_id = int(match.group(1)) if match else 0
-        
+
         # Get interpretability context
         context = interp_lookup.get(latent_id, {})
-        
+
         out_dir = f"scores/{model_str}/{scorer_type}"
         os.makedirs(out_dir, exist_ok=True)
         path = os.path.join(out_dir, f"{safe}.json")
-        
+
         # Convert score to dict and ensure it's a proper dict
         score_obj = result.score
         if hasattr(score_obj, "to_json_string"):
             score_data = json.loads(score_obj.to_json_string())
         elif isinstance(score_obj, list):
-            score_data = {"scores": [dataclasses.asdict(elem) for elem in score_obj]}
+            score_data = {"scores": [
+                dataclasses.asdict(elem) for elem in score_obj]}
         elif isinstance(score_obj, dict):
             score_data = dict(score_obj)  # Ensure it's a mutable dict
         else:
             score_data = {"score": str(score_obj)}
-        
+
         # Ensure score_data is a dict before adding metadata
         if not isinstance(score_data, dict):
             score_data = {"original_score": score_data}
-        
+
         # Add interpretability metadata
         score_data['interpretability_metadata'] = {
             "latent_id": latent_id,
@@ -197,17 +201,18 @@ def create_enhanced_save_functions(model_str):
             "activation_sparsity": context.get('metrics', {}).get('avg_sparsity', 0),
             "token_diversity": context.get('metrics', {}).get('token_diversity', 0)
         }
-        
+
         with open(path, "w") as f:
             json.dump(score_data, f, indent=2)
-        
+
         # Print progress with context
         score = context.get('interpretability_score', 0)
         func = _infer_function_from_tokens(context.get('metrics', {}))
-        print(f"✓ Scored Latent {latent_id} (Score: {score:.2f}, Function: {func}) - {scorer_type}")
-        
+        print(
+            f"✓ Scored Latent {latent_id} (Score: {score:.2f}, Function: {func}) - {scorer_type}")
+
         return result
-    
+
     return enhanced_save_explanation, enhanced_save_score
 
 
@@ -267,7 +272,7 @@ class LLMResponseCache:
                 except:
                     pass  # Ignore cleanup errors
 
-    def get_explanation(self, record) -> Optional[str]:
+    def get_explanation(self, record) -> Optional[Dict[str, Any]]:
         """Get cached explanation or return None if not found."""
         cache_key = self._get_cache_key({
             'latent': str(record.latent),
@@ -294,15 +299,57 @@ class LLMResponseCache:
                 f"Warning: Failed to load explanation cache {cache_file}: {e}")
             return None
 
-    def save_explanation(self, record, explanation: str):
+    def save_explanation(
+        self,
+        record,
+        explanation: str,
+        *,
+        activating_sequences: Optional[List[Any]] = None,
+        non_activating_sequences: Optional[List[Any]] = None,
+    ):
         """Save explanation to cache."""
         cache_key = self._get_cache_key({
             'latent': str(record.latent),
             'activating_examples': [str(ex) for ex in record.examples[:5]],
             'non_activating_examples': [str(ex) for ex in record.not_active[:5]]
         })
+        # latent_str = str(record.latent)
+        # cache_key = latent_str.replace(
+        #     ".", "_").replace(":", "_").replace(" ", "_")
 
         cache_file = self.explanation_cache_dir / f"{cache_key}.json"
+
+        activating_sequences = activating_sequences or []
+        non_activating_sequences = non_activating_sequences or []
+
+        def _make_json_safe(value):
+            if isinstance(value, dict):
+                return {k: _make_json_safe(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [_make_json_safe(v) for v in value]
+            if isinstance(value, (str, int, float)) or value is None:
+                return value
+            return str(value)
+
+        def _sanitize_payload(seq_list):
+            sanitized = []
+            for item in seq_list:
+                if item is None:
+                    continue
+                sanitized.append(_make_json_safe(item))
+            return sanitized
+
+        activating_payload = _sanitize_payload(activating_sequences)
+        non_activating_payload = _sanitize_payload(non_activating_sequences)
+
+        activating_preview = [
+            CachedExplainer.format_sequence_with_metadata(item)
+            for item in activating_payload
+        ]
+        non_activating_preview = [
+            CachedExplainer.format_sequence_with_metadata(item)
+            for item in non_activating_payload
+        ]
 
         def write_explanation(filepath, mode):
             # Write to temporary file first, then atomic rename
@@ -311,6 +358,10 @@ class LLMResponseCache:
                 json.dump({
                     'latent': str(record.latent),
                     'explanation': explanation,
+                    'activating_sequences': activating_payload,
+                    'non_activating_sequences': non_activating_payload,
+                    'activating_sequences_preview': activating_preview,
+                    'non_activating_sequences_preview': non_activating_preview,
                     # Simple timestamp
                     'timestamp': str(torch.tensor(0).item())
                 }, f, indent=2)
@@ -403,24 +454,253 @@ class LLMResponseCache:
 
 # Global cache instance\
 
-llm_cache = LLMResponseCache(cache_dir=f'llm_cache_{os.environ.get("CUDA_VISIBLE_DEVICES")}')
+llm_cache = LLMResponseCache(
+    cache_dir=f'llm_cache_{os.environ.get("CUDA_VISIBLE_DEVICES")}')
 # llm_cache = LLMResponseCache(cache_dir='llm_cache_512_2')
 
 
 class CachedExplainer:
     """Wrapper around Delphi explainer with caching."""
 
-    def __init__(self, base_explainer):
+    def __init__(self, base_explainer, tokenizer: Optional[PreTrainedTokenizerBase] = None):
         self.base_explainer = base_explainer
+        self.tokenizer = tokenizer
+        self.ran = False
+
+    @staticmethod
+    def _clean_token_text(text: str) -> str:
+        if not text:
+            return ""
+        cleaned = text.replace("Ġ", " ").replace("▁", " ")
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip()
+
+    @staticmethod
+    def _token_ids_from(example_tokens) -> List[int]:
+        if example_tokens is None:
+            return []
+        if hasattr(example_tokens, "detach"):
+            example_tokens = example_tokens.detach().cpu()
+        if hasattr(example_tokens, "tolist"):
+            example_tokens = example_tokens.tolist()
+        if isinstance(example_tokens, (list, tuple)):
+            return [int(t) for t in example_tokens]
+        return []
+
+    @staticmethod
+    def _truncate_text(text: str, limit: int = 160) -> str:
+        snippet = text.replace("\n", " ")
+        if len(snippet) <= limit:
+            return snippet
+        return snippet[:limit - 3] + "…"
+
+    @staticmethod
+    def _activation_list_from(example_activations) -> List[float]:
+        if example_activations is None:
+            return []
+        if hasattr(example_activations, "detach"):
+            example_activations = example_activations.detach().cpu()
+        if hasattr(example_activations, "tolist"):
+            example_activations = example_activations.tolist()
+        if isinstance(example_activations, (list, tuple)):
+            return [float(a) for a in example_activations]
+        return []
+
+    def _extract_top_token_info(self, example) -> Optional[Dict[str, Any]]:
+        activations = self._activation_list_from(
+            getattr(example, "activations", None))
+        if not activations:
+            return None
+
+        best_idx = int(max(range(len(activations)),
+                       key=lambda idx: activations[idx]))
+        best_activation = float(activations[best_idx])
+
+        token_ids = self._token_ids_from(getattr(example, "tokens", None))
+        token_id = token_ids[best_idx] if best_idx < len(token_ids) else None
+
+        token_text = None
+        str_tokens = getattr(example, "str_tokens", None)
+        if isinstance(str_tokens, (list, tuple)) and best_idx < len(str_tokens):
+            token_text = str(str_tokens[best_idx])
+        elif self.tokenizer is not None and token_id is not None:
+            try:
+                token_text = self.tokenizer.convert_ids_to_tokens(token_id)
+                if isinstance(token_text, (list, tuple)):
+                    token_text = token_text[0] if token_text else None
+            except Exception:
+                token_text = None
+            if not token_text:
+                try:
+                    token_text = self.tokenizer.decode(
+                        [token_id], skip_special_tokens=False)
+                except Exception:
+                    token_text = None
+        token_text = self._clean_token_text(token_text) if token_text else None
+
+        normalized_acts = self._activation_list_from(
+            getattr(example, "normalized_activations", None))
+        normalized_value = float(normalized_acts[best_idx]) if best_idx < len(
+            normalized_acts) else None
+
+        return {
+            "token_id": int(token_id) if token_id is not None else None,
+            "token": token_text,
+            "activation": best_activation,
+            "normalized_activation": normalized_value,
+            "position": best_idx,
+        }
+
+    def _normalize_cached_activating(self, activating: Iterable[Any]) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        for item in activating or []:
+            if isinstance(item, dict):
+                sequence_text = item.get("sequence")
+                top_token = item.get("top_token")
+                if sequence_text is None and "text" in item:
+                    sequence_text = item.get("text")
+                cleaned_sequence = self._clean_token_text(
+                    str(sequence_text)) if sequence_text else ""
+                normalized.append({
+                    "sequence": cleaned_sequence,
+                    "top_token": top_token,
+                })
+            else:
+                normalized.append(
+                    {"sequence": self._clean_token_text(str(item))})
+        return normalized
+
+    def _render_sequence(self, example) -> str:
+        # Prefer precomputed string tokens when available
+        str_tokens = getattr(example, "str_tokens", None)
+        if str_tokens:
+            joined = " ".join(str(token) for token in str_tokens)
+            text = self._clean_token_text(joined)
+            if text:
+                return text
+
+        tokens = getattr(example, "tokens", None)
+        token_ids = self._token_ids_from(tokens)
+        if token_ids:
+            if self.tokenizer is not None:
+                try:
+                    decoded = self.tokenizer.decode(
+                        token_ids, skip_special_tokens=True)
+                    decoded = self._clean_token_text(decoded)
+                    if decoded:
+                        return decoded
+                except Exception:
+                    pass
+            return " ".join(str(t) for t in token_ids)
+
+        if hasattr(example, "text") and example.text is not None:
+            text = self._clean_token_text(str(example.text))
+            if text:
+                return text
+
+        return self._clean_token_text(str(example))
+
+    def _extract_sequences(self, record):
+        activating_entries: List[Dict[str, Any]] = []
+        for example in getattr(record, "examples", []):
+            sequence_text = self._render_sequence(example)
+            if not sequence_text:
+                continue
+            top_token = self._extract_top_token_info(example)
+            activating_entries.append({
+                "sequence": sequence_text,
+                "top_token": top_token,
+            })
+
+        non_activating = [
+            seq for seq in (
+                self._render_sequence(example)
+                for example in getattr(record, "not_active", [])
+            )
+            if seq
+        ]
+        return activating_entries, non_activating
+
+    @classmethod
+    def format_sequence_with_metadata(cls, entry: Any, *, limit: int = 400) -> str:
+        if isinstance(entry, dict):
+            raw_sequence = entry.get("sequence", "")
+            top_token = entry.get("top_token")
+        else:
+            raw_sequence = entry
+            top_token = None
+
+        sequence_text = cls._clean_token_text(
+            str(raw_sequence)) if raw_sequence is not None else ""
+        snippet = cls._truncate_text(sequence_text, limit=limit)
+
+        if top_token and isinstance(top_token, dict):
+            token_bits = []
+            token_text = top_token.get("token")
+            token_id = top_token.get("token_id")
+            activation = top_token.get("activation")
+            normalized = top_token.get("normalized_activation")
+            position = top_token.get("position")
+
+            if token_text:
+                token_bits.append(f"token='{token_text}'")
+            if token_id is not None:
+                token_bits.append(f"id={token_id}")
+            if position is not None:
+                token_bits.append(f"pos={position}")
+            if activation is not None:
+                token_bits.append(f"act={float(activation):.4f}")
+            if normalized is not None:
+                token_bits.append(f"norm={float(normalized):.3f}")
+
+            if token_bits:
+                snippet = f"{snippet} ({', '.join(token_bits)})"
+
+        return snippet
+
+    @staticmethod
+    def _preview_sequences(latent, activating, non_activating, limit=3):
+        def _preview_block(name, seqs):
+            if not seqs:
+                print(f"   • No {name} sequences cached")
+                return
+            print(f"   • Top {name} sequences:")
+            for idx, entry in enumerate(seqs[:limit], start=1):
+                snippet = CachedExplainer.format_sequence_with_metadata(entry)
+                print(f"     {idx:02d}: {snippet}")
+
+        print(f"📄 Latent {latent}: cached sequences")
+        _preview_block("activating", activating)
+        _preview_block("non-activating", non_activating)
 
     async def __call__(self, record):
         # Check cache first
-        cached_explanation = llm_cache.get_explanation(record)
-        if cached_explanation is not None:
+        cached_payload = llm_cache.get_explanation(record)
+        if cached_payload is not None:
+            if isinstance(cached_payload, dict):
+                explanation_text = cached_payload.get("explanation")
+                activating = self._normalize_cached_activating(
+                    cached_payload.get("activating_sequences", [])
+                )
+                non_activating = [
+                    self._clean_token_text(str(item))
+                    for item in cached_payload.get("non_activating_sequences", [])
+                ]
+            else:  # Backwards compatibility for old cache entries
+                explanation_text = str(cached_payload)
+                activating = []
+                non_activating = []
+
+            if explanation_text is not None:
+                self._preview_sequences(
+                    record.latent, activating, non_activating)
+
             # Create result object with cached explanation
             result = type('ExplanationResult', (), {
                 'record': record,
-                'explanation': cached_explanation
+                'explanation': explanation_text,
+                'activating_sequences': activating,
+                'non_activating_sequences': non_activating,
             })()
             return result
 
@@ -428,8 +708,16 @@ class CachedExplainer:
         print(f"⚡ Generating new explanation for {record.latent}")
         result = await self.base_explainer(record)
 
-        # Cache the result
-        llm_cache.save_explanation(record, result.explanation)
+        activating, non_activating = self._extract_sequences(record)
+        self._preview_sequences(record.latent, activating, non_activating)
+
+        # Cache the result with sequences
+        llm_cache.save_explanation(
+            record,
+            result.explanation,
+            activating_sequences=activating,
+            non_activating_sequences=non_activating,
+        )
 
         return result
 
@@ -514,7 +802,11 @@ def save_explanation(result, model_str, explainer_type):
 
     path = os.path.join(out_dir, f"{safe}.json")
     with open(path, "w") as f:
-        json.dump({"explanation": result.explanation}, f, indent=2)
+        json.dump({
+            "explanation": result.explanation,
+            # 'activating_sequences': result.activating_sequences,
+            # 'non_activating_sequences': result.non_activating_sequences,
+        }, f, indent=2)
     return result
 
 
@@ -553,9 +845,20 @@ def save_score(result, model_str, scorer):
     return result
 
 
-def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
-    print('starting analysis')
-    flat_ds = load_dataset("allenai/c4", "en", split="train", streaming=True)
+"""
+    if dataset_name == 'ultrachat':
+        flat_ds = load_ultrachat()
+    else:
+        flat_ds = load_dataset(
+            dataset_name, "en", split="train", streaming=True)
+
+"""
+
+
+def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules, dataset_name='allenai/c4'):
+    print('starting activation collection')
+
+    flat_ds = load_dataset(dataset_name, "en", split="train", streaming=True)
 
     def stream_and_format(dataset, max_examples):
         for example in islice(dataset, max_examples):
@@ -570,9 +873,9 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
     flat_ds = list(stream_and_format(flat_ds, MAX_BATCHES))
     chat_collate = ChatTemplateCollator(tokenizer, device, max_length=256)
 
-    loader = DataLoader(
+    loader = DataLoader(  # type: ignore[arg-type]
         flat_ds,
-        batch_size=cfg.evals.auto_interp.batch_size,
+        batch_size=cfg.evals.causal_auto_interp.batch_size,
         shuffle=False,
         collate_fn=chat_collate,
         drop_last=False
@@ -604,7 +907,7 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
     cache = LatentCache(
         model=model,
         hookpoint_to_sparse_encode=topk_modules,
-        batch_size=cfg.evals.auto_interp.batch_size,
+        batch_size=cfg.evals.causal_auto_interp.batch_size,
         transcode=False,
     )
 
@@ -613,7 +916,7 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
         tokens=tokens_array,
     )
     out_dir = Path(
-        f"cache/delphi_cache_{cfg.evals.auto_interp.r}_{cfg.evals.auto_interp.k}"
+        f"cache/delphi_cache_{cfg.evals.causal_auto_interp.r}_{cfg.evals.causal_auto_interp.k}"
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     cache.save_splits(n_splits=4, save_dir=out_dir)
@@ -648,6 +951,9 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
     print(f"Cache directory: {llm_cache.cache_dir}")
     print("="*50 + "\n")
 
+    config = cfg.evals.causal_auto_interp if hasattr(
+        cfg.evals, 'causal_auto_interp') else cfg.evals.topk_lora_autointerp
+
     topk_modules = [
         f"{name}.topk" for name, _ in wrapped_modules.items()
     ]
@@ -655,19 +961,20 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
     model.cpu()
     del model
     del wrapped_modules
-    
+
     # Load interpretability rankings and get priority latents
     print("\n" + "="*60)
     print("ENHANCED INTERPRETABILITY-FOCUSED ANALYSIS")
     print("="*60)
-    
+
     interp_results = load_interpretability_rankings()
-    priority_latents = get_priority_latents(interp_results, top_k=cfg.evals.auto_interp.r)
-    
+    priority_latents = get_priority_latents(
+        interp_results, top_k=config.r)
+
     # 1) Load the raw cache you saved
     dataset = LatentDataset(
         raw_dir=Path(
-            f"cache/delphi_cache_{cfg.evals.auto_interp.r}_{cfg.evals.auto_interp.k}"
+            f"cache/delphi_causal_cache_{config.r}_{config.k}"
         ),
         modules=topk_modules,
         latents={
@@ -712,116 +1019,64 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
     #     "Qwen/Qwen2.5-32B-Instruct-AWQ",
     #     max_tokens=25_768, base_url="http://127.0.0.1:8081/v1/chat/completions"
     # )
-    
+
     # GPU Memory Management Configuration
-    
+
     # Clear any existing CUDA cache
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    
+
     # Based on testing, the optimal configuration is:
     # - Single GPU (GPU 0, 3, or 4 are all free)
     # - Conservative memory settings to avoid OOM errors
     # - Reduced context length to fit in memory
-    
+
     # Use GPUs 0 and 3 (both completely free)
     # os.environ["CUDA_VISIBLE_DEVICES"] = "0,3"
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    
-    print(f"🔧 Using GPUs: {os.environ['CUDA_VISIBLE_DEVICES']} (multi-GPU with tensor parallelism)")
-    
+
+    print(
+        f"🔧 Using GPUs: {os.environ['CUDA_VISIBLE_DEVICES']} (multi-GPU with tensor parallelism)")
+
     # Set PyTorch CUDA memory management for fragmentation
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     num_gpus = len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
-    
-    # ABSOLUTE MINIMUM multi-GPU configuration for 32B model
-    # Emergency memory settings - last resort to prevent OOM
-    client = Offline("Qwen/Qwen2.5-32B-Instruct-AWQ",
-                     max_memory=0.65,       # EMERGENCY: reduced to 55% for generation headroom
-                     max_model_len=18860,    # MINIMUM: 2K context to maximize memory savings
-                     num_gpus=num_gpus,            # Split across 2 GPUs (tensor parallelism)
-                     prefix_caching=False,  # Disable to save memory during generation
-                     batch_size=1,          # Single sample processing to minimize memory
-                     enforce_eager=True)    # Disable CUDA graphs to avoid capture errors
-    
-    # Add device attribute for SurprisalScorer compatibility
-    client.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    print("✅ Model loaded successfully with multi-GPU tensor parallelism!")
-    print("   - Memory usage: 65% of GPU (conservative for generation)")
-    print("   - Context length: 24,768 tokens (current setting)")
-    print("   - Batch size: 1 (memory-safe)")
-    print(f"   - GPUs: {os.environ['CUDA_VISIBLE_DEVICES']} (tensor parallelism)")
 
-    # Create enhanced save functions with interpretability metadata
-    # enhanced_save_explanation, enhanced_save_score = create_enhanced_save_functions(
-    #     f'{cfg.evals.auto_interp.r}_{cfg.evals.auto_interp.k}'
-    # )
+    client = Offline(
+        "Qwen/Qwen3-30B-A3B-Thinking-2507",
+        num_gpus=4,                 # TP=2
+        max_model_len=18000,         # smaller KV → faster & safer
+        max_memory=0.65,
+        prefix_caching=False,
+        batch_size=1,
+        enforce_eager=False,        # allow CUDA graphs
+        number_tokens_to_generate=14_500,
+        # max_num_batched_tokens=3072,
+    )
+
+    # Add device attribute for SurprisalScorer compatibility
+    client.device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu")
+
+    print("✅ Model loaded successfully with multi-GPU tensor parallelism!")
+    print(
+        f"   - GPUs: {os.environ['CUDA_VISIBLE_DEVICES']} (tensor parallelism)")
 
     openai_run = False
     if not openai_run:
 
         base_explainer = DefaultExplainer(client, cot=True)
-        explainer = CachedExplainer(base_explainer)
-        # explainer = ContrastiveExplainer(
-        #     client,
-        #     # minimum confidence score to accept a label :contentReference[oaicite:5]{index=5}
-        #     threshold=0.3,
-        #     # number of activating contexts to show :contentReference[oaicite:6]{index=6}
-        #     max_examples=15,
-        #     # number of hard negatives per feature :contentReference[oaicite:7]{index=7}
-        #     max_non_activating=5,
-        #     # print debug logs during explanation generation :contentReference[oaicite:8]{index=8}
-        #     verbose=True
-        # )
-
-        # # 3) Wrap it in a pipe(here we save each explanation to disk)
-        # # def save_explanation(result):
-        # #     with open(f"explanations/{result.record.feature}.json", "w") as f:
-        # #         f.write(result.explanation.json())
-        # #     return result
-
+        explainer = CachedExplainer(base_explainer, tokenizer=tokenizer)
         explainer_pipe = process_wrapper(
             explainer,
-            postprocess=lambda x: save_explanation(x, f'{cfg.evals.auto_interp.r}_{cfg.evals.auto_interp.k}_simple', 'enhanced_default')
-            # postprocess=lambda x: enhanced_save_explanation(x, 'enhanced_default')
+            postprocess=lambda x: save_explanation(
+                x, f'{os.environ.get("CUDA_VISIBLE_DEVICES")}_{config.r}_{config.k}_simple', 'enhanced_default')
         )
 
-        base_detection_scorer = DetectionScorer(client, tokenizer=tokenizer)
+        base_detection_scorer = DetectionScorer(
+            client, tokenizer=tokenizer, n_examples_shown=5)
         detection_scorer = CachedDetectionScorer(base_detection_scorer)
-        
-        # Add surprisal scorer for additional robustness analysis (temporarily disabled for VLLM)
-        # surprisal_scorer = SurprisalScorer(
-        #     client, True, cfg.evals.auto_interp.batch_size
-        # )
-        # fuzzing_scorer = FuzzingScorer(
-        #     client, tokenizer, batch_size=cfg.evals.auto_interp.batch_size
-        # )
-
-        # async def score_both(explained):
-        #     rec = explained.record
-        #     rec.explanation = explained.explanation
-        #     rec.extra_examples = rec.not_active
-
-        #     # run detection
-        #     try:
-        #         det_res = await detection_scorer(rec)
-        #         save_score(det_res, 'default_detection')
-        #     except Exception as e:
-        #         print(f"Detection failed for {rec.feature}: {e}")
-        #         det_res = None
-
-        #     # # run surprisal
-        #     # sup_res = await surprisal_scorer(rec)
-        #     # save_score(sup_res)
-        #     # try:
-        #     #     fuz_res = await fuzzing_scorer(rec)
-        #     #     save_score(fuz_res, 'default_fuzzing')
-        #     # except Exception as e:
-        #     #     print(f"Fuzzing failed for {rec.feature}: {e}")
-        #     #     fuz_res = None
-        #     return explained
 
         # Enhanced preprocessing and scoring
         def preprocess(explained):
@@ -833,42 +1088,30 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
         detection_pipe = process_wrapper(
             detection_scorer,
             preprocess=preprocess,
-            postprocess=lambda x: save_score(x, f'{cfg.evals.auto_interp.r}_{cfg.evals.auto_interp.k}_simple',  'enhanced_detection')
+            postprocess=lambda x: save_score(
+                x, f'{os.environ.get("CUDA_VISIBLE_DEVICES")}_{config.r}_{config.k}_simple',  'enhanced_detection')
         )
-        
-        # Add surprisal scoring pipeline (temporarily disabled for VLLM)
-        # surprisal_pipe = process_wrapper(
-        #     surprisal_scorer,
-        #     preprocess=preprocess,
-        #     postprocess=lambda x: enhanced_save_score(x, 'surprisal')
-        # )
 
         # Enhanced pipeline with multiple scoring methods
-        print(f"Running enhanced interpretability analysis on {len(priority_latents)} latents")
+        print(
+            f"Running enhanced interpretability analysis on {len(priority_latents)} latents")
         print(f"Analysis includes: explanations, detection scoring, and surprisal analysis")
-        
+
         # Multi-stage pipeline
         async def comprehensive_scoring(explained):
             """Run both detection and surprisal scoring."""
             rec = explained.record
             rec.explanation = explained.explanation
             rec.extra_examples = rec.not_active
-            
+
             # Run detection scoring
             try:
                 det_result = await detection_scorer(rec)
-                save_score(det_result, f'{cfg.evals.auto_interp.r}_{cfg.evals.auto_interp.k}_simple',  'enhanced_detection')
+                save_score(
+                    det_result, f'{os.environ.get("CUDA_VISIBLE_DEVICES")}_{config.r}_{config.k}_simple',  'enhanced_detection')
             except Exception as e:
                 print(f"Detection scoring failed for {rec.latent}: {e}")
-            
-            # Run surprisal scoring (temporarily disabled for VLLM compatibility)
-            # try:
-            #     sup_result = await surprisal_scorer(rec)
-            #     enhanced_save_score(sup_result, 'surprisal')
-            # except Exception as e:
-            #     print(f"Surprisal scoring failed for {rec.latent}: {e}")
-            # print(f"Surprisal scoring skipped for {rec.latent} (VLLM compatibility)")
-            
+
             return explained
 
         comprehensive_pipe = process_wrapper(comprehensive_scoring)
@@ -895,7 +1138,8 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
         sim_pipe = process_wrapper(
             simulator,
             preprocess=sim_preprocess,
-            postprocess=lambda x: save_score(x, f'{cfg.evals.auto_interp.r}_{cfg.evals.auto_interp.k}_simple', 'OpenAISimulator')
+            postprocess=lambda x: save_score(
+                x, f'{os.environ.get("CUDA_VISIBLE_DEVICES")}_{config.r}_{config.k}_simple', 'OpenAISimulator')
         )
 
         # 4. Build and run the pipeline
@@ -907,18 +1151,167 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
     # Reduce concurrency to prevent memory issues
     # With the 32B model, we need to be very conservative with parallel processing
     max_concurrent = 3  # Process one at a time to avoid memory pressure
-    
+
     asyncio.run(pipeline.run(max_concurrent=max_concurrent))
-    
-    print(f"✅ Pipeline completed with max_concurrent={max_concurrent} (memory-safe)")
-    
+
+    print(
+        f"✅ Pipeline completed with max_concurrent={max_concurrent} (memory-safe)")
+
     # Generate summary after analysis
     print(f"\n{'='*60}")
     print("ENHANCED INTERPRETABILITY ANALYSIS COMPLETE")
     print(f"{'='*60}")
     print(f"Analyzed {len(priority_latents)} most interpretable latents")
     print(f"Results saved to:")
-    print(f"  - Explanations: explanations/{cfg.evals.auto_interp.r}_{cfg.evals.auto_interp.k}/enhanced_default/")
-    print(f"  - Detection scores: scores/{cfg.evals.auto_interp.r}_{cfg.evals.auto_interp.k}/enhanced_detection/")
-    print(f"  - Surprisal scores: scores/{cfg.evals.auto_interp.r}_{cfg.evals.auto_interp.k}/surprisal/")
+    print(
+        f"  - Explanations: explanations/{config.r}_{config.k}/enhanced_default/")
+    print(
+        f"  - Detection scores: scores/{config.r}_{config.k}/enhanced_detection/")
+    print(
+        f"  - Surprisal scores: scores/{config.r}_{config.k}/surprisal/")
     print(f"{'='*60}\n")
+
+
+def ultrachat_to_flat_tokens(
+    tokenizer,
+    splits=("train_sft",),
+    add_eos_between=True,
+    eos_id=None,
+    num_proc=None,
+    render_batch_size=256,
+    encode_batch_size=1024,
+    token_budget=None,  # int or None
+) -> torch.Tensor:
+    """
+    Returns a 1-D torch.LongTensor of token ids.
+    No NumPy, no per-example skipping.
+    """
+    if eos_id is None:
+        eos_id = tokenizer.eos_token_id
+    ds = load_ultrachat()
+
+    # Step A: repair + render chat template to strings (fast, parallel)
+    def render_batch(batch):
+        texts = []
+        for msgs in batch["messages"]:
+            fixed, need_gen = normalize_ultrachat_messages(msgs)
+            txt = tokenizer.apply_chat_template(
+                fixed,
+                tokenize=False,                 # render string only
+                add_generation_prompt=need_gen
+            )
+            texts.append(txt)
+        return {"text": texts}
+
+    ds = ds.remove_columns([c for c in ds.column_names if c != "messages"])
+    print("Rendering chat templates to strings...")
+    print(ds[0])
+    ds = ds.map(
+        render_batch,
+        batched=True,
+        batch_size=render_batch_size,
+        num_proc=(num_proc or os.cpu_count() or 4),
+        desc="Render chat templates",
+    )
+    texts = ds["text"]
+
+    # Step B: batch-encode strings → lists of ids, then to torch and cat once
+    pieces = []
+    total = 0
+    for i in tqdm(range(0, len(texts), encode_batch_size)):
+        chunk = texts[i:i + encode_batch_size]
+        enc = tokenizer(
+            chunk,
+            add_special_tokens=False,   # template already added specials
+            return_attention_mask=False,
+            padding=False,
+            truncation=False,
+            return_tensors=None,        # get List[List[int]]
+        )["input_ids"]
+
+        for ids in enc:
+            if add_eos_between and eos_id is not None:
+                ids = ids + [eos_id]
+            t = torch.tensor(ids, dtype=torch.long)
+            if token_budget is None:
+                pieces.append(t)
+            else:
+                if total >= token_budget:
+                    break
+                need = token_budget - total
+                if t.numel() <= need:
+                    pieces.append(t)
+                    total += t.numel()
+                else:
+                    pieces.append(t[:need])
+                    total += need
+                    break
+        if token_budget is not None and total >= token_budget:
+            break
+
+    if not pieces:
+        return torch.empty(0, dtype=torch.long)
+
+    return torch.cat(pieces, dim=0)  # 1-D long tensor
+
+
+def pack_1d_stream(tokens_1d: torch.Tensor, seq_len: int) -> torch.Tensor:
+    usable = (tokens_1d.numel() // seq_len) * seq_len
+    if usable == 0:
+        raise ValueError("Not enough tokens to form a single window.")
+    return tokens_1d.narrow(0, 0, usable).view(-1, seq_len)
+
+
+def delphi_collect_activations_causal(cfg, model, tokenizer, wrapped_modules):
+    print("starting activation collection")
+    # manual forward pass: check LoRA adapter outputs
+    # define hooks
+
+    SEQ_LEN = cfg.evals.causal_auto_interp.seq_len
+    N_TOKENS_TARGET = cfg.evals.causal_auto_interp.n_tokens
+
+    tokens_1d = ultrachat_to_flat_tokens(
+        tokenizer,
+        splits=("train_sft",),
+        add_eos_between=True,
+        token_budget=N_TOKENS_TARGET,
+        num_proc=os.cpu_count(),
+        render_batch_size=256,
+        encode_batch_size=1024,
+        eos_id=tokenizer.eos_token_id
+    )
+
+    if tokens_1d.numel() == 0:
+        raise RuntimeError("UltraChat produced no tokens after cleaning.")
+
+    tokens_array = pack_1d_stream(
+        tokens_1d, seq_len=SEQ_LEN)  # shape [N, SEQ_LEN]
+
+    topk_modules = {f"{name}.topk": module.topk for name,
+                    module in wrapped_modules.items()}
+    cache = LatentCache(
+        model=model,
+        hookpoint_to_sparse_encode=topk_modules,
+        batch_size=cfg.evals.causal_auto_interp.batch_size,
+        transcode=False,
+    )
+
+    cache.run(
+        n_tokens=N_TOKENS_TARGET,
+        tokens=tokens_array,
+    )
+
+    # assert False
+
+    out_dir = Path(
+        f"cache/delphi_causal_cache_{cfg.evals.causal_auto_interp.r}_{cfg.evals.causal_auto_interp.k}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cache.save_splits(n_splits=4, save_dir=out_dir)
+
+    widths = {
+        f"{name}.topk": wrapped_modules[name].r for name in wrapped_modules}
+    for hookpoint in widths:
+        hp_dir = out_dir / hookpoint
+        hp_dir.mkdir(parents=True, exist_ok=True)
+        with open(hp_dir / "config.json", "w") as f:
+            json.dump({"hookpoint": hookpoint, "width": widths[hookpoint]}, f)

@@ -11,7 +11,7 @@ datasets_to_use:
   - "ultrachat"   # HF UltraChat 200k dataset
 
 # Sequence length for the enhanced system
-max_length: 4096
+max_length: 2048
 
 # Evaluation holdout ratio (fraction of data for eval)
 eval_holdout_ratio: 0.01  # 1% for evaluation

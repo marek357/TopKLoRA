@@ -2,7 +2,8 @@ defaults:
   - _self_
   - logger: wandb_disabled
   # - evals/metrics@evals.metrics
-  - evals/causal-auto-interpret@evals.causal_auto_interp
+  # - evals/causal-auto-interpret@evals.causal_auto_interp
+  - evals/topk-lora-autointerp@evals.topk_lora_autointerp
   # - evals/auto-interpret@evals.auto_interp
   # - evals/toxicity@evals.toxicity
   # - evals/instruction_following@evals.instruction_following
@@ -10,7 +11,8 @@ defaults:
   # - model: dpo_512_lg_start_sm_end
   # - model: dpo_512_sm_start_lg_end
   # - model: sft_mlp
-  - model: sft_both
+  - model: sft_sparse
+  # - model: sft_both
   # - model: dpo_1024
   # - model: interp_dpo_gemma_large_5k
   # - override hydra/launcher: submitit_slurm
