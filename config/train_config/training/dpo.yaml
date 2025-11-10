@@ -7,7 +7,7 @@ defaults:
   #- experiment/lora_gemma_interp_large_start@dpo_experiment
   #- experiment/lora_gemma_interp_small_small@dpo_experiment
   - experiment/lora_gemma_interp_512_large_start@dpo_experiment
-  - experiment/dense_small@dpo_experiment
+  # - experiment/dense_small@dpo_experiment
   #- experiment/lora_gemma_interp_512_small_start@dpo_experiment
   - dataset/alpaca-train@sft_dataset
   - dataset/hh-rlhf@dpo_dataset

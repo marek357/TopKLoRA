@@ -15,7 +15,6 @@ from src.utils import merge_lora_adapter
 import socket
 
 
-
 @hydra.main(
     version_base=None,
     config_path="config/train_config",
@@ -29,13 +28,13 @@ def main(cfg: DictConfig):
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
     set_seed(cfg.get("seed", 42))
-    wandb.init(
-        project=cfg.logger.project,
-        entity=cfg.logger.entity,
-        name=cfg.experiment_name,
-        config=OmegaConf.to_container(cfg, resolve=True),
-        mode=cfg.logger.wandb_mode  # NOTE: disabled by default
-    )
+    # wandb.init(
+    #     project=cfg.logger.project,
+    #     entity=cfg.logger.entity,
+    #     name=cfg.experiment_name,
+    #     config=OmegaConf.to_container(cfg, resolve=True),
+    #     mode=cfg.logger.wandb_mode  # NOTE: disabled by default
+    # )
 
     logging.basicConfig(
         level=logging.INFO,
@@ -59,8 +58,8 @@ def main(cfg: DictConfig):
         run_dpo(cfg, quant_cfg)
         # model = lukas_dpo(cfg, model)
 
-    if cfg.training.dump_trained_model:
-        model.save_pretrained(cfg.training.dump_path)
+    # if cfg.training.dump_trained_model:
+    #     model.save_pretrained(cfg.training.dump_path)
 
 
 if __name__ == '__main__':

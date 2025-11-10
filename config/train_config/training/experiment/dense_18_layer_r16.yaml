@@ -1,20 +1,21 @@
 size: "small"
 lora:
-  r: 512
+  r: 16
   bias: 'none'
-  alpha: 1024
+  alpha: 32
   # alpha: 256
   dropout: 0.0
-  top_k_experiment: True
-  #k: 128
+  top_k_experiment: False
+  k: 16
   # k_final: 512
-  k: 64
-  #k_final: 2
-  k_final: 4
+  #k: 64
+  k_final: 16
+  #k_final: 4
   # k_schedule: constant
   k_schedule: cubic
   temperature: 0.1
   temperature_final: 0.005
+  layer: 18_dense
   temperature_schedule: linear
   target_modules:
     - layers.18.self_attn.q_proj

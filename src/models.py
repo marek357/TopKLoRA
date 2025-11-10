@@ -584,12 +584,14 @@ class TopKLoRALinearSTE(nn.Module):
         alpha_over_r: bool = True,              # scaling mode
         # optional target temperature at progress=1
         temperature_final: Optional[float] = None,
+        is_topk_experiment: bool = False
     ):
         super().__init__()
         self.lora_module = base
         self.base_layer = base.base_layer
         adapter = base.active_adapter if isinstance(
             base.active_adapter, str) else base.active_adapter[0]
+        self.is_topk_experiment = is_topk_experiment
 
         self.A_module = base.lora_A[adapter]
         self.B_module = base.lora_B[adapter]
@@ -616,6 +618,7 @@ class TopKLoRALinearSTE(nn.Module):
         # Progress variable (0..1)
         self.register_buffer("progress", torch.tensor(0.0))
         self.register_buffer("last_frac_grad_nonzero", torch.tensor(0.0))
+        self._progress_scalar: float = 0.0
 
         # Transient caches for regs/logging
         self._z_live: Optional[torch.Tensor] = None
@@ -673,6 +676,8 @@ class TopKLoRALinearSTE(nn.Module):
             if hasattr(self, name):
                 getattr(self, name).copy_(value)
 
+        self._progress_scalar = float(self.progress.detach().cpu().item())
+
         return
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
@@ -702,6 +707,9 @@ class TopKLoRALinearSTE(nn.Module):
             if key in state_dict:
                 setattr(self, name, state_dict[key])
 
+        if isinstance(self.progress, torch.Tensor):
+            self._progress_scalar = float(self.progress.detach().cpu().item())
+
         # Delegate lora weights to the lora_module
         lora_prefix = prefix  # Keep same prefix for transparency
         self.lora_module._load_from_state_dict(
@@ -712,11 +720,17 @@ class TopKLoRALinearSTE(nn.Module):
     # -------- Progress control --------
     def set_progress(self, p: float):
         """Set training progress in [0, 1]."""
-        self.progress.fill_(float(min(max(p, 0.0), 1.0)))
+        value = float(min(max(p, 0.0), 1.0))
+        self._progress_scalar = value
+        self.progress.fill_(value)
+
+    @property
+    def progress_scalar(self) -> float:
+        return self._progress_scalar
 
     # -------- Scheduling --------
     def _tau(self):
-        p = float(self.progress)
+        p = self._progress_scalar
         # If constant or already at target, keep t0
         if self.temperature_schedule == "constant" or abs(self.t0 - self.t_final) < 1e-12:
             return self.t0
@@ -734,7 +748,7 @@ class TopKLoRALinearSTE(nn.Module):
 
     def _current_k(self):
         # p in [0,1]; compress so k finishes warming up by 5% of training
-        p = float(self.progress)
+        p = self._progress_scalar
         warm = min(p / 0.05, 1.0)  # 0..1 grows only during first 5%
         if self.k_schedule == "constant" or self.k_init == self.k_final:
             return self.k_init
@@ -756,6 +770,11 @@ class TopKLoRALinearSTE(nn.Module):
         x_lora = self.dropout(x)        # dropout only on LoRA
 
         z_pre = F.linear(x_lora, A)
+
+        if not self.is_topk_experiment:
+            lora_out = F.linear(z_pre, B) * self.scale
+            return out + lora_out
+
         if self.relu_latents:
             z = F.relu(z_pre)
         else:
@@ -774,8 +793,10 @@ class TopKLoRALinearSTE(nn.Module):
             # eval mode, hard top-k
             z = self.topk(z)
             lora_out = F.linear(z, B) * self.scale
-            # print('LoRA contribution:', lora_out.mean().item())
+            # print('LoRA contribution:', lora_out.mean())
             # print('Base layer contribution:', out.mean().item())
+            # print('lora_out1 is nonzero:',
+            #       (lora_out.detach().abs().sum()))
             return out + lora_out
 
         g_soft = _soft_topk_mass(z, k_now, tau)
@@ -791,6 +812,7 @@ class TopKLoRALinearSTE(nn.Module):
         self._last_ghard_mean = g.mean().detach()
 
         lora_out = F.linear(z * g, B) * self.scale
+
         return out + lora_out
 
     def get_gate_stats(self):

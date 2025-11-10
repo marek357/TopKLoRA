@@ -1,0 +1,84 @@
+# Default configuration for feature steering
+# This config defines how to load a model with TopKLoRALinearSTE adapters
+# and apply feature steering during inference
+
+defaults:
+  - _self_
+
+# Experiment identification
+experiment_name: "feature_steering_default"
+
+# Model configuration
+model:
+  # Base model name or path
+  model_name: "google/gemma-2-2b-it"
+  
+  # Path to the adapter checkpoint (trained TopKLoRALinearSTE)
+  adapter_path: "models/dpo/dpo_model_512_4/final_adapter"
+  
+  # Device configuration
+  device: "cuda"  # or "cpu" or "mps"
+  dtype: "bfloat16"  # float16, bfloat16, or float32
+  
+  # Quantization (optional)
+  load_in_4bit: false
+  load_in_8bit: false
+
+# Generation configuration
+generation:
+  max_new_tokens: 256
+  do_sample: false
+  temperature: 0.0
+  top_p: 1.0
+  repetition_penalty: 1.0
+
+# Steering configuration
+steering:
+  # Dictionary mapping adapter names to list of (feature_num, effect) tuples
+  # effect can be "enable" or "disable"
+  
+  # Example: Steer features in self-attention q_proj of layer 11
+  features:
+    "base_model.model.model.layers.11.self_attn.q_proj.topk":
+      - feature: 217
+        effect: "enable"
+        description: "Pronouns and auxiliary verbs in question structures"
+      
+      - feature: 45
+        effect: "disable"
+        description: "Example disabled feature"
+  
+  # Verbose logging
+  verbose: true
+  
+  # List available adapters before steering
+  list_adapters: true
+
+# Evaluation prompts
+prompts:
+  # List of prompts to test with steering enabled
+  - "How do I make a cake?"
+  - "What is the capital of France?"
+  - "Can you help me with my homework?"
+  - "Tell me about the history of computers."
+
+# Output configuration
+output:
+  # Directory to save results
+  output_dir: "outputs/steering"
+  
+  # Save outputs to file
+  save_outputs: true
+  
+  # Print outputs to console
+  print_outputs: true
+  
+  # Compare with baseline (no steering)
+  compare_baseline: true
+
+# Logging
+logger:
+  report_to: []  # ["wandb"] or []
+  wandb_project: "sparselora-steering"
+  wandb_entity: null
+  wandb_mode: "disabled"  # "online", "offline", or "disabled"

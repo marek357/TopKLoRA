@@ -1,0 +1,26 @@
+size: "small"
+lora:
+  r: 16
+  bias: 'none'
+  alpha: 16
+  # alpha: 256
+  dropout: 0.0
+  top_k_experiment: False
+  # k: 128
+  # k_final: 512
+  k: 16
+  # k_final: 2
+  k_final: 16
+  # k_schedule: constant
+  k_schedule: constant
+  temperature: 0.1
+  temperature_final: 0.005
+  temperature_schedule: linear
+  target_modules:
+    - layers.11.self_attn.q_proj
+    - layers.11.self_attn.k_proj
+    - layers.11.self_attn.v_proj
+    - layers.11.self_attn.o_proj
+    - layers.11.mlp.gate_proj
+    - layers.11.mlp.up_proj
+    - layers.11.mlp.down_proj

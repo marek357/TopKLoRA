@@ -49,8 +49,16 @@ def load_interpretability_rankings():
 def get_priority_latents(interpretability_results, top_k=15):
     """Get the most interpretable latents based on our analysis."""
     if not interpretability_results or True:
-        print(f"No interpretability results, using default range 0-{top_k}")
-        return list(range(top_k))
+        print(
+            f"No interpretability results, sampling 250 latents per matrix (range 0-{top_k})")
+        # sample randomly 250 latent ids from 0 to top_k for each matrix
+        # this means that we will have an array of 7 * 250 = 1750 latents to explain
+        # set random seed for reproducibility
+        local_rng = random.Random(42)
+        return [
+            local_rng.sample(range(top_k), 150)
+            for _ in range(7)
+        ]
 
     # Sort by interpretability score
     sorted_latents = sorted(
@@ -130,7 +138,7 @@ def create_enhanced_save_functions(model_str):
         # Get interpretability context
         context = interp_lookup.get(latent_id, {})
 
-        out_dir = f"explanations/{model_str}/" + explainer_type
+        out_dir = f"autointerp/{model_str}/explanations/" + explainer_type
         os.makedirs(out_dir, exist_ok=True)
 
         # Enhanced output with interpretability metadata
@@ -172,7 +180,7 @@ def create_enhanced_save_functions(model_str):
         # Get interpretability context
         context = interp_lookup.get(latent_id, {})
 
-        out_dir = f"scores/{model_str}/{scorer_type}"
+        out_dir = f"autointerp/{model_str}/scores/{scorer_type}"
         os.makedirs(out_dir, exist_ok=True)
         path = os.path.join(out_dir, f"{safe}.json")
 
@@ -219,9 +227,10 @@ def create_enhanced_save_functions(model_str):
 class LLMResponseCache:
     """Cache for LLM responses to avoid redundant API calls."""
 
-    def __init__(self, cache_dir: str = "llm_cache"):
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(exist_ok=True)
+    def __init__(self, cache_dir: str = "llm_cache", base_dir: str = "autointerp"):
+        self.base_dir = Path(base_dir)
+        self.cache_dir = self.base_dir / cache_dir
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.explanation_cache_dir = self.cache_dir / "explanations"
         self.detection_cache_dir = self.cache_dir / "detection"
         self.explanation_cache_dir.mkdir(exist_ok=True)
@@ -452,18 +461,12 @@ class LLMResponseCache:
         }
 
 
-# Global cache instance\
-
-llm_cache = LLMResponseCache(
-    cache_dir=f'llm_cache_{os.environ.get("CUDA_VISIBLE_DEVICES")}')
-# llm_cache = LLMResponseCache(cache_dir='llm_cache_512_2')
-
-
 class CachedExplainer:
     """Wrapper around Delphi explainer with caching."""
 
-    def __init__(self, base_explainer, tokenizer: Optional[PreTrainedTokenizerBase] = None):
+    def __init__(self, base_explainer, cache: LLMResponseCache, tokenizer: Optional[PreTrainedTokenizerBase] = None):
         self.base_explainer = base_explainer
+        self.cache = cache
         self.tokenizer = tokenizer
         self.ran = False
 
@@ -675,7 +678,7 @@ class CachedExplainer:
 
     async def __call__(self, record):
         # Check cache first
-        cached_payload = llm_cache.get_explanation(record)
+        cached_payload = self.cache.get_explanation(record)
         if cached_payload is not None:
             if isinstance(cached_payload, dict):
                 explanation_text = cached_payload.get("explanation")
@@ -712,7 +715,7 @@ class CachedExplainer:
         self._preview_sequences(record.latent, activating, non_activating)
 
         # Cache the result with sequences
-        llm_cache.save_explanation(
+        self.cache.save_explanation(
             record,
             result.explanation,
             activating_sequences=activating,
@@ -725,12 +728,13 @@ class CachedExplainer:
 class CachedDetectionScorer:
     """Wrapper around Delphi detection scorer with caching."""
 
-    def __init__(self, base_scorer):
+    def __init__(self, base_scorer, cache: LLMResponseCache):
         self.base_scorer = base_scorer
+        self.cache = cache
 
     async def __call__(self, record):
         # Check cache first
-        cached_score = llm_cache.get_detection_score(record)
+        cached_score = self.cache.get_detection_score(record)
         if cached_score is not None:
             # Create result object with cached score
             result = type('ScoreResult', (), {
@@ -744,7 +748,7 @@ class CachedDetectionScorer:
         result = await self.base_scorer(record)
 
         # Cache the result
-        llm_cache.save_detection_score(record, result.score)
+        self.cache.save_detection_score(record, result.score)
 
         return result
 
@@ -797,7 +801,7 @@ def save_explanation(result, model_str, explainer_type):
     latent_str = str(result.record.latent)
     safe = latent_str.replace(".", "_").replace(":", "_").replace(" ", "_")
 
-    out_dir = f"explanations/{model_str}/" + explainer_type
+    out_dir = f"autointerp/{model_str}/explanations/" + explainer_type
     os.makedirs(out_dir, exist_ok=True)
 
     path = os.path.join(out_dir, f"{safe}.json")
@@ -816,7 +820,7 @@ def save_score(result, model_str, scorer):
     safe = latent_str.replace(".", "_").replace(":", "_").replace(" ", "_")
 
     # 2) Ensure output directory
-    out_dir = f"scores/{model_str}/{scorer}"
+    out_dir = f"autointerp/{model_str}/scores/{scorer}"
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"{safe}.json")
 
@@ -904,6 +908,13 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules, dataset_n
         for name, module in wrapped_modules.items()
     }
 
+    # Temporarily enable TopK experiment mode so hooks see gated latents
+    original_modes = {}
+    for module in wrapped_modules.values():
+        if hasattr(module, "is_topk_experiment"):
+            original_modes[module] = module.is_topk_experiment
+            module.is_topk_experiment = True
+
     cache = LatentCache(
         model=model,
         hookpoint_to_sparse_encode=topk_modules,
@@ -911,38 +922,67 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules, dataset_n
         transcode=False,
     )
 
-    cache.run(
-        n_tokens=N_TOKENS,
-        tokens=tokens_array,
-    )
-    out_dir = Path(
-        f"cache/delphi_cache_{cfg.evals.causal_auto_interp.r}_{cfg.evals.causal_auto_interp.k}"
-    )
-    out_dir.mkdir(parents=True, exist_ok=True)
-    cache.save_splits(n_splits=4, save_dir=out_dir)
-    widths = {
-        f"{name}.topk": wrapped_modules[name].r
-        for name in wrapped_modules
-    }
-
-    for hookpoint in widths:
-        # the directory is literally raw_dir / hookpoint
-        hp_dir = out_dir / hookpoint
-        hp_dir.mkdir(parents=True, exist_ok=True)
-
-        config = {
-            "hookpoint": hookpoint,
-            "width": widths[hookpoint]
+    try:
+        cache.run(
+            n_tokens=N_TOKENS,
+            tokens=tokens_array,
+        )
+        print("Cache collection complete. Checking cache contents...")
+        total_entries = 0
+        for hookpoint, locations in cache.cache.latent_locations.items():
+            num_entries = int(
+                locations.shape[0]) if locations is not None else 0
+            total_entries += num_entries
+            print(f"  {hookpoint}: {num_entries} non-zero activations")
+        if total_entries == 0:
+            print("WARNING: No latent activations were recorded.")
+        out_dir = Path(
+            f"cache/delphi_cache_{cfg.evals.causal_auto_interp.r}_{cfg.evals.causal_auto_interp.k}"
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cache.save_splits(n_splits=4, save_dir=out_dir)
+        widths = {
+            f"{name}.topk": wrapped_modules[name].r
+            for name in wrapped_modules
         }
-        with open(hp_dir / "config.json", "w") as f:
-            json.dump(config, f)
+
+        for hookpoint in widths:
+            # the directory is literally raw_dir / hookpoint
+            hp_dir = out_dir / hookpoint
+            hp_dir.mkdir(parents=True, exist_ok=True)
+
+            config = {
+                "hookpoint": hookpoint,
+                "width": widths[hookpoint]
+            }
+            with open(hp_dir / "config.json", "w") as f:
+                json.dump(config, f)
+    finally:
+        for module, original in original_modes.items():
+            module.is_topk_experiment = original
 
 
 def delphi_score(cfg, model, tokenizer, wrapped_modules):
+    config = cfg.evals.causal_auto_interp if hasattr(
+        cfg.evals, 'causal_auto_interp') else cfg.evals.topk_lora_autointerp
+
+    # Create model-specific identifier string based on config
+    # Format: {model_type}_{r}_{k}
+    model_type = getattr(cfg.model, 'type', 'unknown')
+    r_val = getattr(cfg.model, 'r', config.r)
+    k_val = getattr(cfg.model, 'k', config.k)
+    model_str = f"{model_type}_{r_val}_{k_val}"
+
+    # Initialize cache with proper model-specific directory
+    cache_subdir = f"llm_cache_{os.environ.get('CUDA_VISIBLE_DEVICES', 'cpu')}"
+    llm_cache = LLMResponseCache(
+        cache_dir=cache_subdir, base_dir=f"autointerp_layer18/{model_str}")
+
     # Print cache status
     print("\n" + "="*50)
     print("LLM CACHE STATUS")
     print("="*50)
+    print(f"Model identifier: {model_str}")
     explanation_files = len(
         list(llm_cache.explanation_cache_dir.glob("*.json")))
     detection_files = len(list(llm_cache.detection_cache_dir.glob("*.pkl")))
@@ -951,11 +991,9 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
     print(f"Cache directory: {llm_cache.cache_dir}")
     print("="*50 + "\n")
 
-    config = cfg.evals.causal_auto_interp if hasattr(
-        cfg.evals, 'causal_auto_interp') else cfg.evals.topk_lora_autointerp
-
     topk_modules = [
-        f"{name}.topk" for name, _ in wrapped_modules.items()
+        # filter out query projections -- these have already been analyzed
+        f"{name}.topk" for name, _ in wrapped_modules.items() if 'q_proj' not in name
     ]
     print(topk_modules)
     model.cpu()
@@ -970,17 +1008,18 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
     interp_results = load_interpretability_rankings()
     priority_latents = get_priority_latents(
         interp_results, top_k=config.r)
+    model_type = getattr(cfg.model, 'type', 'sft_model')
 
     # 1) Load the raw cache you saved
     dataset = LatentDataset(
         raw_dir=Path(
-            f"cache/delphi_causal_cache_{config.r}_{config.k}"
+            f"cache/{model_type}/layer18/{config.r}_{config.k}"
         ),
         modules=topk_modules,
         latents={
             # Focus on most interpretable latents only
-            name: torch.tensor(priority_latents, dtype=torch.long)
-            for name in topk_modules
+            name: torch.tensor(priority_latents[idx + 1], dtype=torch.long)
+            for idx, name in enumerate(topk_modules)
         },
         tokenizer=tokenizer,
         sampler_cfg=SamplerConfig(
@@ -1067,16 +1106,18 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
     if not openai_run:
 
         base_explainer = DefaultExplainer(client, cot=True)
-        explainer = CachedExplainer(base_explainer, tokenizer=tokenizer)
+        explainer = CachedExplainer(
+            base_explainer, cache=llm_cache, tokenizer=tokenizer)
         explainer_pipe = process_wrapper(
             explainer,
             postprocess=lambda x: save_explanation(
-                x, f'{os.environ.get("CUDA_VISIBLE_DEVICES")}_{config.r}_{config.k}_simple', 'enhanced_default')
+                x, model_str, 'enhanced_default')
         )
 
         base_detection_scorer = DetectionScorer(
             client, tokenizer=tokenizer, n_examples_shown=5)
-        detection_scorer = CachedDetectionScorer(base_detection_scorer)
+        detection_scorer = CachedDetectionScorer(
+            base_detection_scorer, cache=llm_cache)
 
         # Enhanced preprocessing and scoring
         def preprocess(explained):
@@ -1089,7 +1130,7 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
             detection_scorer,
             preprocess=preprocess,
             postprocess=lambda x: save_score(
-                x, f'{os.environ.get("CUDA_VISIBLE_DEVICES")}_{config.r}_{config.k}_simple',  'enhanced_detection')
+                x, model_str, 'enhanced_detection')
         )
 
         # Enhanced pipeline with multiple scoring methods
@@ -1098,6 +1139,9 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
         print(f"Analysis includes: explanations, detection scoring, and surprisal analysis")
 
         # Multi-stage pipeline
+        # Capture model_str in closure for the async function
+        _model_str = model_str
+
         async def comprehensive_scoring(explained):
             """Run both detection and surprisal scoring."""
             rec = explained.record
@@ -1108,7 +1152,7 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
             try:
                 det_result = await detection_scorer(rec)
                 save_score(
-                    det_result, f'{os.environ.get("CUDA_VISIBLE_DEVICES")}_{config.r}_{config.k}_simple',  'enhanced_detection')
+                    det_result, _model_str, 'enhanced_detection')
             except Exception as e:
                 print(f"Detection scoring failed for {rec.latent}: {e}")
 
@@ -1139,7 +1183,7 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
             simulator,
             preprocess=sim_preprocess,
             postprocess=lambda x: save_score(
-                x, f'{os.environ.get("CUDA_VISIBLE_DEVICES")}_{config.r}_{config.k}_simple', 'OpenAISimulator')
+                x, model_str, 'OpenAISimulator')
         )
 
         # 4. Build and run the pipeline
@@ -1162,13 +1206,14 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
     print("ENHANCED INTERPRETABILITY ANALYSIS COMPLETE")
     print(f"{'='*60}")
     print(f"Analyzed {len(priority_latents)} most interpretable latents")
+    print(f"Model identifier: {model_str}")
     print(f"Results saved to:")
     print(
-        f"  - Explanations: explanations/{config.r}_{config.k}/enhanced_default/")
+        f"  - Explanations: autointerp/{model_str}/explanations/enhanced_default/")
     print(
-        f"  - Detection scores: scores/{config.r}_{config.k}/enhanced_detection/")
+        f"  - Detection scores: autointerp/{model_str}/scores/enhanced_detection/")
     print(
-        f"  - Surprisal scores: scores/{config.r}_{config.k}/surprisal/")
+        f"  - LLM cache: {llm_cache.cache_dir}")
     print(f"{'='*60}\n")
 
 
@@ -1262,33 +1307,173 @@ def pack_1d_stream(tokens_1d: torch.Tensor, seq_len: int) -> torch.Tensor:
     return tokens_1d.narrow(0, 0, usable).view(-1, seq_len)
 
 
+def dpo_dataset_to_flat_tokens(
+    tokenizer,
+    add_eos_between=True,
+    eos_id=None,
+    num_proc=None,
+    encode_batch_size=1024,
+    token_budget=None,
+) -> torch.Tensor:
+    """
+    Load DPO dataset using the EXACT same prepare_hh_rlhf_datasets function from dpo.py.
+    Converts prompt+chosen and prompt+rejected pairs to flat 1-D token tensor.
+    """
+    from src.dpo import prepare_hh_rlhf_datasets
+
+    if eos_id is None:
+        eos_id = tokenizer.eos_token_id
+
+    print("Loading DPO dataset using prepare_hh_rlhf_datasets from dpo.py...")
+    # Use the exact same function as DPO training
+    try:
+        train_dataset, _ = prepare_hh_rlhf_datasets(
+            max_length=2048,  # Large enough to not filter out examples
+            tokenizer=tokenizer,
+            max_prompt_length=1024,
+            max_completion_length=1024,
+        )
+    except Exception as e:
+        print(f"ERROR: Failed to load DPO dataset: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+    print(
+        f"Loaded {len(train_dataset)} DPO examples (prompt + chosen/rejected pairs)")
+
+    if len(train_dataset) == 0:
+        raise RuntimeError(
+            "DPO dataset is empty after prepare_hh_rlhf_datasets filtering!")
+
+    # Each example has: prompt, chosen, rejected
+    # We'll tokenize both prompt+chosen and prompt+rejected
+    texts = []
+    for example in train_dataset:
+        prompt = example["prompt"]
+        chosen = example["chosen"]
+        rejected = example["rejected"]
+
+        # Concatenate prompt with chosen response
+        texts.append(prompt + chosen)
+        # Concatenate prompt with rejected response
+        texts.append(prompt + rejected)
+
+    print(
+        f"Created {len(texts)} text sequences from DPO dataset (2x examples for chosen+rejected)")
+
+    if len(texts) == 0:
+        raise RuntimeError("No text sequences created from DPO dataset!")
+
+    # Tokenize and concatenate (same pattern as ultrachat)
+    pieces = []
+    total = 0
+    for i in tqdm(range(0, len(texts), encode_batch_size), desc="Tokenizing DPO dataset"):
+        chunk = texts[i:i + encode_batch_size]
+        enc = tokenizer(
+            chunk,
+            add_special_tokens=False,
+            return_attention_mask=False,
+            padding=False,
+            truncation=False,
+            return_tensors=None,
+        )["input_ids"]
+
+        for ids in enc:
+            if add_eos_between and eos_id is not None:
+                ids = ids + [eos_id]
+            t = torch.tensor(ids, dtype=torch.long)
+            if token_budget is None:
+                pieces.append(t)
+            else:
+                if total >= token_budget:
+                    break
+                need = token_budget - total
+                if t.numel() <= need:
+                    pieces.append(t)
+                    total += t.numel()
+                else:
+                    pieces.append(t[:need])
+                    total += need
+                    break
+        if token_budget is not None and total >= token_budget:
+            break
+
+    if not pieces:
+        raise RuntimeError(
+            "DPO dataset produced no token pieces after tokenization!")
+
+    result = torch.cat(pieces, dim=0)
+    print(f"DPO dataset: Created {result.numel():,} tokens")
+
+    if result.numel() == 0:
+        raise RuntimeError("DPO dataset produced zero tokens!")
+
+    return result
+
+
 def delphi_collect_activations_causal(cfg, model, tokenizer, wrapped_modules):
-    print("starting activation collection")
-    # manual forward pass: check LoRA adapter outputs
-    # define hooks
+    print("Starting SEMI-CAUSAL activation collection")
 
     SEQ_LEN = cfg.evals.causal_auto_interp.seq_len
     N_TOKENS_TARGET = cfg.evals.causal_auto_interp.n_tokens
 
-    tokens_1d = ultrachat_to_flat_tokens(
-        tokenizer,
-        splits=("train_sft",),
-        add_eos_between=True,
-        token_budget=N_TOKENS_TARGET,
-        num_proc=os.cpu_count(),
-        render_batch_size=256,
-        encode_batch_size=1024,
-        eos_id=tokenizer.eos_token_id
-    )
+    # Determine which dataset to use based on model type
+    model_type = getattr(cfg.model, 'type', 'sft_model')
+
+    # sometimes I also add the layer number to model_type
+    # for backward compatibility just check
+    # if string contains 'dpo_model'
+    if 'dpo_model' in model_type:
+        print(
+            f"Model type is '{model_type}' - using DPO dataset (Anthropic/hh-rlhf)")
+        tokens_1d = dpo_dataset_to_flat_tokens(
+            tokenizer,
+            add_eos_between=True,
+            token_budget=N_TOKENS_TARGET,
+            num_proc=os.cpu_count(),
+            encode_batch_size=1024,
+            eos_id=tokenizer.eos_token_id
+        )
+    else:
+        print(f"Model type is '{model_type}' - using SFT dataset (UltraChat)")
+        tokens_1d = ultrachat_to_flat_tokens(
+            tokenizer,
+            splits=("train_sft",),
+            add_eos_between=True,
+            token_budget=N_TOKENS_TARGET,
+            num_proc=os.cpu_count(),
+            render_batch_size=256,
+            encode_batch_size=1024,
+            eos_id=tokenizer.eos_token_id
+        )
 
     if tokens_1d.numel() == 0:
-        raise RuntimeError("UltraChat produced no tokens after cleaning.")
+        raise RuntimeError(
+            f"Dataset ({model_type}) produced no tokens after loading!")
+
+    print(
+        f"Successfully loaded {tokens_1d.numel():,} tokens from {model_type} dataset")
 
     tokens_array = pack_1d_stream(
         tokens_1d, seq_len=SEQ_LEN)  # shape [N, SEQ_LEN]
 
+    print(
+        f"Packed into {tokens_array.shape[0]:,} sequences of length {SEQ_LEN}")
+
     topk_modules = {f"{name}.topk": module.topk for name,
                     module in wrapped_modules.items()}
+
+    print(f"Setting up LatentCache for {len(topk_modules)} TopK modules:")
+    for name in topk_modules:
+        print(f"  - {name}")
+
+    original_modes = {}
+    for module in wrapped_modules.values():
+        if hasattr(module, "is_topk_experiment"):
+            original_modes[module] = module.is_topk_experiment
+            module.is_topk_experiment = True
+
     cache = LatentCache(
         model=model,
         hookpoint_to_sparse_encode=topk_modules,
@@ -1296,22 +1481,36 @@ def delphi_collect_activations_causal(cfg, model, tokenizer, wrapped_modules):
         transcode=False,
     )
 
-    cache.run(
-        n_tokens=N_TOKENS_TARGET,
-        tokens=tokens_array,
-    )
+    print(f"Running cache collection on {tokens_array.shape[0]} sequences...")
+    try:
+        cache.run(
+            n_tokens=N_TOKENS_TARGET,
+            tokens=tokens_array,
+        )
 
-    # assert False
+        print(f"Cache collection complete. Checking cache contents...")
+        total_entries = 0
+        for hookpoint, locations in cache.cache.latent_locations.items():
+            num_entries = int(
+                locations.shape[0]) if locations is not None else 0
+            total_entries += num_entries
+            print(f"  {hookpoint}: {num_entries} non-zero activations")
+        if total_entries == 0:
+            print("WARNING: No latent activations were recorded.")
 
-    out_dir = Path(
-        f"cache/delphi_causal_cache_{cfg.evals.causal_auto_interp.r}_{cfg.evals.causal_auto_interp.k}")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    cache.save_splits(n_splits=4, save_dir=out_dir)
+        out_dir = Path(
+            f"cache/{model_type}/layer18/{cfg.evals.causal_auto_interp.r}_{cfg.evals.causal_auto_interp.k}")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cache.save_splits(n_splits=8, save_dir=out_dir)
 
-    widths = {
-        f"{name}.topk": wrapped_modules[name].r for name in wrapped_modules}
-    for hookpoint in widths:
-        hp_dir = out_dir / hookpoint
-        hp_dir.mkdir(parents=True, exist_ok=True)
-        with open(hp_dir / "config.json", "w") as f:
-            json.dump({"hookpoint": hookpoint, "width": widths[hookpoint]}, f)
+        widths = {
+            f"{name}.topk": wrapped_modules[name].r for name in wrapped_modules}
+        for hookpoint in widths:
+            hp_dir = out_dir / hookpoint
+            hp_dir.mkdir(parents=True, exist_ok=True)
+            with open(hp_dir / "config.json", "w") as f:
+                json.dump({"hookpoint": hookpoint,
+                          "width": widths[hookpoint]}, f)
+    finally:
+        for module, original in original_modes.items():
+            module.is_topk_experiment = original

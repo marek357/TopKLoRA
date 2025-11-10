@@ -1,8 +1,8 @@
 defaults:
   - _self_
-  - training: sft_enhanced_sparse
+  - training: dpo_fast
   - lr_scheduler: cosine
   - logger: wandb
   # - override hydra/launcher: submitit_slurm
 seed: 42
-experiment_name: ${training.method}_${training.model}_experiment
+experiment_name: ${training.dpo_experiment.lora.r}_${training.dpo_experiment.lora.k}_layer${training.dpo_experiment.lora.layer}

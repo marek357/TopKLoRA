@@ -599,7 +599,17 @@ def run_sft(cfg):
                 hard_eval=True, relu_latents=True, alpha_over_r=True,
                 temperature_final=getattr(
                     cfg.training.sft_experiment.lora, 'temperature_final', None),
+                is_topk_experiment=cfg.training.sft_experiment.lora.get(
+                    'top_k_experiment', False),
             )
+            try:
+                target_device = next(peft_layer.parameters()).device
+            except StopIteration:
+                if hasattr(peft_layer, "base_layer") and hasattr(peft_layer.base_layer, "weight"):
+                    target_device = peft_layer.base_layer.weight.device
+                else:
+                    target_device = next(model.parameters()).device
+            wrapped = wrapped.to(device=target_device)
             wrapped.train()
             setattr(parent, attr, wrapped)
             replaced += 1

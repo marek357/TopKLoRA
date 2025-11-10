@@ -23,4 +23,4 @@ if __name__ == '__main__':
                 'scores', 'explanations')
             with open(explanation, 'r') as f:
                 expl = json.load(f)
-            print(correct, expl['explanation'])
+            print(round(correct / 90, 2), expl['explanation'])
