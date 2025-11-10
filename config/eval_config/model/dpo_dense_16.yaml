@@ -1,0 +1,13 @@
+defaults:
+  - quantization: 4bit
+  - _self_
+name: "gemma"
+version: 2.0
+size: "2B"
+type: dpo_model_dense
+k: 16
+r: 16
+base_model: "/scratch/network/ssd/marek/lora_interp/cache/tempartefacts/google/gemma-2-2b_sft"
+model_it_name: "google/gemma-2-2b-it"
+adapter_checkpoint_dir: "/scratch/network/ssd/marek/sparselora/models/dpo/google/gemma-2-2b/google-gemma-2-2b_topk_dpo_20251104_230825_11756934/final_adapter"
+train_steps: 7500

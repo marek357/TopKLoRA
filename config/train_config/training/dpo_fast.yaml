@@ -1,0 +1,61 @@
+method: "dpo"
+
+defaults:
+  - model: gemma_2_2b
+  - experiment/lora_gemma_interp_small_lg@sft_experiment
+  # - experiment/full_1024@dpo_experiment
+  # - experiment/full_8192@dpo_experiment
+  # - experiment/full_4096@dpo_experiment
+  # - experiment/lora_gemma_interp_1024@dpo_experiment
+  # - experiment/lora_gemma_interp_8192@dpo_experiment
+  # - experiment/lora_gemma_interp_4096@dpo_experiment
+  # - experiment/lora_gemma_interp_1024_19@dpo_experiment
+  # - experiment/lora_gemma_interp_4096_19@dpo_experiment
+  # - experiment/dense_18_layer_r64@dpo_experiment
+  # - experiment/dense_18_layer_r32@dpo_experiment
+  # - experiment/dense_18_layer_r16@dpo_experiment
+  - experiment/dense_18_layer_r8@dpo_experiment
+  # - experiment/lora_gemma_interp_4096_17@dpo_experiment
+  # - experiment/lora_gemma_interp_1024_17@dpo_experiment
+  # - experiment/lora_gemma_interp_8192@dpo_experiment
+  # - experiment/lora_gemma_interp_512_small_start@dpo_experiment
+  - dataset/alpaca-train@sft_dataset
+  # - dataset/civil_comments@dpo_dataset
+  - dataset/hh-rlhf@dpo_dataset
+  - base_sft_merged_model: gemma_2_2b
+  - quantization: 4bit
+
+
+dump_trained_model: True
+dump_path: "models/dpo/${training.model.model_name}"
+
+sft:
+  enabled: False
+
+dpo:
+  enabled: True
+  max_prompt_length: 256
+  max_completion_length: 256
+  beta: 0.2
+  loss_type: 'sigmoid'
+  num_train_epochs: 1
+  # PERFORMANCE OPTIMIZATION: Increase batch size, reduce gradient accumulation
+  per_device_train_batch_size: 2     # Increased from 4 to 16 (4x speedup)
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8      # Decreased from 16 to 4 (4x speedup)
+  # Net effect: Same effective batch size (16*4=64), but 4x faster!
+  gradient_checkpointing: True
+  # max_steps: 1000
+  max_steps: 7500
+  optim: 'adamw_bnb_8bit'
+  learning_rate: 2e-5
+  warmup_ratio: 0.03
+  bf16: True
+  fp16: False
+  max_grad_norm: 1.0
+  save_strategy: 'steps'
+  save_steps: 500
+  save_total_limit: 2
+  eval_strategy: 'steps'
+  eval_steps: 250
+  do_eval: True

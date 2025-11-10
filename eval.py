@@ -6,7 +6,6 @@ import random
 import numpy as np
 from trl import setup_chat_format
 from transformers import AutoTokenizer, AutoModelForCausalLM, set_seed
-from src.sft import run_sft, run_sft, run_dpo
 from hydra.utils import instantiate
 from dotenv import load_dotenv
 from omegaconf import DictConfig, OmegaConf

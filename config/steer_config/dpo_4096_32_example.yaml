@@ -1,0 +1,51 @@
+# Example: Steering features from DPO model (4096_32)
+# Based on assess_autointerp_dpo.py results showing high-scoring features
+
+defaults:
+  - default
+  - _self_
+
+experiment_name: "dpo_4096_32_politeness"
+
+model:
+  model_name: "google/gemma-2-2b-it"
+  adapter_path: "autointerp/dpo_model_4096_32"
+
+steering:
+  features:
+    # Comma following the word "Sorry" in chatbot responses
+    # Score: 0.89 - Very strong feature!
+    "base_model.model.model.layers.11.self_attn.q_proj":
+      - feature: 1234  # Example feature number - adjust based on actual results
+        effect: "enable"
+        description: "Comma following 'Sorry' in chatbot responses (politeness)"
+    
+    # Direct "Yes" responses to questions
+    # Score: 0.82
+    "base_model.model.model.layers.11.self_attn.q_proj":
+      - feature: 567
+        effect: "enable"
+        description: "Direct 'Yes' responses to questions"
+    
+    # Words in informal or vulgar expressions
+    # Score: 0.71
+    "base_model.model.model.layers.11.self_attn.q_proj":
+      - feature: 890
+        effect: "disable"
+        description: "Words in informal or vulgar expressions"
+  
+  verbose: true
+  list_adapters: true
+
+prompts:
+  # Prompts designed to test these features
+  - "Can you help me with this?"
+  - "Is the sky blue?"
+  - "Do you understand what I'm saying?"
+  - "What's the weather like?"
+  - "Are you an AI?"
+
+output:
+  output_dir: "outputs/steering/dpo_4096_32_politeness"
+  save_outputs: true
+  compare_baseline: true

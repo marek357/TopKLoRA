@@ -1,0 +1,27 @@
+size: "small"
+lora:
+  r: 1024
+  bias: 'none'
+  alpha: 2048
+  # alpha: 256
+  dropout: 0.0
+  top_k_experiment: True
+  # k: 128
+  # k_final: 512
+  k: 128
+  # k_final: 2
+  k_final: 8
+  # k_schedule: constant
+  k_schedule: cubic
+  temperature: 0.1
+  temperature_final: 0.005
+  temperature_schedule: linear
+  layer: full
+  target_modules:
+    - o_proj
+    - v_proj
+    - k_proj
+    - q_proj
+    - gate_proj
+    - up_proj
+    - down_proj

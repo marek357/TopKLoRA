@@ -22,8 +22,10 @@ from transformers import (
     DataCollatorWithPadding,
     default_data_collator
 )
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, get_peft_model_state_dict
 from peft.tuners.lora import LoraLayer
+from src.models import TopKLoRALinearSTE, _soft_topk_mass, TopKProgressCallback, MemoryClearCallback
+from src.sft import enable_topk_lora_grads, count_params
 from trl import DPOTrainer, DPOConfig
 from torch.optim import AdamW
 import wandb
@@ -166,244 +168,6 @@ class ActivationTrackingCallback(TrainerCallback):
             tracker['samples_seen'] = 0
 
 
-def _soft_topk_mass(z, k, tau):
-    # compute in fp32 for stability, then rescale to sum=k
-    z_fp32 = z.float() / max(tau, 1e-6)
-    g = torch.softmax(z_fp32, dim=-1)
-    g = g * (float(k) / (g.sum(dim=-1, keepdim=True) + 1e-8))
-    return g.to(z.dtype)
-
-
-def _hard_topk_mask(z, k):
-    # returns 0/1 mask with exactly k ones along last dim
-    idx = z.topk(k, dim=-1).indices
-    hard = torch.zeros_like(z)
-    return hard.scatter_(-1, idx, 1.0)
-
-
-class TopKLoRALinearSTE(nn.Module):
-    """
-    LoRA with straight-through Top-K gating over the latent dim (r).
-    - Forward: hard top-k mask (exact k active channels).
-    - Backward: gradients flow through a soft surrogate.
-    - Supports k and temperature schedules driven by `progress` (0..1).
-    """
-
-    def __init__(
-        self,
-        base: LoraLayer,
-        *,
-        layer_name: str,
-        k: int,
-        temperature: float = 1.0,
-        # "constant" | "linear" | "exp" | "cubic"
-        temperature_schedule: str = "linear",
-        k_schedule: str = "constant",           # "constant" | "linear" | "exp" | "cubic"
-        # target k at progress=1
-        k_final: Optional[int] = None,
-        hard_eval: bool = True,                 # use hard mask in eval
-        relu_latents: bool = True,              # force z >= 0
-        alpha_over_r: bool = True,              # scaling mode
-        # optional target temperature at progress=1
-        temperature_final: Optional[float] = None,
-    ):
-        super().__init__()
-        self.lora_module = base
-        self.base_layer = base.base_layer
-        adapter = base.active_adapter if isinstance(
-            base.active_adapter, str) else base.active_adapter[0]
-
-        self.A_module = base.lora_A[adapter]
-        self.B_module = base.lora_B[adapter]
-        self.dropout = (base.lora_dropout[adapter]
-                        if hasattr(base, "lora_dropout") and adapter in base.lora_dropout
-                        else nn.Identity())
-
-        self.r = int(base.r[adapter])
-        self.alpha = float(base.lora_alpha[adapter])
-        self.k_init = int(k)
-        self.k_final = int(k_final) if k_final is not None else int(k)
-        self.k_schedule = k_schedule
-        self.t0 = float(temperature)
-        self.t_final = float(
-            temperature_final) if temperature_final is not None else 0.1 * self.t0
-        self.temperature_schedule = temperature_schedule
-        self.hard_eval = hard_eval
-        self.relu_latents = relu_latents
-        self.scale = (
-            self.alpha / self.r) if alpha_over_r else (self.alpha / max(self.k_init, 1))
-        self.layer_name = layer_name
-
-        # Progress variable (0..1)
-        self.register_buffer("progress", torch.tensor(0.0))
-        self.register_buffer("last_frac_grad_nonzero", torch.tensor(0.0))
-
-        # Transient caches for regs/logging
-        self._z_live: Optional[torch.Tensor] = None
-        self._g_soft_live: Optional[torch.Tensor] = None
-        self._last_z: Optional[torch.Tensor] = None
-        self._last_g_soft: Optional[torch.Tensor] = None
-        self._last_ghard_mean: torch.Tensor = torch.tensor(0.0)
-
-    # -------- Progress control --------
-    def set_progress(self, p: float):
-        """Set training progress in [0, 1]."""
-        self.progress.fill_(float(min(max(p, 0.0), 1.0)))
-
-    # -------- Scheduling --------
-    def _tau(self):
-        p = float(self.progress)
-        # If constant or already at target, keep t0
-        if self.temperature_schedule == "constant" or abs(self.t0 - self.t_final) < 1e-12:
-            return self.t0
-        if self.temperature_schedule == "linear":
-            # linear interpolation from t0 to t_final
-            return float(self.t0 + (self.t_final - self.t0) * p)
-        if self.temperature_schedule == "cubic":
-            # cubic interpolation, slower start, faster end
-            return float(self.t0 + (self.t_final - self.t0) * (p ** 3))
-        if self.temperature_schedule == "exp":
-            # geometric interpolation (monotonic)
-            ratio = max(self.t_final, 1e-12) / max(self.t0, 1e-12)
-            return float(self.t0 * (ratio ** p))
-        return self.t0
-
-    def _current_k(self):
-        # p in [0,1]; compress so k finishes warming up by 5% of training
-        p = float(self.progress)
-        warm = min(p / 0.05, 1.0)  # 0..1 grows only during first 5%
-        if self.k_schedule == "constant" or self.k_init == self.k_final:
-            return self.k_init
-        if self.k_schedule == "linear":
-            return int(round(self.k_init + (self.k_final - self.k_init) * warm))
-        if self.k_schedule == "cubic":
-            return int(round(self.k_init + (self.k_final - self.k_init) * (warm ** 3)))
-        if self.k_schedule == "exp":
-            ratio = (self.k_final / max(self.k_init, 1)) ** warm
-            return int(round(self.k_init * ratio))
-        return self.k_init
-
-    # -------- Forward --------
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        A = self.A_module.weight
-        B = self.B_module.weight
-
-        out = self.base_layer(x)        # base path
-        x_lora = self.dropout(x)        # dropout only on LoRA
-
-        z_pre = F.linear(x_lora, A)
-        if self.relu_latents:
-            z = F.leaky_relu(z_pre, negative_slope=1e-3)   # safer than ReLU
-        else:
-            z = z_pre
-
-        # keep both: live for regs, detached for callbacks
-        # self._z_live = z                         # may carry graph
-        self._last_z = z.detach()                # safe for logging
-
-        tau = self._tau()
-        k_now = self._current_k()
-
-        g_soft = _soft_topk_mass(z, k_now, tau)
-        g_hard = _hard_topk_mask(z, k_now)
-        g = g_hard + g_soft - g_soft.detach()
-
-        # keep both: live for regs, detached for callbacks
-        # self._g_soft_live = g_soft               # may carry graph
-        self._last_g_soft = g_soft.detach()
-
-        self._last_ghard_mean = g.mean().detach()
-
-        lora_out = F.linear(z * g, B) * self.scale
-        return out + lora_out
-
-    def get_gate_stats(self):
-        if self._last_z is None:
-            return {}
-        k = self._current_k()
-        r = self.r
-        frac_active = float(self._last_ghard_mean) / max(k / r, 1e-8)
-        return {
-            "k": k, "r": r,
-            "tau": self._tau(),
-            "frac_active_vs_target": frac_active,
-        }
-
-
-class TopKProgressCallback(TrainerCallback):
-    """Update training progress in TopK modules"""
-
-    def on_step_begin(self, args, state, control, model=None, **kwargs):
-        if model is not None and state.max_steps:
-            p = state.global_step / state.max_steps
-            for m in model.modules():
-                if isinstance(m, TopKLoRALinearSTE):
-                    m.set_progress(p)
-
-
-class DeadLatentsLoggerCallback(TrainerCallback):
-    def __init__(self, log_every=500, activation_threshold=1e-6):
-        """
-        Args:
-            log_every: steps between W&B logs
-            activation_threshold: below this value, a latent is considered inactive for that batch
-        """
-        self.log_every = log_every
-        self.activation_threshold = activation_threshold
-        self.stats = {}  # {layer_name: {"counts": tensor, "total": int}}
-
-    def on_train_begin(self, args, state, control, model=None, **kwargs):
-        # Initialize tracking for each TopKLoRALinearSTE layer
-        if model is None:
-            return
-        for name, module in model.named_modules():
-            if isinstance(module, TopKLoRALinearSTE):
-                self.stats[name] = {
-                    "counts": torch.zeros(module.r, dtype=torch.long),
-                    "total": 0
-                }
-
-    def on_step_end(self, args, state, control, model=None, **kwargs):
-        if model is None:
-            return
-
-        # Track activations for each TopK module
-        for name, module in model.named_modules():
-            if isinstance(module, TopKLoRALinearSTE) and hasattr(module, "_last_g_soft"):
-                g_soft = module._last_g_soft  # [B, T, r]
-                # Mean gate activation per latent
-                mean_act = g_soft.mean(dim=(0, 1))
-                active_mask = (mean_act > self.activation_threshold).cpu()
-                self.stats[name]["counts"] += active_mask.long()
-                self.stats[name]["total"] += 1
-
-        # Periodic logging
-        if state.global_step % self.log_every == 0 and args.report_to and "wandb" in args.report_to:
-            log_dict = {}
-            total_dead_all = 0
-            total_latents_all = 0
-
-            for layer_name, st in self.stats.items():
-                total_seen = st["total"]
-                if total_seen == 0:
-                    continue
-                dead_mask = st["counts"] == 0
-                num_dead = dead_mask.sum().item()
-                pct_dead = 100.0 * num_dead / len(dead_mask)
-
-                total_dead_all += num_dead
-                total_latents_all += len(dead_mask)
-
-                log_dict[f"dead_latents/{layer_name}/count"] = num_dead
-                log_dict[f"dead_latents/{layer_name}/pct"] = pct_dead
-
-            if total_latents_all > 0:
-                log_dict["dead_latents/total_count"] = total_dead_all
-                log_dict["dead_latents/total_pct"] = 100.0 * \
-                    total_dead_all / total_latents_all
-            wandb.log(log_dict, step=state.global_step)
-
-
 # expects: TopKLoRALinearSTE, _soft_topk_mass already defined/imported
 
 
@@ -438,7 +202,9 @@ class EnhancedDPOTrainer(DPOTrainer):
             "L_ORTHO_A": 1e-4,
             "L_ORTHO_B": 1e-4,
             # compute orthogonality every n steps (0 disables)
-            "ORTHO_EVERY": 1,
+            "ORTHO_EVERY": 10,  # Reduced from 1 to improve performance
+            "DECORR_EVERY": 5,   # NEW: Only compute expensive decorrelation every N steps
+            "MASS_EVERY": 1,     # Mass is cheap, keep it every step
             "sched_type": "cubic",  # "linear" | "quad" | "cubic"
             "sched_start": 0.0,    # fraction of training (0..1)
             "sched_end": 0.30,     # fraction of training (0..1)
@@ -531,6 +297,8 @@ class EnhancedDPOTrainer(DPOTrainer):
         L_ORTHO_A = float(self.reg_cfg["L_ORTHO_A"])
         L_ORTHO_B = float(self.reg_cfg["L_ORTHO_B"])
         ORTHO_EVERY = int(self.reg_cfg["ORTHO_EVERY"])
+        DECORR_EVERY = int(self.reg_cfg.get("DECORR_EVERY", 1))
+        MASS_EVERY = int(self.reg_cfg.get("MASS_EVERY", 1))
 
         try:
             for m in model.modules():
@@ -551,10 +319,12 @@ class EnhancedDPOTrainer(DPOTrainer):
                 w_sched = self._sched_scalar(p_layer)
 
                 # which terms are (potentially) active
-                need_decorr = self._active(L_DECORR,  self.reg_cfg.get(
-                    "schedule_decorr", True), w_sched)
-                need_mass = self._active(L_MASS,    self.reg_cfg.get(
-                    "schedule_mass",   True), w_sched)
+                need_decorr = (DECORR_EVERY > 0) and (step % DECORR_EVERY == 0) and \
+                    self._active(L_DECORR,  self.reg_cfg.get(
+                        "schedule_decorr", True), w_sched)
+                need_mass = (MASS_EVERY > 0) and (step % MASS_EVERY == 0) and \
+                    self._active(L_MASS,    self.reg_cfg.get(
+                        "schedule_mass",   True), w_sched)
                 need_ent = self._active(L_ENTROPY, self.reg_cfg.get(
                     "schedule_ent",    True), w_sched)
                 need_orthoA = (self.reg_mode == "z_plus_ortho") and ORTHO_EVERY > 0 and (step % ORTHO_EVERY == 0) \
@@ -646,11 +416,13 @@ class EnhancedDPOTrainer(DPOTrainer):
                     acc["reg/sched_w"] += w_sched
                     n_layers += 1
 
-                L1 = 1e-5
-                reg = reg + L1 * z_live.abs().mean()
-                usage = g_soft.mean(dim=(0, 1))                 # [r]
-                cov = ((usage - usage.mean())**2).mean()
-                reg = reg + 1e-4 * cov
+                # Optional: L1 and usage variance regularization (lightweight)
+                # Only apply if needed - comment out for max speed
+                # L1 = 1e-5
+                # reg = reg + L1 * z_live.abs().mean()
+                # usage = g_soft.mean(dim=(0, 1))                 # [r]
+                # cov = ((usage - usage.mean())**2).mean()
+                # reg = reg + 1e-4 * cov
 
         finally:
             # critical: drop live caches every step to avoid cross-step graphs
@@ -684,13 +456,67 @@ class MemoryClearCallback(TrainerCallback):
     """Memory management callback"""
 
     def on_step_end(self, args, state, control, **kwargs):
-        if state.global_step % args.gradient_accumulation_steps == 0:
-            torch.cuda.empty_cache()
-            gc.collect()
+        try:
+            if (
+                hasattr(args, "gradient_accumulation_steps")
+                and args.gradient_accumulation_steps > 0
+                and state.global_step % args.gradient_accumulation_steps == 0
+            ):
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+        except Exception:
+            pass
 
     def on_evaluate(self, args, state, control, **kwargs):
         torch.cuda.empty_cache()
         gc.collect()
+
+
+def _resolve_device_map_for_ddp() -> Optional[Dict[str, int]]:
+    """Resolve a safe device_map when running under DDP/Accelerate.
+    try:
+        if torch.cuda.is_available():
+            visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+            num_visible = None
+            if visible:
+                try:
+                    num_visible = len([v for v in visible.split(",") if v.strip() != ""])
+                except Exception:
+                    num_visible = None
+            world_local_count = torch.cuda.device_count()
+            # If only one device is visible to this process, always map to 0 (local index)
+            if world_local_count == 1 or (num_visible == 1):
+                local_idx = 0
+            else:
+                # Prefer LOCAL_RANK when multiple devices visible
+                local_rank_env = os.environ.get("LOCAL_RANK")
+                if local_rank_env is not None:
+                    local_idx = int(local_rank_env)
+                else:
+                    local_idx = int(torch.cuda.current_device())
+            logging.info(
+                f"CUDA_VISIBLE_DEVICES={visible!r}, device_count={world_local_count}, mapping root module to local idx {local_idx}"
+            )
+            return {"": local_idx}
+    except Exception as e:
+    """
+    try:
+        if torch.cuda.is_available():
+            # Prefer LOCAL_RANK when provided by torch.distributed/accelerate
+            local_rank_env = os.environ.get("LOCAL_RANK")
+            if local_rank_env is not None:
+                local_idx = int(local_rank_env)
+            else:
+                # When CUDA_VISIBLE_DEVICES is restricted per-process, current_device() is 0
+                local_idx = int(torch.cuda.current_device())
+            logging.info(
+                f"Using per-process device_map -> {{'': {local_idx}}}")
+            return {"": local_idx}
+    except Exception as e:
+        logging.warning(
+            f"Could not resolve per-process device_map, falling back to default: {e}")
+    return None
 
 
 def prepare_hh_rlhf_datasets(
@@ -987,6 +813,150 @@ def _make_run_dir(base_dir: str, model_name: str, tag: str, hparams: Dict[str, A
     return run_dir
 
 
+def prepare_civil_comments_datasets(
+    *,
+    tokenizer,
+    max_prompt_length=512,
+    max_completion_length=16,
+    train_size=None,
+    eval_size=100,
+    label_field: str = "toxicity",
+    threshold: float = 0.5,
+    approval_token: str = "APPROVE",
+    rejection_token: str = "REJECT",
+):
+    """
+    Load and prepare google/civil_comments (or civil_comments) as DPO pairs.
+    For each comment, the prompt asks for a single-token moderation decision.
+    The preferred completion is APPROVE for non-toxic and REJECT for toxic.
+
+    Columns expected:
+      - text column: one of ["text", "comment_text"] (auto-detected)
+      - label field: default "toxicity" (float in [0,1])
+    """
+    cache_dir = os.path.join(os.getcwd(), "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    eos = tokenizer.eos_token or ""
+
+    # Robust dataset load (namespace may vary on HF)
+    try:
+        base = load_dataset("google/civil_comments", cache_dir=cache_dir)
+    except Exception:
+        base = load_dataset("civil_comments", cache_dir=cache_dir)
+
+    # Pick splits
+    train_split = "train" if "train" in base else list(base.keys())[0]
+    eval_split = "validation" if "validation" in base else (
+        "test" if "test" in base else train_split)
+
+    train_ds = base[train_split]
+    eval_ds = base[eval_split]
+
+    # Detect text column
+    text_col = None
+    for cand in ["text", "comment_text", "comment"]:
+        if cand in train_ds.column_names:
+            text_col = cand
+            break
+    if text_col is None:
+        raise ValueError(
+            f"Could not find a text column in {train_ds.column_names}")
+
+    if label_field not in train_ds.column_names:
+        raise ValueError(
+            f"Label field '{label_field}' not found. Available: {train_ds.column_names}"
+        )
+
+    ASSISTANT = "Assistant:"
+    INSTRUCTIONS = (
+        "You are a content-moderation assistant. "
+        f"Read the user comment and answer with a single token: {approval_token} if it's civil/acceptable, "
+        f"or {rejection_token} if it violates toxicity guidelines.\n\n"
+    )
+
+    def make_pairs(batch):
+        prompts, chosens, rejecteds = [], [], []
+        texts = batch[text_col]
+        labels = batch[label_field]
+
+        for t, y in zip(texts, labels):
+            if t is None:
+                continue
+            try:
+                tox = float(y)
+            except Exception:
+                continue
+
+            is_toxic = tox >= threshold
+            chosen = rejection_token if is_toxic else approval_token
+            rejected = approval_token if is_toxic else rejection_token
+
+            prompt = (
+                f"{INSTRUCTIONS}"
+                f"Comment:\n{t}\n\n{ASSISTANT}"
+            )
+
+            # ensure EOS termination
+            ch = (chosen + " " + eos).strip() if eos else chosen
+            rj = (rejected + " " + eos).strip() if eos else rejected
+
+            prompts.append(prompt)
+            chosens.append(ch)
+            rejecteds.append(rj)
+
+        return {"prompt": prompts, "chosen": chosens, "rejected": rejecteds}
+
+    # Map to DPO columns
+    train_ds = train_ds.map(
+        make_pairs,
+        batched=True,
+        remove_columns=train_ds.column_names,
+        desc="Formatting Civil Comments train for DPO",
+    )
+    eval_ds = eval_ds.map(
+        make_pairs,
+        batched=True,
+        remove_columns=eval_ds.column_names,
+        desc="Formatting Civil Comments eval for DPO",
+    )
+
+    # Basic sanity filters
+    def ok(ex):
+        p = ex["prompt"]
+        return (
+            p.rstrip().endswith(ASSISTANT)
+            and len(ex["chosen"]) > 0
+            and len(ex["rejected"]) > 0
+        )
+
+    train_ds = train_ds.filter(ok)
+    eval_ds = eval_ds.filter(ok)
+
+    # Length constraints (prompt/completions)
+    max_p = max_prompt_length
+    max_c = max_completion_length
+
+    def length_ok(ex):
+        p_ids = tokenizer(ex["prompt"], add_special_tokens=False)["input_ids"]
+        c_ids = tokenizer(ex["chosen"], add_special_tokens=False)["input_ids"]
+        r_ids = tokenizer(ex["rejected"], add_special_tokens=False)[
+            "input_ids"]
+        return len(p_ids) <= max_p and len(c_ids) <= max_c and len(r_ids) <= max_c
+
+    train_ds = train_ds.filter(length_ok)
+    eval_ds = eval_ds.filter(length_ok)
+
+    # Optional downsampling
+    if train_size:
+        train_ds = train_ds.select(range(min(train_size, len(train_ds))))
+    if eval_size:
+        eval_ds = eval_ds.select(range(min(eval_size, len(eval_ds))))
+
+    logging.info(
+        f"Civil Comments -> Train size: {len(train_ds)}, Eval size: {len(eval_ds)}")
+    return train_ds, eval_ds
+
+
 def run_dpo(cfg, quant_cfg):
     dpo_args = cfg.training.dpo
     experiment_args = cfg.training.dpo_experiment
@@ -1001,15 +971,25 @@ def run_dpo(cfg, quant_cfg):
 
     # Load policy model
     logging.info("Loading policy model...")
+    _device_map = _resolve_device_map_for_ddp()
     policy_model = AutoModelForCausalLM.from_pretrained(
         cfg.training.base_sft_merged_model.checkpoint_dir,
         torch_dtype=torch.bfloat16,
-        device_map="auto",
+        device_map=_device_map,  # per-process placement; avoid auto-sharding under DDP
         trust_remote_code=True,
         quantization_config=quant_cfg,
-        attn_implementation='eager'
+        attn_implementation='sdpa'  # lower memory than eager when available
     )
     policy_model = prepare_model_for_kbit_training(policy_model)
+    # Respect config flag for gradient checkpointing to reduce activation memory
+    try:
+        if getattr(cfg.training.dpo, "gradient_checkpointing", False):
+            policy_model.gradient_checkpointing_enable()
+            if hasattr(policy_model, "enable_input_require_grads"):
+                policy_model.enable_input_require_grads()
+            policy_model.config.use_cache = False
+    except Exception as e:
+        logging.warning(f"Could not enable gradient checkpointing: {e}")
     extra = False
 
     if not getattr(tokenizer, "chat_template", None):
@@ -1073,16 +1053,35 @@ def run_dpo(cfg, quant_cfg):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Sanity logs about device placement and memory state
+    try:
+        if torch.cuda.is_available():
+            dev = torch.cuda.current_device()
+            logging.info(
+                f"Policy first param device: {next(policy_model.parameters()).device}; Ref first param device: {next(ref_model.parameters()).device}; current_device={dev}"
+            )
+            mem = torch.cuda.memory_allocated()
+            rsv = torch.cuda.memory_reserved()
+            logging.info(
+                f"CUDA mem at start: allocated={mem/1e9:.2f} GB, reserved={rsv/1e9:.2f} GB")
+    except Exception:
+        pass
+
     # Load reference model
     logging.info("Loading reference model...")
     ref_model = AutoModelForCausalLM.from_pretrained(
         cfg.training.base_sft_merged_model.checkpoint_dir,
         torch_dtype=torch.bfloat16,
-        device_map="auto",
+        device_map=_device_map,  # match policy placement per process
         trust_remote_code=True,
         quantization_config=quant_cfg,
-        attn_implementation='eager'
+        attn_implementation='sdpa'
     )
+    # Avoid cache growth on the ref model as well
+    try:
+        ref_model.config.use_cache = False
+    except Exception:
+        pass
     ref_model.generation_config.eos_token_id = policy_model.generation_config.eos_token_id
 
     ref_model.eval()
@@ -1102,6 +1101,24 @@ def run_dpo(cfg, quant_cfg):
             tokenizer=tokenizer, max_prompt_length=dpo_args.max_prompt_length,
             max_completion_length=dpo_args.max_completion_length,
         )
+    elif cfg.training.dpo_dataset.name == 'civil_comments':
+        train_dataset, eval_dataset = prepare_civil_comments_datasets(
+            tokenizer=tokenizer,
+            max_prompt_length=getattr(dpo_args, "max_prompt_length", 512),
+            max_completion_length=getattr(
+                dpo_args, "max_completion_length", 16),
+            train_size=getattr(cfg.training.dpo_dataset, "train_size", None),
+            eval_size=getattr(cfg.training.dpo_dataset, "eval_size", 100),
+            label_field=getattr(cfg.training.dpo_dataset,
+                                "label_field", "toxicity"),
+            threshold=float(
+                getattr(cfg.training.dpo_dataset, "threshold", 0.5)),
+            approval_token=getattr(
+                cfg.training.dpo_dataset, "approval_token", "APPROVE"),
+            rejection_token=getattr(
+                cfg.training.dpo_dataset, "rejection_token", "REJECT"),
+        )
+
     else:
         raise NotImplementedError(
             f"Dataset {cfg.training.dpo_dataset.name} not implemented"
@@ -1136,35 +1153,61 @@ def run_dpo(cfg, quant_cfg):
     logging.info(
         f"Initialized {initialised} LoRA layers with normal distribution")
 
-    # Inject TopK wrappers
-    logging.info("Injecting TopKLoRALinearSTE wrappers...")
-    replaced = 0
+    # Inject TopK wrappers (aligned with SFT pattern)
+    logging.info("🔥 Injecting TopKLoRALinearSTE wrappers...")
+
+    # Step 1: Find all LoRA layers
+    targets = []
     for name, module in model.named_modules():
-        if getattr(module, "lora_A", None) is None and False:
-            continue
-        parent = model.get_submodule(".".join(name.split(".")[:-1]))
+        if getattr(module, "lora_A", None) is not None:
+            targets.append(name)
+
+    logging.info(f"Found {len(targets)} LoRA layers to wrap")
+
+    # Step 2: Wrap them properly
+    replaced = 0
+    for name in targets:
+        peft_layer = model.get_submodule(name)
+        parent = model.get_submodule(
+            ".".join(name.split(".")[:-1])) if "." in name else model
         attr = name.split(".")[-1]
-        setattr(
-            parent, attr,
-            TopKLoRALinearSTE(
-                base=module,
-                layer_name=name,
-                k=experiment_args.lora.k,
-                temperature=experiment_args.lora.temperature,
-                temperature_schedule=experiment_args.lora.temperature_schedule,
-                k_schedule=experiment_args.lora.k_schedule,
-                k_final=experiment_args.lora.k_final,
-                hard_eval=True,
-                relu_latents=True,
-                alpha_over_r=True,
-                temperature_final=getattr(
-                    experiment_args.lora, 'temperature_final', None),
-            )
+
+        wrapped = TopKLoRALinearSTE(
+            base=peft_layer,
+            layer_name=name,
+            k=experiment_args.lora.k,
+            temperature=experiment_args.lora.temperature,
+            temperature_schedule=experiment_args.lora.temperature_schedule,
+            k_schedule=experiment_args.lora.k_schedule,
+            k_final=experiment_args.lora.k_final,
+            hard_eval=True,
+            relu_latents=True,
+            alpha_over_r=True,
+            temperature_final=getattr(
+                experiment_args.lora, 'temperature_final', None),
+            is_topk_experiment=experiment_args.lora.get(
+                'top_k_experiment', False),
         )
+        # Ensure wrapper buffers land on the same device as the underlying layer
+        try:
+            target_device = next(peft_layer.parameters()).device
+        except StopIteration:
+            if hasattr(peft_layer, "base_layer") and hasattr(peft_layer.base_layer, "weight"):
+                target_device = peft_layer.base_layer.weight.device
+            else:
+                target_device = next(model.parameters()).device
+        wrapped = wrapped.to(device=target_device)
+        wrapped.train()  # Set to train mode
+        setattr(parent, attr, wrapped)
         replaced += 1
 
-    logging.info(f"Injected TopK STE wrappers in {replaced} layers")
+    logging.info(f"✅ Injected TopK STE wrappers in {replaced} layers")
     model.print_trainable_parameters()
+
+    # Configure gradients for TopK training
+    enable_topk_lora_grads(model)
+    logging.info("Model after TopK injection and gradient setup:")
+    count_params(model)
 
     # Build structured hparams and output_dir
     hparams = _collect_hparams(
@@ -1273,6 +1316,7 @@ def run_dpo(cfg, quant_cfg):
         warmup_ratio=dpo_args.warmup_ratio,
         logging_steps=5,
         eval_strategy="steps",
+        save_strategy="steps",
         eval_steps=dpo_args.eval_steps,
         save_steps=dpo_args.save_steps,
         bf16=True,
@@ -1320,9 +1364,46 @@ def run_dpo(cfg, quant_cfg):
                 logging.info(
                     f"[gradnorm] mean={tot/cnt:.4f} over {cnt} params")
 
-    # Create trainer
-    # trainer = EnhancedDPOTrainer(
-    trainer = DPOTrainer(
+    # Regularization config (aligned with SFT pattern)
+    reg_cfg = {
+        "log_every": 100,      # Reduced logging frequency for speed
+        "L_DECORR": 1e-4,      # decorrelate latents
+        "L_MASS": 1e-3,        # enforce soft mass ~= k
+        "L_ENTROPY": 0.0,      # encourage sharp gates (disabled by default)
+        "L_ORTHO_A": 1e-4,     # orthogonality on A (rows ~ latents)
+        "L_ORTHO_B": 1e-4,     # orthogonality on B (columns ~ latents)
+        # Reduced from 4 to 20 for better speed (only for z_plus_ortho mode)
+        "ORTHO_EVERY": 20,
+        # CRITICAL: Decorrelation is expensive (r×r matrix), only do every 10 steps
+        "DECORR_EVERY": 10,
+        "MASS_EVERY": 2,       # Mass is cheap but still skip some steps
+        "schedule_decorr": True,
+        "schedule_mass": True,
+        "schedule_ent": True,
+        "schedule_ortho": True,
+        "sched_start": 0.0,
+        "sched_end": 0.15,
+        "sched_type": "cubic",
+    }
+
+    # Prepare callbacks
+    callbacks = [
+        MemoryClearCallback(),
+        TopKProgressCallback(),
+    ]
+
+    # Add dead latent logging if enabled in config
+    if getattr(experiment_args.lora, 'log_dead_latents', False):
+        from src.models import DeadLatentsLoggerCallback
+        dead_latents_log_every = getattr(
+            experiment_args.lora, 'dead_latents_log_every', 500)
+        callbacks.append(DeadLatentsLoggerCallback(
+            log_every=dead_latents_log_every))
+        logging.info(
+            f"📊 Added DeadLatentsLoggerCallback (log_every={dead_latents_log_every})")
+
+    # Create trainer with TopK-aware regularization
+    trainer = EnhancedDPOTrainer(
         model=model,
         ref_model=ref_model,
         args=dpo_config,
@@ -1330,83 +1411,57 @@ def run_dpo(cfg, quant_cfg):
         eval_dataset=eval_dataset,
         peft_config=None,
         processing_class=tokenizer,
-        callbacks=[
-            MemoryClearCallback(),
-            TopKProgressCallback(),
-            # DeadLatentsLoggerCallback(log_every=5),
-            # GradNormLogger(every=1),
-
-            # DeadNeuronDetectionCallback(
-            #     check_interval=args.dead_neuron_interval,
-            #     num_samples=args.dead_neuron_samples,
-            #     activation_threshold=0.001, # TODO: consider lowering to 0
-            #     use_soft_detection=False
-            # )
-            # EarlyStoppingCallback(early_stopping_patience=3)
-        ],
+        callbacks=callbacks,
+        reg_cfg=reg_cfg,
+        reg_mode="off",  # Enable TopK-aware regularization
     )
-
-    # trainer.reg_mode = "z_only"
-    # trainer.reg_cfg.update(dict(
-    #     L_MASS=5e-3, L_DECORR=1e-4, L_ENTROPY=0.0,
-    #     sched_start=0.0, sched_end=0.15,          # fast early ramp
-    #     schedule_decorr=True, schedule_mass=True, schedule_ent=True,
-    #     sched_type="cubic",
-    #     log_every=50,
-    # ))
-    # trainer.reg_cfg.update(log_every=5)
-
-    # trainer.reg_mode = "z_plus_ortho"
-    # trainer.reg_cfg.update({
-    #     "ORTHO_EVERY": 8,         # start sparse
-    #     "sched_start": 0.001,      # don’t start at step 0
-    #     "sched_end": 0.30,
-    #     "schedule_ortho": True,
-    # })
-
-    # def attach_lora_grad_hooks(model):
-    #     handles = []
-    #     for name, p in model.named_parameters():
-    #         if p.requires_grad and (name.endswith(".A") or name.endswith(".B") or
-    #                                 "lora_A" in name or "lora_B" in name):
-    #             def make_hook(n):
-    #                 def _hook(grad):
-    #                     print(f"{n} grad_norm={float(grad.norm())}")
-    #                 return _hook
-    #             handles.append(p.register_hook(make_hook(name)))
-    #     return handles
-
-    # # After building `model` and before `trainer.train()`:
-    # handles = attach_lora_grad_hooks(model)
 
     # Train
     logging.info("Starting training...")
     trainer.train()
 
-    # Unwrap TopK wrappers before saving
-    logging.info("Unwrapping TopK wrappers...")
-    unwrapped = 0
-    for name, module in model.named_modules():
-        if isinstance(module, TopKLoRALinearSTE) and False:
-            parent = model.get_submodule(".".join(name.split(".")[:-1]))
-            attr = name.split(".")[-1]
-            setattr(parent, attr, module.lora_module)
-            unwrapped += 1
-
-    logging.info(f"Reverted {unwrapped} Fixed TopK wrappers")
+    # No unwrapping needed! TopKLoRALinearSTE.state_dict() handles transparency
+    # The wrapper delegates to lora_module automatically during save_model()
+    logging.info(
+        "Saving model (TopK wrappers are transparent to PEFT save)...")
 
     # Save final model
     final_path = os.path.join(output_dir, "final_adapter")
+
+    # Primary save via trainer
     trainer.save_model(final_path)
     tokenizer.save_pretrained(final_path)
+
+    # Also explicit PEFT save for compatibility
+    trainer.model.save_pretrained(final_path)
+
+    # Explicit adapter state dict (belt and suspenders approach from SFT)
+    adapter_state_dict = get_peft_model_state_dict(
+        model,
+        state_dict=model.state_dict(),
+        adapter_name="default"
+    )
+    torch.save(adapter_state_dict, f"{final_path}/adapter_model.bin")
+
+    # Save as safetensors (preferred format)
+    from safetensors.torch import save_file, load_file
+    save_file(adapter_state_dict, f"{final_path}/adapter_model.safetensors")
+
+    logging.info(f"✅ Adapter saved to: {final_path}")
+
+    # print dataset used
+    # Verification: print saved keys
+    saved = load_file(f"{final_path}/adapter_model.safetensors")
+    print("Saved keys sample:")
+    for key in list(saved.keys())[:5]:
+        print(f"  {key}")
+
     logging.info(f"Model saved to {final_path}")
 
     # Print final summary
     print("\n" + "="*60)
     print("Training Complete!")
     print(f"Final model saved to: {final_path}")
-    #if hasattr(trainer.state, 'best_metric'):
-    #    print(f"Best eval accuracy: {trainer.state.best_metric:.4f}")
     print("\nConfiguration summary:")
     print(
         f"  - LoRA: r={experiment_args.lora.r}, k={experiment_args.lora.k} (sparsity={(1-experiment_args.lora.k/experiment_args.lora.r)*100:.1f}%)")
@@ -1414,6 +1469,10 @@ def run_dpo(cfg, quant_cfg):
         f"  - Soft masking with temperature={experiment_args.lora.temperature}")
     print(f"  - DPO beta={dpo_args.beta}, lr={dpo_args.learning_rate}")
     print("="*60)
+    logging.info(f"Train dataset size: {len(train_dataset)}")
+    logging.info(f"Eval dataset size: {len(eval_dataset)}")
+    # print the name of the dataset
+    logging.info(f"Dataset used: {cfg.training.dpo_dataset.name}")
 
     if cfg.logger.wandb_mode != "disabled":
         wandb.finish()

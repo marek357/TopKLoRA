@@ -1,7 +1,14 @@
 name: auto-interpret
-layer_idx: 13
+layer_idx: 18
 k: ${model.k}
 r: ${model.r}
-dataset_name: "ultrachat"
+collect_activations: False
+score_activations: True
+seq_len: 1024
+# n_tokens: 200000
+n_tokens: 2500000000
+# n_tokens: 2500000000
+batch_size: 1
+
 build_eval_function:
   _target_: src.evals.causal_auto_interp

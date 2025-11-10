@@ -20,12 +20,13 @@ from peft import LoraConfig, TaskType, get_peft_model
 import peft
 import time
 import os
-from src.models import TopKLoRALinear, MemoryClearCallback, CustomDPOTrainer
-from src.dpo import TopKLoRALinearSTE, TopKProgressCallback, DeadLatentsLoggerCallback
+from src.models import TopKLoRALinear, MemoryClearCallback, CustomDPOTrainer, TopKLoRALinearSTE
+from src.models import TopKProgressCallback, DeadLatentsLoggerCallback
 from src.utils import build_quant_config, get_conversational_dataset, hh_rlhf_preprocess_to_messages, is_valid_dpo_pair, merge_lora_adapter, preprocess_to_messages, violates_alternation
 from peft import PeftModelForCausalLM, PeftModel
 import numpy as np
 import logging
+from peft import get_peft_model_state_dict
 import torch.nn.functional as F
 
 
@@ -139,10 +140,10 @@ class EnhancedSFTTrainer(SFTTrainer):
 
         # Pull config once
         L_DECORR = float(self.reg_cfg.get("L_DECORR", 0.0))
-        L_MASS   = float(self.reg_cfg.get("L_MASS",   0.0))
-        L_ENTROPY= float(self.reg_cfg.get("L_ENTROPY",0.0))
-        L_ORTHO_A= float(self.reg_cfg.get("L_ORTHO_A",0.0))
-        L_ORTHO_B= float(self.reg_cfg.get("L_ORTHO_B",0.0))
+        L_MASS = float(self.reg_cfg.get("L_MASS",   0.0))
+        L_ENTROPY = float(self.reg_cfg.get("L_ENTROPY", 0.0))
+        L_ORTHO_A = float(self.reg_cfg.get("L_ORTHO_A", 0.0))
+        L_ORTHO_B = float(self.reg_cfg.get("L_ORTHO_B", 0.0))
         ORTHO_EVERY = int(self.reg_cfg.get("ORTHO_EVERY", 0))
 
         try:
@@ -162,24 +163,30 @@ class EnhancedSFTTrainer(SFTTrainer):
                     p_layer = step / max(1, max_steps)
                 w_sched = self._sched_scalar(p_layer)
 
-                need_decorr = self._active(L_DECORR, self.reg_cfg.get("schedule_decorr", True), w_sched)
-                need_mass   = self._active(L_MASS,   self.reg_cfg.get("schedule_mass", True),   w_sched)
-                need_ent    = self._active(L_ENTROPY,self.reg_cfg.get("schedule_ent", True),    w_sched)
+                need_decorr = self._active(L_DECORR, self.reg_cfg.get(
+                    "schedule_decorr", True), w_sched)
+                need_mass = self._active(L_MASS,   self.reg_cfg.get(
+                    "schedule_mass", True),   w_sched)
+                need_ent = self._active(L_ENTROPY, self.reg_cfg.get(
+                    "schedule_ent", True),    w_sched)
 
                 need_orthoA = (
                     self.reg_mode == "z_plus_ortho" and ORTHO_EVERY > 0 and (step % ORTHO_EVERY == 0) and
-                    self._active(L_ORTHO_A, self.reg_cfg.get("schedule_ortho", True), w_sched)
+                    self._active(L_ORTHO_A, self.reg_cfg.get(
+                        "schedule_ortho", True), w_sched)
                 )
                 need_orthoB = (
                     self.reg_mode == "z_plus_ortho" and ORTHO_EVERY > 0 and (step % ORTHO_EVERY == 0) and
-                    self._active(L_ORTHO_B, self.reg_cfg.get("schedule_ortho", True), w_sched)
+                    self._active(L_ORTHO_B, self.reg_cfg.get(
+                        "schedule_ortho", True), w_sched)
                 )
 
                 all_sched = (
                     self.reg_cfg.get("schedule_decorr", True) and
                     self.reg_cfg.get("schedule_mass", True) and
                     self.reg_cfg.get("schedule_ent", True) and
-                    (self.reg_mode != "z_plus_ortho" or self.reg_cfg.get("schedule_ortho", True))
+                    (self.reg_mode != "z_plus_ortho" or self.reg_cfg.get(
+                        "schedule_ortho", True))
                 )
                 if all_sched and not (need_decorr or need_mass or need_ent or need_orthoA or need_orthoB):
                     if do_log:
@@ -189,7 +196,7 @@ class EnhancedSFTTrainer(SFTTrainer):
 
                 # Prepare gates (reuse live soft gate when available)
                 k_now = getattr(m, "_current_k")()
-                tau   = getattr(m, "_tau")()
+                tau = getattr(m, "_tau")()
                 g_soft_live = getattr(m, "_g_soft_live", None)
 
                 if g_soft_live is None:
@@ -291,6 +298,7 @@ class EnhancedSFTTrainer(SFTTrainer):
 
         return (total_loss, base_outputs) if return_outputs else total_loss
 
+
 def enable_topk_lora_grads(model):
     # mark only A/B weights trainable; freeze everything else
     ab_ids = set()
@@ -330,10 +338,9 @@ def compute_metrics(eval_pred):
 
 def count_params(m):
     trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
-    total     = sum(p.numel() for p in m.parameters())
+    total = sum(p.numel() for p in m.parameters())
     print(f"[raw] trainable params: {trainable} / {total}")
     return trainable
-
 
 
 def run_sft(cfg):
@@ -345,7 +352,6 @@ def run_sft(cfg):
         cfg.training.quantization
     )
     logging.info("Using quantisation: %s", quant_cfg)
-
 
     if 'gemma' in cfg.training.model.name:
         tokenizer.padding_side = 'right'
@@ -381,7 +387,6 @@ def run_sft(cfg):
         target_modules=list(cfg.training.sft_experiment.lora.target_modules),
     )
 
-
     model = prepare_model_for_kbit_training(model)
     print("Model prepared for kbit training")
     count_params(model)
@@ -389,8 +394,6 @@ def run_sft(cfg):
     model = get_peft_model(model, peft_config)  # inject LoraLinear now
     print("PEFT model created")
     count_params(model)
-
-
 
     # Ensure chat template exists; attempt to copy from -it model.
     if not getattr(tokenizer, "chat_template", None):
@@ -465,9 +468,10 @@ def run_sft(cfg):
         # Use enhanced dataset system from src/datasets.py
         import sys
         import os
-        sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        sys.path.append(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__))))
         from src.utils import build_sft_datasets
-        
+
         train_dataset, eval_dataset = build_sft_datasets(
             datasets_to_use=cfg.training.sft_dataset.datasets_to_use,
             tokenizer=tokenizer,
@@ -478,9 +482,9 @@ def run_sft(cfg):
             use_cache=cfg.training.sft_dataset.use_cache,
             streaming=cfg.training.sft_dataset.streaming,
         )
-        logging.info("Using enhanced datasets with %d datasets: %s", 
-                    len(cfg.training.sft_dataset.datasets_to_use),
-                    cfg.training.sft_dataset.datasets_to_use)
+        logging.info("Using enhanced datasets with %d datasets: %s",
+                     len(cfg.training.sft_dataset.datasets_to_use),
+                     cfg.training.sft_dataset.datasets_to_use)
     else:
         # Use legacy streaming approach
         def preprocessed_stream():
@@ -504,11 +508,11 @@ def run_sft(cfg):
                     yield ex
         from datasets import IterableDataset
         train_dataset = IterableDataset.from_generator(train_gen)
-        eval_dataset  = IterableDataset.from_generator(eval_gen)
+        eval_dataset = IterableDataset.from_generator(eval_gen)
         logging.info("Using legacy streaming datasets")
 
-
     model_str = f'{cfg.training.model.name}_{cfg.training.model.version}_{cfg.training.model.size}'
+    base_output_dir = f'experiments/{model_str}_sparse_sft'
     training_args = SFTConfig(
         packing=cfg.training.sft.packing,
         # changes the tokenizers eos token to eot and the google gemma-2b-it doesn't have that will default to the list [...] in the tokenizer bos and end of turn
@@ -534,10 +538,10 @@ def run_sft(cfg):
         save_strategy=cfg.training.sft.save_strategy,
         save_steps=cfg.training.sft.save_steps,
         save_total_limit=cfg.training.sft.save_total_limit,
-        output_dir=f'experiments/{model_str}_sft',
+        output_dir=base_output_dir,
         eval_strategy=cfg.training.sft.eval_strategy,
         eval_steps=cfg.training.sft.eval_steps,
-        logging_dir=f'experiments/{model_str}_sft/logs',
+        logging_dir=f'{base_output_dir}/logs',
         max_steps=cfg.training.sft.max_steps,
         report_to=cfg.logger.report_to,
         per_device_eval_batch_size=cfg.training.sft.batch_size_eval,
@@ -560,7 +564,7 @@ def run_sft(cfg):
         "schedule_ent": True,
         "schedule_ortho": True
     }
-    
+
     # Use enhanced trainer if TopK is enabled, otherwise regular trainer
     use_topk = getattr(cfg.training.sft_experiment.lora, 'use_topk', False)
     reg_mode = "z_only" if use_topk else "off"
@@ -577,19 +581,37 @@ def run_sft(cfg):
         replaced = 0
         for name in targets:
             peft_layer = model.get_submodule(name)
-            parent = model.get_submodule(".".join(name.split(".")[:-1])) if "." in name else model
+            parent = model.get_submodule(
+                ".".join(name.split(".")[:-1])) if "." in name else model
             attr = name.split(".")[-1]
-            setattr(parent, attr, TopKLoRALinearSTE(
+            wrapped = TopKLoRALinearSTE(
                 base=peft_layer,
                 layer_name=name,
                 k=cfg.training.sft_experiment.lora.k,
-                temperature=getattr(cfg.training.sft_experiment.lora, 'temperature', 1.0),
-                temperature_schedule=getattr(cfg.training.sft_experiment.lora, 'temperature_schedule', 'constant'),
-                k_schedule=getattr(cfg.training.sft_experiment.lora, 'k_schedule', 'constant'),
-                k_final=getattr(cfg.training.sft_experiment.lora, 'k_final', cfg.training.sft_experiment.lora.k),
+                temperature=getattr(
+                    cfg.training.sft_experiment.lora, 'temperature', 1.0),
+                temperature_schedule=getattr(
+                    cfg.training.sft_experiment.lora, 'temperature_schedule', 'constant'),
+                k_schedule=getattr(
+                    cfg.training.sft_experiment.lora, 'k_schedule', 'constant'),
+                k_final=getattr(cfg.training.sft_experiment.lora,
+                                'k_final', cfg.training.sft_experiment.lora.k),
                 hard_eval=True, relu_latents=True, alpha_over_r=True,
-                temperature_final=getattr(cfg.training.sft_experiment.lora, 'temperature_final', None),
-            ))
+                temperature_final=getattr(
+                    cfg.training.sft_experiment.lora, 'temperature_final', None),
+                is_topk_experiment=cfg.training.sft_experiment.lora.get(
+                    'top_k_experiment', False),
+            )
+            try:
+                target_device = next(peft_layer.parameters()).device
+            except StopIteration:
+                if hasattr(peft_layer, "base_layer") and hasattr(peft_layer.base_layer, "weight"):
+                    target_device = peft_layer.base_layer.weight.device
+                else:
+                    target_device = next(model.parameters()).device
+            wrapped = wrapped.to(device=target_device)
+            wrapped.train()
+            setattr(parent, attr, wrapped)
             replaced += 1
         logging.info(f"✅ Injected TopK STE wrappers in {replaced} layers")
         enable_topk_lora_grads(model)
@@ -600,11 +622,11 @@ def run_sft(cfg):
         logging.info("⚪ TopK disabled - using standard LoRA training")
 
     from torch.optim import AdamW
-    
-    lora_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = AdamW(lora_params, lr=cfg.training.sft.lr, weight_decay=cfg.training.sft.weight_decay)
 
-    
+    lora_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = AdamW(lora_params, lr=cfg.training.sft.lr,
+                      weight_decay=cfg.training.sft.weight_decay)
+
     trainer = EnhancedSFTTrainer(
         model=model,
         args=training_args,
@@ -629,29 +651,31 @@ def run_sft(cfg):
     count_trainables(trainer.model, "right before train()")
 
     # (Optional) sanity: ensure the optimizer really has params
-    num_opt_params = sum(p.numel() for g in trainer.optimizer.param_groups for p in g["params"])
+    num_opt_params = sum(p.numel()
+                         for g in trainer.optimizer.param_groups for p in g["params"])
     assert num_opt_params > 0, "Optimizer has no params; LoRA A/B were not captured."
-
-
 
     if cfg.training.sft_experiment.lora.use_topk:
         topk_callbacks = [
             MemoryClearCallback(),
             TopKProgressCallback(),
         ]
-        
+
         # Add dead latent logging if enabled
         if getattr(cfg.training.sft_experiment.lora, 'log_dead_latents', False):
-            dead_latents_log_every = getattr(cfg.training.sft_experiment.lora, 'dead_latents_log_every', 500)
-            topk_callbacks.append(DeadLatentsLoggerCallback(log_every=dead_latents_log_every))
-            logging.info(f"📊 Added DeadLatentsLoggerCallback (log_every={dead_latents_log_every})")
-        
+            dead_latents_log_every = getattr(
+                cfg.training.sft_experiment.lora, 'dead_latents_log_every', 500)
+            topk_callbacks.append(DeadLatentsLoggerCallback(
+                log_every=dead_latents_log_every))
+            logging.info(
+                f"📊 Added DeadLatentsLoggerCallback (log_every={dead_latents_log_every})")
+
         # Update trainer callbacks
         # trainer.callback_handler.callbacks = topk_callbacks
         for callback in topk_callbacks:
             trainer.add_callback(callback)
             callback.trainer = trainer
-        
+
         logging.info("🔧 Updated trainer callbacks for TopK monitoring")
 
     # 1) Grab all names of parameters that belong to LoRA
@@ -675,17 +699,15 @@ def run_sft(cfg):
             logging.info(f"[MISSING] {tm:15} → NO LoRA weights found!")
 
     logging.info(f"EOS: {str(trainer.processing_class.eos_token_id)}")
-    
-    
+
     # ----------------------- Enhanced Logging & Output Structure -----------------------
     import subprocess
     import sys
     import json
-    
+
     # Create structured output directory similar to DPO
     model_str = f'{cfg.training.model.name}_{cfg.training.model.version}_{cfg.training.model.size}'
-    base_output_dir = f'experiments/{model_str}_sft'
-    
+
     # Collect hyperparameters
     hparams = {
         "model": cfg.training.model.model_name,
@@ -708,7 +730,7 @@ def run_sft(cfg):
             "use_topk": getattr(cfg.training.sft_experiment.lora, 'use_topk', False),
         }
     }
-    
+
     # Add TopK parameters if enabled
     if getattr(cfg.training.sft_experiment.lora, 'use_topk', False):
         hparams["topk_config"] = {
@@ -719,7 +741,7 @@ def run_sft(cfg):
             "temperature_schedule": getattr(cfg.training.sft_experiment.lora, 'temperature_schedule', 'constant'),
             "k_schedule": getattr(cfg.training.sft_experiment.lora, 'k_schedule', 'constant'),
         }
-    
+
     # Add dataset info if available
     if hasattr(train_dataset, '__len__'):
         hparams["dataset"] = {
@@ -732,12 +754,12 @@ def run_sft(cfg):
                 "datasets_to_use": getattr(cfg.training.sft_dataset, 'datasets_to_use', []),
                 "max_length": getattr(cfg.training.sft_dataset, 'max_length', cfg.training.sft.max_seq_length),
             })
-    
+
     # Save hyperparameters
     os.makedirs(base_output_dir, exist_ok=True)
     with open(os.path.join(base_output_dir, "hparams.json"), "w") as f:
         json.dump(hparams, f, indent=2, default=str)
-    
+
     # Save full config as YAML for reproducibility
     try:
         from omegaconf import OmegaConf
@@ -745,21 +767,21 @@ def run_sft(cfg):
             f.write(OmegaConf.to_yaml(cfg))
     except Exception as e:
         logging.warning(f"Could not serialize cfg to YAML: {e}")
-    
+
     # Capture environment snapshots
     try:
         env_dir = os.path.join(base_output_dir, "env")
         os.makedirs(env_dir, exist_ok=True)
-        
+
         # pip freeze
         try:
             frz = subprocess.run([sys.executable, "-m", "pip", "freeze"],
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             with open(os.path.join(env_dir, "requirements_freeze.txt"), "wb") as f:
                 f.write(frz.stdout)
         except Exception:
             pass
-            
+
         # nvidia-smi
         try:
             smi = subprocess.run(
@@ -770,23 +792,26 @@ def run_sft(cfg):
             pass
     except Exception as e:
         logging.warning(f"Failed to capture environment info: {e}")
-    
+
     # Human-readable summary
     try:
         summary = []
         summary.append(f"model: {cfg.training.model.model_name}")
-        summary.append(f"training: SFT with {cfg.training.sft_experiment.lora.r}r LoRA")
+        summary.append(
+            f"training: SFT with {cfg.training.sft_experiment.lora.r}r LoRA")
         if hasattr(train_dataset, '__len__'):
             summary.append(f"dataset: {len(train_dataset)} train samples")
         if getattr(cfg.training.sft_experiment.lora, 'use_topk', False):
-            summary.append(f"topk: k={cfg.training.sft_experiment.lora.k}, temp={getattr(cfg.training.sft_experiment.lora, 'temperature', 1.0)}")
-        summary.append(f"sft: lr={cfg.training.sft.lr}, steps={cfg.training.sft.max_steps}, bs={cfg.training.sft.batch_size_train}x{cfg.training.sft.gradient_accumulation_steps}")
-        
+            summary.append(
+                f"topk: k={cfg.training.sft_experiment.lora.k}, temp={getattr(cfg.training.sft_experiment.lora, 'temperature', 1.0)}")
+        summary.append(
+            f"sft: lr={cfg.training.sft.lr}, steps={cfg.training.sft.max_steps}, bs={cfg.training.sft.batch_size_train}x{cfg.training.sft.gradient_accumulation_steps}")
+
         with open(os.path.join(base_output_dir, "README.txt"), "w") as f:
             f.write("\\n".join(summary) + "\\n")
     except Exception as e:
         logging.warning(f"Failed to write summary README.txt: {e}")
-    
+
     # Update WandB config if enabled
     if getattr(cfg.logger, "report_to", None) and "wandb" in cfg.logger.report_to:
         try:
@@ -797,17 +822,16 @@ def run_sft(cfg):
                     wandb.run.name = os.path.basename(base_output_dir)
         except Exception as e:
             logging.warning(f"Could not update wandb config: {e}")
-    
-    logging.info(f"📊 Enhanced logging setup complete. Output dir: {base_output_dir}")
-   
 
-    opt_ids = {id(p) for g in trainer.optimizer.param_groups for p in g["params"]}
+    logging.info(
+        f"📊 Enhanced logging setup complete. Output dir: {base_output_dir}")
+
+    opt_ids = {id(p)
+               for g in trainer.optimizer.param_groups for p in g["params"]}
     for n, m in model.named_modules():
         if isinstance(m, TopKLoRALinearSTE):
             print(n, "A in optimizer:", id(m.A_module.weight) in opt_ids,
-                    "B in optimizer:", id(m.B_module.weight) in opt_ids)
-
-
+                  "B in optimizer:", id(m.B_module.weight) in opt_ids)
 
     from transformers import TrainerCallback
 
@@ -826,7 +850,8 @@ def run_sft(cfg):
 
         def on_step_begin(self, args, state, control, model=None, **kw):
             if (state.global_step % self.every) == 0 and model is not None:
-                self.prev = {name: p.detach().clone().cpu() for name, p in self._targets(model)}
+                self.prev = {name: p.detach().clone().cpu()
+                             for name, p in self._targets(model)}
 
         def on_step_end(self, args, state, control, model=None, **kw):
             if (state.global_step % self.every) != 0 or model is None:
@@ -838,15 +863,14 @@ def run_sft(cfg):
                     logs[f"grad_norm/{name}"] = float(g.norm().detach().cpu())
                 if name in self.prev:
                     with torch.no_grad():
-                        logs[f"update_norm/{name}"] = float((p.detach().cpu() - self.prev[name]).norm())
+                        logs[f"update_norm/{name}"] = float(
+                            (p.detach().cpu() - self.prev[name]).norm())
             wandb.log(logs, step=state.global_step)
             print(logs)
 
     # add it
     trainer.add_callback(ABProbe(every=10))
     print('REG MODE:', trainer.reg_mode)
-
-
 
     # ------------------------------- Training ------------------------------
     start_ts = time.time()
@@ -859,7 +883,7 @@ def run_sft(cfg):
     final_path = os.path.join(base_output_dir, "final_adapter")
     trainer.save_model(final_path)
     tokenizer.save_pretrained(final_path)
-    
+
     # Also save to legacy path for compatibility
     legacy_path = (
         f'adapters/sft/{cfg.training.sft_experiment.lora.r}-{cfg.training.sft_experiment.lora.alpha}-'
@@ -867,27 +891,28 @@ def run_sft(cfg):
         f'{getattr(cfg.training.sft_dataset, "name", "enhanced_dataset")}/'
         f'{"-".join(cfg.training.sft_experiment.lora.target_modules)}'
     )
-    trainer.model.save_pretrained(legacy_path)
-    tokenizer.save_pretrained(legacy_path)
-    
+    trainer.model.save_pretrained(final_path)
+    tokenizer.save_pretrained(final_path)
+
+    adapter_state_dict = get_peft_model_state_dict(
+        model,
+        state_dict=model.state_dict(),
+        adapter_name="default"
+    )
+    torch.save(adapter_state_dict, f"{final_path}/adapter_model.bin")
+    # or use safetensors
+    from safetensors.torch import save_file
+    save_file(adapter_state_dict, f"{final_path}/adapter_model.safetensors")
+
     logging.info("✅ Adapter saved to: %s", final_path)
     logging.info("📂 Legacy path: %s", legacy_path)
-    
-    # Unwrap TopK wrappers before finishing (like in DPO)
-    if getattr(cfg.training.sft_experiment.lora, 'use_topk', False):
-        logging.info("🔧 Unwrapping TopK wrappers...")
-        unwrapped = 0
-        for name, module in ft_model.named_modules():
-            if isinstance(module, TopKLoRALinearSTE):
-                parent = ft_model.get_submodule(".".join(name.split(".")[:-1]))
-                attr = name.split(".")[-1]
-                setattr(parent, attr, module.lora_module)
-                unwrapped += 1
-        logging.info(f"✅ Reverted {unwrapped} TopK wrappers")
-    
+
+    from safetensors.torch import load_file
+    saved = load_file(f"{final_path}/adapter_model.safetensors")
+    print("Saved keys sample:")
+    for key in list(saved.keys())[:5]:
+        print(f"  {key}")
+
     wandb.finish()
 
     return trainer.model
-
-
-

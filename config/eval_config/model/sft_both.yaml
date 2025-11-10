@@ -7,7 +7,7 @@ size: "2B"
 type: sft_model
 k: 4
 r: 512
-base_model: "/scratch/network/ssd/marek/lora_interp/cache/tempartefacts/google/gemma-2-2b_sft"
+base_model: "google/gemma-2-2b"
 model_it_name: "google/gemma-2-2b-it"
-adapter_checkpoint_dir: "/scratch/network/ssd/marek/sparselora/experiments/gemma_2.0_2B_sft/both_adapter"
+adapter_checkpoint_dir: "/scratch/network/ssd/marek/sparselora/experiments/gemma_2.0_2B_sft_exp/final_adapter"
 train_steps: 5000
