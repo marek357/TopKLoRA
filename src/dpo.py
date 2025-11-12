@@ -542,24 +542,97 @@ def prepare_hh_rlhf_datasets(
         reply = text[i + len(ASSISTANT):].strip()
         return prompt, reply
 
+    # def format_hh(samples):
+    #     prompts, chosens, rejecteds = [], [], []
+    #     for c, r in zip(samples["chosen"], samples["rejected"]):
+    #         p_c, ch = split_reply(c)
+    #         p_r, rj = split_reply(r)
+    #         # normalize whitespace before comparing
+    #         if p_c.strip() != p_r.strip() or not ch or not rj:
+    #             continue
+    #         # ensure EOS termination
+    #         if eos and not ch.endswith(eos):
+    #             ch = ch + " " + eos
+    #         if eos and not rj.endswith(eos):
+    #             rj = rj + " " + eos
+    #         p_c = re.sub(r"^\s*\n*", "", p_c)
+    #         prompts.append(p_c)
+    #         chosens.append(ch)
+    #         rejecteds.append(rj)
+    #     return {"prompt": prompts, "chosen": chosens, "rejected": rejecteds}
+
     def format_hh(samples):
-        prompts, chosens, rejecteds = [], [], []
+        """Return message lists for DPOTrainer to process.
+
+        DPOTrainer expects 'chosen' and 'rejected' fields containing message lists,
+        and it will apply the chat template itself.
+        """
+        chosens, rejecteds = [], []
+
         for c, r in zip(samples["chosen"], samples["rejected"]):
-            p_c, ch = split_reply(c)
-            p_r, rj = split_reply(r)
-            # normalize whitespace before comparing
-            if p_c.strip() != p_r.strip() or not ch or not rj:
+            # Parse the conversation from Anthropic format
+            c_messages = parse_anthropic_to_messages(c)
+            r_messages = parse_anthropic_to_messages(r)
+
+            if not c_messages or not r_messages:
                 continue
-            # ensure EOS termination
-            if eos and not ch.endswith(eos):
-                ch = ch + " " + eos
-            if eos and not rj.endswith(eos):
-                rj = rj + " " + eos
-            p_c = re.sub(r"^\s*\n*", "", p_c)
-            prompts.append(p_c)
-            chosens.append(ch)
-            rejecteds.append(rj)
-        return {"prompt": prompts, "chosen": chosens, "rejected": rejecteds}
+
+            # Both should end with assistant responses
+            if c_messages[-1]["role"] != "assistant" or r_messages[-1]["role"] != "assistant":
+                continue
+
+            # Verify same conversation context (all messages except last assistant)
+            if len(c_messages) != len(r_messages):
+                continue
+
+            c_prompt_msgs = c_messages[:-1]
+            r_prompt_msgs = r_messages[:-1]
+
+            # Verify prompts match
+            if c_prompt_msgs != r_prompt_msgs:
+                continue
+
+            # Return full message lists - DPOTrainer will apply the chat template
+            chosens.append(c_messages)
+            rejecteds.append(r_messages)
+
+        return {"chosen": chosens, "rejected": rejecteds}
+
+    def parse_anthropic_to_messages(text):
+        """Parse Anthropic's Human:/Assistant: format to messages list."""
+        messages = []
+        lines = text.split('\n')
+        current_role = None
+        current_content = []
+
+        for line in lines:
+            if line.startswith("Human: "):
+                if current_role:
+                    messages.append({
+                        "role": "assistant" if current_role == "Assistant" else "user",
+                        "content": '\n'.join(current_content).strip()
+                    })
+                current_role = "Human"
+                current_content = [line[7:]]  # Remove "Human: "
+            elif line.startswith("Assistant: "):
+                if current_role:
+                    messages.append({
+                        "role": "assistant" if current_role == "Assistant" else "user",
+                        "content": '\n'.join(current_content).strip()
+                    })
+                current_role = "Assistant"
+                current_content = [line[11:]]  # Remove "Assistant: "
+            else:
+                current_content.append(line)
+
+        # Add the last message
+        if current_role:
+            messages.append({
+                "role": "assistant" if current_role == "Assistant" else "user",
+                "content": '\n'.join(current_content).strip()
+            })
+
+        return messages
 
     logging.info("Loading harmless PM split")
     base_dataset = load_dataset(
@@ -587,13 +660,37 @@ def prepare_hh_rlhf_datasets(
     )
 
     def ok(ex):
-        p = ex["prompt"]
-        return (
-            p.rstrip().endswith("Assistant:") and
-            ("Assistant:" not in ex["chosen"]) and
-            ("Assistant:" not in ex["rejected"]) and
-            len(ex["chosen"]) > 0 and len(ex["rejected"]) > 0
-        )
+        """Validate message list format.
+
+        Since we're now passing message lists to DPOTrainer,
+        we just need to ensure they're valid message lists.
+        """
+        chosen = ex["chosen"]
+        rejected = ex["rejected"]
+
+        # Must be lists
+        if not isinstance(chosen, list) or not isinstance(rejected, list):
+            return False
+
+        # Must have at least one message
+        if len(chosen) == 0 or len(rejected) == 0:
+            return False
+
+        # Must end with assistant message
+        if chosen[-1].get("role") != "assistant" or rejected[-1].get("role") != "assistant":
+            return False
+
+        # Responses must not be empty
+        if not chosen[-1].get("content", "").strip() or not rejected[-1].get("content", "").strip():
+            return False
+
+        return True
+
+    logging.info('Before filtering dataset size...')
+    logging.info(f"Train size before filtering: {len(train_dataset)}")
+    logging.info(f"Eval size before filtering: {len(eval_dataset)}")
+    logging.info(f"Dataset example: {train_dataset[0]}")
+
     train_dataset = train_dataset.filter(ok)
     eval_dataset = eval_dataset.filter(ok)
 
@@ -601,23 +698,65 @@ def prepare_hh_rlhf_datasets(
     max_c = max_completion_length
 
     def length_ok(ex):
-        p_ids = tokenizer(ex["prompt"], add_special_tokens=False)["input_ids"]
-        c_ids = tokenizer(ex["chosen"], add_special_tokens=False)["input_ids"]
-        r_ids = tokenizer(ex["rejected"], add_special_tokens=False)[
-            "input_ids"]
-        return len(p_ids) <= max_p and len(c_ids) <= max_c and len(r_ids) <= max_c
+        """Check length after applying chat template.
+
+        Since DPOTrainer will apply the template, we need to simulate that
+        to check the final tokenized length.
+        """
+        try:
+            chosen = ex["chosen"]
+            rejected = ex["rejected"]
+
+            # Apply chat template to get the full formatted text
+            chosen_text = tokenizer.apply_chat_template(
+                chosen,
+                tokenize=False,
+                add_generation_prompt=False
+            )
+            rejected_text = tokenizer.apply_chat_template(
+                rejected,
+                tokenize=False,
+                add_generation_prompt=False
+            )
+
+            # Get prompt (all messages except last)
+            prompt_messages = chosen[:-1]
+            prompt_text = tokenizer.apply_chat_template(
+                prompt_messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+
+            # Tokenize to check lengths
+            p_ids = tokenizer(prompt_text, add_special_tokens=True)[
+                "input_ids"]
+
+            # Response is the difference between full text and prompt
+            # For simplicity, just tokenize the last message content
+            c_response = chosen[-1]["content"]
+            r_response = rejected[-1]["content"]
+
+            c_ids = tokenizer(c_response, add_special_tokens=False)[
+                "input_ids"]
+            r_ids = tokenizer(r_response, add_special_tokens=False)[
+                "input_ids"]
+
+            return len(p_ids) <= max_p and len(c_ids) <= max_c and len(r_ids) <= max_c
+        except Exception:
+            # If template application fails, filter out
+            return False
 
     train_dataset = train_dataset.filter(length_ok)
     eval_dataset = eval_dataset.filter(length_ok)
 
     # (Optional) filter out very short replies
     train_dataset = train_dataset.filter(
-        lambda ex: len(ex["chosen"]) > 10 and len(
-            ex["rejected"]) > 10
+        lambda ex: len(ex["chosen"][-1]["content"]
+                       ) > 10 and len(ex["rejected"][-1]["content"]) > 10
     )
     eval_dataset = eval_dataset.filter(
-        lambda ex: len(ex["chosen"]) > 0 and len(
-            ex["rejected"]) > 0
+        lambda ex: len(ex["chosen"][-1]["content"]
+                       ) > 0 and len(ex["rejected"][-1]["content"]) > 0
     )
 
     # Decrease dataset sizes
@@ -1402,6 +1541,23 @@ def run_dpo(cfg, quant_cfg):
         logging.info(
             f"📊 Added DeadLatentsLoggerCallback (log_every={dead_latents_log_every})")
 
+    # Verify dataset format before passing to DPOTrainer
+    logging.info("\n=== Dataset format going into DPOTrainer ===")
+    logging.info(f"Columns: {train_dataset.column_names}")
+    logging.info(
+        f"First example type - chosen: {type(train_dataset[0]['chosen'])}")
+    logging.info(
+        f"First example type - rejected: {type(train_dataset[0]['rejected'])}")
+    if isinstance(train_dataset[0]['chosen'], list):
+        logging.info("Format: Message lists ✅")
+        logging.info(
+            f"Sample chosen messages: {train_dataset[0]['chosen'][:2]}")
+        logging.info(
+            f"Sample rejected messages: {train_dataset[0]['rejected'][:2]}")
+    else:
+        logging.info("Format: Text strings ⚠️")
+        logging.info(f"Sample chosen: {train_dataset[0]['chosen'][:200]}")
+
     # Create trainer with TopK-aware regularization
     trainer = EnhancedDPOTrainer(
         model=model,
@@ -1415,6 +1571,8 @@ def run_dpo(cfg, quant_cfg):
         reg_cfg=reg_cfg,
         reg_mode="off",  # Enable TopK-aware regularization
     )
+
+    print(trainer.train_dataset[0])
 
     # Train
     logging.info("Starting training...")

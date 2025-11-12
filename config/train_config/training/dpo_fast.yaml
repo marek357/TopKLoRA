@@ -8,13 +8,13 @@ defaults:
   # - experiment/full_4096@dpo_experiment
   # - experiment/lora_gemma_interp_1024@dpo_experiment
   # - experiment/lora_gemma_interp_8192@dpo_experiment
-  # - experiment/lora_gemma_interp_4096@dpo_experiment
+  - experiment/lora_gemma_interp_4096@dpo_experiment
   # - experiment/lora_gemma_interp_1024_19@dpo_experiment
   # - experiment/lora_gemma_interp_4096_19@dpo_experiment
   # - experiment/dense_18_layer_r64@dpo_experiment
   # - experiment/dense_18_layer_r32@dpo_experiment
   # - experiment/dense_18_layer_r16@dpo_experiment
-  - experiment/dense_18_layer_r8@dpo_experiment
+  # - experiment/dense_18_layer_r8@dpo_experiment
   # - experiment/lora_gemma_interp_4096_17@dpo_experiment
   # - experiment/lora_gemma_interp_1024_17@dpo_experiment
   # - experiment/lora_gemma_interp_8192@dpo_experiment
