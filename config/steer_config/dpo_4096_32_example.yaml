@@ -8,8 +8,10 @@ defaults:
 experiment_name: "dpo_4096_32_politeness"
 
 model:
-  model_name: "google/gemma-2-2b-it"
-  adapter_path: "autointerp/dpo_model_4096_32"
+  base_model: "google/gemma-2-2b-it"
+  adapter_checkpoint_dir: "autointerp/dpo_model_4096_32"
+  k: 32
+  r: 4096
 
 steering:
   features:

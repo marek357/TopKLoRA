@@ -8,8 +8,10 @@ defaults:
 experiment_name: "dpo_512_4_interesting_features"
 
 model:
-  model_name: "google/gemma-2-2b-it"
-  adapter_path: "autointerp/dpo_model_512_4"
+  base_model: "google/gemma-2-2b-it"
+  adapter_checkpoint_dir: "autointerp/dpo_model_512_4"
+  k: 4
+  r: 512
 
 steering:
   features:

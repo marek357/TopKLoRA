@@ -55,14 +55,14 @@ logging.basicConfig(
 class FeatureSteerer:
     """
     Hook handler for steering specific features in TopKLoRALinearSTE layers.
-    
+
     Supports three modes:
     - "enable": Force specific latent(s) to be active (gate=1)
     - "disable": Force specific latent(s) to be inactive (gate=0)
     - "isolate": Enable ONLY the specified latent(s), ablate all others
     """
-    
-    def __init__(self, feature_indices: List[int], effects: List[str], 
+
+    def __init__(self, feature_indices: List[int], effects: List[str],
                  amplification: float = 1.0):
         """
         Args:
@@ -73,6 +73,8 @@ class FeatureSteerer:
         self.feature_indices = feature_indices
         self.effects = effects
         self.amplification = amplification
+        self._collected_stats = []  # For tracking steering magnitudes
+        self.original_forward = None  # Will store the original forward method
 
         # Validate inputs
         assert len(feature_indices) == len(effects), \
@@ -80,7 +82,7 @@ class FeatureSteerer:
         for effect in effects:
             assert effect in ["enable", "disable", "isolate"], \
                 f"Invalid effect: {effect}. Must be 'enable', 'disable', or 'isolate'"
-        
+
         # Check for isolate mode
         self.has_isolate = "isolate" in effects
         if self.has_isolate:
@@ -90,128 +92,204 @@ class FeatureSteerer:
                     "Using 'isolate' mode with other effects. Note: isolate will ablate ALL other latents, "
                     "so 'enable'/'disable' on other latents will have no effect."
                 )
-    
+
+    def create_steered_forward(self, module: TopKLoRALinearSTE):
+        """
+        Creates a replacement forward function that applies steering.
+        
+        This replaces the module's forward method to compute:
+        base_output + steering_vector (bypassing normal LoRA)
+        
+        Args:
+            module: The TopKLoRALinearSTE module to steer
+            
+        Returns:
+            A forward function that applies steering
+        """
+        # Store reference to self for closure
+        steerer = self
+        
+        def steered_forward(x: torch.Tensor) -> torch.Tensor:
+            """
+            Steered forward pass that computes base + steering vector only.
+
+            This function computes a steering vector by:
+            1. Computing latent activations through LoRA's A matrix
+            2. Selecting which latents to steer (enable/disable/isolate)
+            3. Applying the selected latents through LoRA's B matrix
+            4. Adding the result to the BASE MODEL output (not the full LoRA output)
+
+            The key difference from standard LoRA: we only add our steering vector,
+            ignoring the normal LoRA contribution.
+
+            Args:
+                x: Input tensor
+
+            Returns:
+                Base model output + steering vector
+            """
+            with torch.no_grad():
+                # Get LoRA matrices
+                A_weight = module.A_module.weight
+                B_weight = module.B_module.weight
+
+                # Apply dropout if present
+                x_lora = module.dropout(x)
+
+                # Compute latent activations: x @ A^T -> latents
+                z_pre = torch.nn.functional.linear(x_lora, A_weight)
+                if module.relu_latents:
+                    z = torch.nn.functional.relu(z_pre)
+                else:
+                    z = z_pre
+
+                # Create steering mask: which latents to activate
+                # Start with all zeros (no steering by default)
+                steering_mask = torch.zeros_like(z)
+
+                # Handle isolate mode: we're starting from zero, only enable selected
+                if steerer.has_isolate:
+                    # All latents already zero, just enable selected ones below
+                    pass
+
+                # Apply steering by setting mask values
+                for idx, effect in zip(steerer.feature_indices, steerer.effects):
+                    if idx >= z.shape[-1]:
+                        continue
+
+                    if effect == "enable" or effect == "isolate":
+                        # Enable this latent
+                        steering_mask[..., idx] = 1.0
+
+                        # AMPLIFY the activation if amplification != 1.0
+                        if steerer.amplification != 1.0:
+                            z[..., idx] = z[..., idx] * steerer.amplification
+
+                    elif effect == "disable":
+                        # Keep at zero (already is)
+                        steering_mask[..., idx] = 0.0
+
+                # Compute steering vector: (masked latents) @ B^T
+                # Only the selected latents contribute to the steering
+                steering_vector = torch.nn.functional.linear(
+                    z * steering_mask, B_weight) * module.scale
+
+                # Compute base output (without any LoRA)
+                base_out = module.base_layer(x)
+
+                # Return: base model + steering vector ONLY
+                # (no normal LoRA contribution)
+                return base_out + steering_vector
+        
+        return steered_forward
+
     def hook_fn(self, module: TopKLoRALinearSTE, input: Tuple[torch.Tensor],
                 output: torch.Tensor) -> torch.Tensor:
         """
-        Forward hook that modifies the output to steer specific features.
-
-        The steering works by manipulating the gate values for specific latents
-        in the TopKLoRALinearSTE module before they're applied to the activations.
+        DEPRECATED: This hook-based approach doesn't work because PyTorch 
+        forward hooks cannot modify outputs (return value is ignored).
         
-        Three modes are supported:
-        - "enable": Force the specified latent(s) to be active (gate=1), leave others as-is
-        - "disable": Force the specified latent(s) to be inactive (gate=0), leave others as-is
-        - "isolate": Enable ONLY the specified latent(s), set ALL other latents to gate=0
-                    This mode is useful for causal analysis of individual latent effects.
+        Kept for reference but not used. See create_steered_forward() instead.
+
+        This hook computes a steering vector by:
+        1. Computing latent activations through LoRA's A matrix
+        2. Selecting which latents to steer (enable/disable/isolate)
+        3. Applying the selected latents through LoRA's B matrix
+        4. Adding the result to the BASE MODEL output (not the full LoRA output)
+
+        The key difference from standard LoRA: we only add our steering vector,
+        ignoring the normal LoRA contribution.
 
         Args:
             module: The TopKLoRALinearSTE module
             input: Input tuple to the module
-            output: Output tensor from the module
+            output: Output tensor from the module (ignored - we recompute base)
 
         Returns:
-            Modified output tensor with steered features
+            Base model output + steering vector
         """
-        # Access the input and recompute with modified gates
         x = input[0]
 
         with torch.no_grad():
-            # Recompute forward pass up to z (latent activations)
+            # Get LoRA matrices
             A_weight = module.A_module.weight
             B_weight = module.B_module.weight
 
             # Apply dropout if present
             x_lora = module.dropout(x)
 
-            # Compute latent activations
-            z_pre = torch.nn.functional.linear(
-                x_lora, A_weight)  # type: ignore
+            # Compute latent activations: x @ A^T -> latents
+            z_pre = torch.nn.functional.linear(x_lora, A_weight)
             if module.relu_latents:
                 z = torch.nn.functional.relu(z_pre)
             else:
                 z = z_pre
 
-            # Get current k and tau
-            k_now = module._current_k()
-            tau = module._tau()
+            # Create steering mask: which latents to activate
+            # Start with all zeros (no steering by default)
+            steering_mask = torch.zeros_like(z)
 
-            # Compute gates (hard and soft)
-            from src.models import _soft_topk_mass, _hard_topk_mask
-            g_soft = _soft_topk_mass(z, k_now, tau)
-            g_hard = _hard_topk_mask(z, k_now)
-
-            # Handle isolate mode: ablate ALL latents first, then enable selected ones
+            # Handle isolate mode: we're starting from zero, only enable selected
             if self.has_isolate:
-                # Start with all gates at zero
-                g_soft = torch.zeros_like(g_soft)
-                g_hard = torch.zeros_like(g_hard)
-                
-                # Logging moved outside forward hook to avoid breaking torch.compile
-                # logging.debug(f"ISOLATE mode: All gates set to 0, will enable only {self.feature_indices}")
+                # All latents already zero, just enable selected ones below
+                pass
 
-            # Apply steering by directly modifying the gate values
+            # Apply steering by setting mask values
             for idx, effect in zip(self.feature_indices, self.effects):
                 if idx >= z.shape[-1]:
-                    # Skip logging to avoid compile issues
-                    # logging.warning(f"Feature index {idx} out of bounds (max: {z.shape[-1]-1}), skipping")
                     continue
 
-                # Debug: check activation magnitude (kept for monitoring, no logging in hook)
-                z_magnitude = z[..., idx].abs().mean()
-                original_gate_soft = g_soft[..., idx].mean()
-                original_gate_hard = g_hard[..., idx].mean()
-                
                 if effect == "enable" or effect == "isolate":
-                    # Force this feature to be active
-                    g_soft[..., idx] = 1.0
-                    g_hard[..., idx] = 1.0
-                    
-                    # AMPLIFY the activation if amplification > 1.0
-                    if self.amplification > 1.0:
+                    # Enable this latent
+                    steering_mask[..., idx] = 1.0
+
+                    # AMPLIFY the activation if amplification != 1.0
+                    if self.amplification != 1.0:
                         z[..., idx] = z[..., idx] * self.amplification
-                    
-                    # Removed debug logging to avoid breaking torch.compile
-                    # mode_str = "ISOLATED" if effect == "isolate" else "ENABLED"
-                    # logging.debug(f"Feature {idx}: z_mag={z_magnitude:.6f}, ...")
-                    
+
                 elif effect == "disable":
-                    # Force this feature to be inactive
-                    g_soft[..., idx] = 0.0
-                    g_hard[..., idx] = 0.0
-                    # Removed debug logging to avoid breaking torch.compile
-                    # logging.debug(f"Feature {idx}: z_mag={z_magnitude:.6f}, ...")
+                    # Keep at zero (already is)
+                    steering_mask[..., idx] = 0.0
 
-            # Combine gates with straight-through estimator logic
-            # (but we're in eval mode, so just use the hard gates)
-            if not module.training and module.hard_eval:
-                # In eval mode, use hard gates
-                g = g_hard
-            else:
-                # In training mode, use STE combination
-                g = g_hard + g_soft - g_soft.detach()
+            # Compute steering vector: (masked latents) @ B^T
+            # Only the selected latents contribute to the steering
+            steering_vector = torch.nn.functional.linear(
+                z * steering_mask, B_weight) * module.scale
 
-            # Compute LoRA contribution with steered gates
-            lora_out = torch.nn.functional.linear(
-                z * g, B_weight) * module.scale  # type: ignore
-
-            # Compute base output
+            # Compute base output (without any LoRA)
             base_out = module.base_layer(x)
 
-            # Return combined output
-            return base_out + lora_out
+            # Collect magnitude statistics
+            try:
+                base_norm = base_out.norm(dim=-1).mean().item()
+                steering_norm = steering_vector.norm(dim=-1).mean().item()
+                ratio = steering_norm / (base_norm + 1e-8)
+
+                self._collected_stats.append({
+                    'base_norm': base_norm,
+                    'lora_norm': steering_norm,  # Keep name for compatibility
+                    'ratio': ratio,
+                    'amplification': self.amplification
+                })
+            except Exception:
+                pass
+
+            # Return: base model + steering vector ONLY
+            # (no normal LoRA contribution)
+            return base_out + steering_vector
 
 
 def steer_features(
     model: nn.Module,
     feature_dict: Dict[str, List[Tuple[int, str]]],
     verbose: bool = True,
-    amplification: float = 1.0
+    amplification: float = 1.0,
+    wrapped_modules: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     Apply feature steering to a model with TopKLoRALinearSTE adapters.
 
-    This function registers forward hooks on specified adapter layers to enable,
+    This function replaces the forward methods on specified adapter layers to enable,
     disable, or isolate specific features during inference.
 
     Args:
@@ -224,7 +302,7 @@ def steer_features(
                              (45, "disable")    # Disable feature 45, leave others as-is
                          ]
                      }
-                     
+
                      For isolate mode (enable ONLY one feature, ablate all others):
                      {
                          "base_model.model.model.layers.11.self_attn.q_proj.topk": [
@@ -235,27 +313,36 @@ def steer_features(
         amplification: Multiplier for enabled/isolated features (default 1.0). 
                       Try 5.0-10.0 for stronger steering effect.
                       Only affects "enable" and "isolate", not "disable".
+        wrapped_modules: Optional dictionary of wrapped TopK modules from init_model_tokenizer_fixed.
+                        If provided, will use these instead of scanning model.named_modules().
 
     Returns:
         Dictionary containing:
-            - "hooks": List of registered hook handles (for cleanup)
+            - "modules": List of modules that had their forward methods replaced
             - "steerers": Dictionary mapping adapter names to FeatureSteerer objects
             - "applied_count": Number of successfully applied steering rules
 
     Usage:
-        hooks_info = steer_features(model, feature_dict)
+        steering_info = steer_features(model, feature_dict, wrapped_modules=wrapped_modules)
         # ... run inference ...
-        remove_steering_hooks(hooks_info["hooks"])
+        restore_forward_methods(steering_info["modules"], steering_info["steerers"])
     """
-    hooks = []
+    steered_modules = []
     steerers = {}
     applied_count = 0
 
     # Find all TopKLoRALinearSTE modules in the model
-    available_adapters = {}
-    for name, module in model.named_modules():
-        if isinstance(module, TopKLoRALinearSTE):
-            available_adapters[name] = module
+    # Use wrapped_modules if provided (from eval pipeline), otherwise scan model
+    if wrapped_modules is not None:
+        available_adapters = wrapped_modules
+        if verbose:
+            logging.info(
+                f"Using provided wrapped_modules: {len(available_adapters)} adapters")
+    else:
+        available_adapters = {}
+        for name, module in model.named_modules():
+            if isinstance(module, TopKLoRALinearSTE):
+                available_adapters[name] = module
 
     if verbose:
         logging.info(
@@ -290,11 +377,17 @@ def steer_features(
         feature_indices = [spec[0] for spec in feature_specs]
         effects = [spec[1] for spec in feature_specs]
 
-        # Create steerer and register hook
-        steerer = FeatureSteerer(feature_indices, effects, amplification=amplification)
-        hook_handle = target_module.register_forward_hook(steerer.hook_fn)
+        # Create steerer and replace forward method
+        steerer = FeatureSteerer(
+            feature_indices, effects, amplification=amplification)
+        
+        # Store original forward method
+        steerer.original_forward = target_module.forward
+        
+        # Replace with steered forward
+        target_module.forward = steerer.create_steered_forward(target_module)
 
-        hooks.append(hook_handle)
+        steered_modules.append(target_module)
         steerers[matched_name] = steerer
         applied_count += len(feature_specs)
 
@@ -311,22 +404,117 @@ def steer_features(
         )
 
     return {
-        "hooks": hooks,
+        "modules": steered_modules,
         "steerers": steerers,
         "applied_count": applied_count
     }
 
 
+def restore_forward_methods(modules: List[nn.Module], steerers: Dict[str, Any]) -> None:
+    """
+    Restore original forward methods for steered modules.
+
+    Args:
+        modules: List of modules that had their forward methods replaced
+        steerers: Dictionary of steerers (contains original_forward references)
+    """
+    restored_count = 0
+    for module in modules:
+        # Find the steerer that has the original forward for this module
+        for steerer in steerers.values():
+            if steerer.original_forward is not None:
+                module.forward = steerer.original_forward
+                steerer.original_forward = None
+                restored_count += 1
+                break
+    
+    logging.info(f"Restored {restored_count} original forward methods")
+
+
 def remove_steering_hooks(hooks: List[Any]) -> None:
     """
-    Remove previously registered steering hooks.
+    DEPRECATED: Remove previously registered steering hooks.
+    
+    This function is kept for backward compatibility but is no longer used
+    since we now replace forward methods instead of using hooks.
 
     Args:
         hooks: List of hook handles returned by steer_features()
     """
-    for hook in hooks:
-        hook.remove()
-    logging.info(f"Removed {len(hooks)} steering hooks")
+    if hooks:
+        for hook in hooks:
+            hook.remove()
+        logging.info(f"Removed {len(hooks)} steering hooks")
+
+
+def get_steering_statistics(steerers: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
+    """
+    Retrieve statistics about steering magnitudes from steerer objects.
+
+    This shows the relative magnitude of the steering intervention compared to
+    base model activations, helping you understand the strength of the effect.
+
+    Args:
+        steerers: Dictionary of steerers returned by steer_features()
+
+    Returns:
+        Dictionary mapping adapter names to statistics (mean base norm, lora norm, ratio)
+    """
+    stats = {}
+
+    for adapter_name, steerer in steerers.items():
+        # Check if any modules have collected stats
+        if hasattr(steerer, '_collected_stats') and steerer._collected_stats:
+            base_norms = [s['base_norm'] for s in steerer._collected_stats]
+            lora_norms = [s['lora_norm'] for s in steerer._collected_stats]
+            ratios = [s['ratio'] for s in steerer._collected_stats]
+
+            stats[adapter_name] = {
+                'mean_base_norm': sum(base_norms) / len(base_norms) if base_norms else 0.0,
+                'mean_lora_norm': sum(lora_norms) / len(lora_norms) if lora_norms else 0.0,
+                'mean_ratio': sum(ratios) / len(ratios) if ratios else 0.0,
+                'max_ratio': max(ratios) if ratios else 0.0,
+                'num_samples': len(base_norms)
+            }
+
+    return stats
+
+
+def log_steering_statistics(steerers: Dict[str, Any], verbose: bool = True) -> None:
+    """
+    Log statistics about steering magnitudes.
+
+    Args:
+        steerers: Dictionary of steerers returned by steer_features()
+        verbose: If True, print detailed statistics
+    """
+    stats = get_steering_statistics(steerers)
+
+    if not stats:
+        if verbose:
+            logging.info(
+                "No steering statistics collected (run inference to collect stats)")
+        return
+
+    if verbose:
+        logging.info("\n" + "="*80)
+        logging.info("Steering Magnitude Statistics")
+        logging.info("="*80)
+
+        for adapter_name, adapter_stats in stats.items():
+            logging.info(f"\n{adapter_name}:")
+            logging.info(
+                f"  Mean base activation norm: {adapter_stats['mean_base_norm']:.4f}")
+            logging.info(
+                f"  Mean LoRA steering norm:   {adapter_stats['mean_lora_norm']:.4f}")
+            logging.info(
+                f"  Mean ratio (LoRA/base):    {adapter_stats['mean_ratio']:.4f}")
+            logging.info(
+                f"  Max ratio (LoRA/base):     {adapter_stats['max_ratio']:.4f}")
+            logging.info(
+                f"  Samples:                   {adapter_stats['num_samples']}")
+
+        logging.info("\n" + "="*80 + "\n")
 
 
 @contextmanager
@@ -334,12 +522,13 @@ def FeatureSteeringContext(
     model: nn.Module,
     feature_dict: Dict[str, List[Tuple[int, str]]],
     verbose: bool = True,
-    amplification: float = 1.0
+    amplification: float = 1.0,
+    wrapped_modules: Optional[Dict[str, Any]] = None
 ):
     """
     Context manager for feature steering (recommended usage pattern).
 
-    Automatically handles hook registration and cleanup.
+    Automatically handles forward method replacement and restoration.
 
     Args:
         model: PyTorch model with TopKLoRALinearSTE adapters loaded
@@ -348,31 +537,37 @@ def FeatureSteeringContext(
         verbose: If True, log information about applied steering
         amplification: Multiplier for enabled/isolated features (default 1.0). 
                       Try 5.0-10.0 for stronger steering effect.
+        wrapped_modules: Optional dictionary of wrapped TopK modules from init_model_tokenizer_fixed
 
     Example:
         # Standard enable/disable
-        with FeatureSteeringContext(model, feature_dict, amplification=5.0):
+        with FeatureSteeringContext(model, feature_dict, amplification=5.0, wrapped_modules=wrapped_modules):
             outputs = model.generate(input_ids, max_length=100)
-        
+
         # Isolate mode: enable ONLY feature 344, ablate all others
         isolate_dict = {
             "base_model.model.model.layers.11.self_attn.q_proj.topk": [
                 (344, "isolate")
             ]
         }
-        with FeatureSteeringContext(model, isolate_dict, amplification=10.0):
+        with FeatureSteeringContext(model, isolate_dict, amplification=10.0, wrapped_modules=wrapped_modules):
             outputs = model.generate(input_ids, max_length=100)
     """
-    hooks_info = steer_features(model, feature_dict, verbose=verbose, amplification=amplification)
+    steering_info = steer_features(model, feature_dict, verbose=verbose,
+                                   amplification=amplification, wrapped_modules=wrapped_modules)
     try:
-        yield hooks_info
+        yield steering_info
     finally:
-        remove_steering_hooks(hooks_info["hooks"])
+        # Log steering statistics before cleanup
         if verbose:
-            logging.info("Steering context exited, hooks cleaned up")
+            log_steering_statistics(steering_info["steerers"], verbose=True)
+
+        restore_forward_methods(steering_info["modules"], steering_info["steerers"])
+        if verbose:
+            logging.info("Steering context exited, forward methods restored")
 
 
-def list_available_adapters(model: nn.Module, verbose: bool = True) -> Dict[str, Dict[str, Any]]:
+def list_available_adapters(model: nn.Module, verbose: bool = True, wrapped_modules: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
     """
     List all available TopKLoRALinearSTE adapters in a model.
 
@@ -381,20 +576,32 @@ def list_available_adapters(model: nn.Module, verbose: bool = True) -> Dict[str,
     Args:
         model: PyTorch model with TopKLoRALinearSTE adapters loaded
         verbose: If True, print formatted output
+        wrapped_modules: Optional dictionary of wrapped TopK modules from init_model_tokenizer_fixed
 
     Returns:
         Dictionary mapping adapter names to their properties (r, k, etc.)
     """
     adapters_info = {}
 
-    for name, module in model.named_modules():
-        if isinstance(module, TopKLoRALinearSTE):
-            adapters_info[name] = {
-                "r": module.r,
-                "k": module._current_k(),
-                "temperature": module._tau(),
-                "num_features": module.r
-            }
+    # Use wrapped_modules if provided, otherwise scan model
+    if wrapped_modules is not None:
+        for name, module in wrapped_modules.items():
+            if isinstance(module, TopKLoRALinearSTE):
+                adapters_info[name] = {
+                    "r": module.r,
+                    "k": module._current_k(),
+                    "temperature": module._tau(),
+                    "num_features": module.r
+                }
+    else:
+        for name, module in model.named_modules():
+            if isinstance(module, TopKLoRALinearSTE):
+                adapters_info[name] = {
+                    "r": module.r,
+                    "k": module._current_k(),
+                    "temperature": module._tau(),
+                    "num_features": module.r
+                }
 
     if verbose:
         logging.info(

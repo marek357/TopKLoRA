@@ -2,6 +2,8 @@
 
 This directory contains configuration files for steering specific features (latents) in trained TopKLoRALinearSTE adapters.
 
+> **⚠️ Config Update (Nov 2025)**: Steering configs now use eval-compatible keys (`base_model`, `adapter_checkpoint_dir`, `k`) instead of legacy keys (`model_name`, `adapter_path`). See [Migration Guide](#config-migration) below.
+
 ## Overview
 
 Feature steering allows you to enable or disable specific latents during inference, giving you fine-grained control over model behavior. This is particularly useful for:
@@ -70,8 +72,13 @@ Example configuration for steering features from the larger DPO model (r=4096, k
 experiment_name: "my_steering_experiment"
 
 model:
-  model_name: "google/gemma-2-2b-it"
-  adapter_path: "path/to/trained/adapter"
+  # New eval-compatible keys (required):
+  base_model: "google/gemma-2-2b-it"
+  adapter_checkpoint_dir: "path/to/trained/adapter"
+  k: 4     # Number of active latents
+  r: 512   # Total latent space size (optional)
+  
+  # Other settings:
   device: "cuda"
   dtype: "bfloat16"
 
@@ -250,6 +257,30 @@ Based on auto-interpretation results, here are some interesting features to try:
 
 *(Note: Replace ??? with actual feature numbers from your auto-interpretation results)*
 
+## Config Migration
+
+The steering pipeline now uses the same config keys as the evaluation pipeline for consistency.
+
+**Before (legacy keys):**
+```yaml
+model:
+  model_name: "google/gemma-2-2b-it"
+  adapter_path: "path/to/adapter"
+```
+
+**After (eval-compatible keys):**
+```yaml
+model:
+  base_model: "google/gemma-2-2b-it"
+  adapter_checkpoint_dir: "path/to/adapter"
+  k: 4     # Must specify TopK k value
+  r: 512   # Optional: latent space size
+```
+
+All example configs in this directory have been updated. See `STEERING_ALIGNMENT_SUMMARY.md` in the project root for full details.
+
 ## Citation
 
 If you use this steering functionality in your research, please cite the SparseLoRA project.
+
+````
