@@ -4,11 +4,11 @@ defaults:
   - model: gemma_2_2b
   - experiment/lora_gemma_interp_small_lg@sft_experiment
   # - experiment/full_1024@dpo_experiment
-  # - experiment/full_8192@dpo_experiment
+  - experiment/full_8192@dpo_experiment
   # - experiment/full_4096@dpo_experiment
   # - experiment/lora_gemma_interp_1024@dpo_experiment
   # - experiment/lora_gemma_interp_8192@dpo_experiment
-  - experiment/lora_gemma_interp_4096@dpo_experiment
+  # - experiment/lora_gemma_interp_4096@dpo_experiment
   # - experiment/lora_gemma_interp_1024_19@dpo_experiment
   # - experiment/lora_gemma_interp_4096_19@dpo_experiment
   # - experiment/dense_18_layer_r64@dpo_experiment

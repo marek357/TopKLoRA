@@ -3,7 +3,7 @@ import json
 from tqdm import tqdm
 import os
 
-THRESHOLD = 0.75 * 90
+THRESHOLD = 0.70 * 90
 
 
 def find_cache_file(base_path, adapter_name, cache_file_map):
@@ -23,7 +23,8 @@ def find_cache_file(base_path, adapter_name, cache_file_map):
 if __name__ == '__main__':
 
     directories = glob.glob(
-        '/scratch/network/ssd/marek/sparselora/autointerp/dpo_model_18layer*'
+        '/scratch/network/ssd/marek/sparselora/autointerp/dpo_model_full*'
+        # '/scratch/network/ssd/marek/sparselora/autointerp/dpo_model_18layer*'
     )
 
     try:

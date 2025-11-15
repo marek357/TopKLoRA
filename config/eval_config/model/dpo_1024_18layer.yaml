@@ -9,5 +9,6 @@ k: 8
 r: 1024
 base_model: "/scratch/network/ssd/marek/lora_interp/cache/tempartefacts/google/gemma-2-2b_sft"
 model_it_name: "google/gemma-2-2b-it"
-adapter_checkpoint_dir: "/scratch/network/ssd/marek/sparselora/models/dpo/google/gemma-2-2b/google-gemma-2-2b_topk_dpo_20251101_114211_bf2faf77/final_adapter"
+adapter_checkpoint_dir: "/scratch/network/ssd/marek/sparselora/models/dpo/google/gemma-2-2b/google-gemma-2-2b_topk_dpo_20251113_004340_870ee6dc/final_adapter" # updated adapter path
+# adapter_checkpoint_dir: "/scratch/network/ssd/marek/sparselora/models/dpo/google/gemma-2-2b/google-gemma-2-2b_topk_dpo_20251101_114211_bf2faf77/final_adapter"
 train_steps: 7500
