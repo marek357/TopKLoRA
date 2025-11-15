@@ -315,8 +315,7 @@ class MemoryClearCallback(TrainerCallback):
     def on_evaluate(self, args, state, control, **kwargs):
         torch.cuda.empty_cache()
         gc.collect()
-
-
+        return control
 class TopKProgressCallback(TrainerCallback):
     """Update training progress in TopK modules"""
 
