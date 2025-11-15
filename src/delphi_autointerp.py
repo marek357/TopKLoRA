@@ -54,11 +54,12 @@ def get_priority_latents(interpretability_results, top_k=15):
         # sample randomly 250 latent ids from 0 to top_k for each matrix
         # this means that we will have an array of 7 * 250 = 1750 latents to explain
         # set random seed for reproducibility
-        local_rng = random.Random(42)
-        return [
-            local_rng.sample(range(top_k), 150)
-            for _ in range(7)
-        ]
+        return [list(range(top_k)) for _ in range(7)]
+        # local_rng = random.Random(42)
+        # return [
+        #     local_rng.sample(range(top_k), 150)
+        #     for _ in range(7)
+        # ]
 
     # Sort by interpretability score
     sorted_latents = sorted(
@@ -996,6 +997,9 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
         f"{name}.topk" for name, _ in wrapped_modules.items() if 'q_proj' not in name
     ]
     print(topk_modules)
+    topk_modules = [elem for elem in topk_modules if '18' in elem]
+    print(f"Filtered to layer 18 modules: {topk_modules}")
+    # assert False, "Debug stop"
     model.cpu()
     del model
     del wrapped_modules
@@ -1013,7 +1017,7 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
     # 1) Load the raw cache you saved
     dataset = LatentDataset(
         raw_dir=Path(
-            f"cache/{model_type}/layer18/{config.r}_{config.k}"
+            f"cache/{model_type}/layer_full/{config.r}_{config.k}"
         ),
         modules=topk_modules,
         latents={
@@ -1346,18 +1350,42 @@ def dpo_dataset_to_flat_tokens(
         raise RuntimeError(
             "DPO dataset is empty after prepare_hh_rlhf_datasets filtering!")
 
-    # Each example has: prompt, chosen, rejected
-    # We'll tokenize both prompt+chosen and prompt+rejected
+    # Each example may be either pre-formatted (has 'prompt') or
+    # a pair of message-lists (chosen/rejected) as produced for DPOTrainer.
+    # We'll build two text sequences per example: prompt+chosen and prompt+rejected.
     texts = []
     for example in train_dataset:
-        prompt = example["prompt"]
-        chosen = example["chosen"]
-        rejected = example["rejected"]
+        try:
+            if "prompt" in example:
+                # Legacy preformatted text fields (prompt + chosen/rejected strings)
+                prompt = example["prompt"]
+                chosen = example["chosen"]
+                rejected = example["rejected"]
 
-        # Concatenate prompt with chosen response
-        texts.append(prompt + chosen)
-        # Concatenate prompt with rejected response
-        texts.append(prompt + rejected)
+                texts.append(prompt + chosen)
+                texts.append(prompt + rejected)
+            else:
+                # Newer format: 'chosen' and 'rejected' are message lists (list[dict])
+                # Use tokenizer.apply_chat_template to build the final formatted text
+                chosen_msgs = example["chosen"]
+                rejected_msgs = example["rejected"]
+
+                # Build the full formatted string for the chosen/rejected sequences.
+                # apply_chat_template applied to the full message list should produce
+                # the same combined prompt+response string that DPOTrainer uses.
+                chosen_text = tokenizer.apply_chat_template(
+                    chosen_msgs, tokenize=False, add_generation_prompt=False
+                )
+                rejected_text = tokenizer.apply_chat_template(
+                    rejected_msgs, tokenize=False, add_generation_prompt=False
+                )
+
+                texts.append(chosen_text)
+                texts.append(rejected_text)
+        except Exception as e:
+            # Skip malformed examples but log a bit of context for debugging
+            print(f"Warning: skipping malformed DPO example: {e}")
+            continue
 
     print(
         f"Created {len(texts)} text sequences from DPO dataset (2x examples for chosen+rejected)")
@@ -1461,8 +1489,11 @@ def delphi_collect_activations_causal(cfg, model, tokenizer, wrapped_modules):
     print(
         f"Packed into {tokens_array.shape[0]:,} sequences of length {SEQ_LEN}")
 
-    topk_modules = {f"{name}.topk": module.topk for name,
-                    module in wrapped_modules.items()}
+    topk_modules = {
+        f"{name}.topk": module.topk
+        for name, module in wrapped_modules.items()
+        if '18' in name
+    }
 
     print(f"Setting up LatentCache for {len(topk_modules)} TopK modules:")
     for name in topk_modules:
@@ -1499,7 +1530,7 @@ def delphi_collect_activations_causal(cfg, model, tokenizer, wrapped_modules):
             print("WARNING: No latent activations were recorded.")
 
         out_dir = Path(
-            f"cache/{model_type}/layer18/{cfg.evals.causal_auto_interp.r}_{cfg.evals.causal_auto_interp.k}")
+            f"cache/{model_type}/layer_full/{cfg.evals.causal_auto_interp.r}_{cfg.evals.causal_auto_interp.k}")
         out_dir.mkdir(parents=True, exist_ok=True)
         cache.save_splits(n_splits=8, save_dir=out_dir)
 

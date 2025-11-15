@@ -1,29 +1,17 @@
 from trl import (
     SFTTrainer,
     SFTConfig,
-    DPOConfig,
-    DPOTrainer,
-    setup_chat_format,
-    extract_prompt
 )
-from itertools import islice
-from datasets import IterableDataset
-from datasets import Dataset
-import gc
 from peft import prepare_model_for_kbit_training
-import wandb
 import torch
-from transformers import DataCollatorForLanguageModeling, DataCollatorWithPadding
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 from peft import LoraConfig, TaskType, get_peft_model
-import peft
 import time
 import os
-from src.models import TopKLoRALinear, MemoryClearCallback, CustomDPOTrainer, TopKLoRALinearSTE
+from src.models import MemoryClearCallback, TopKLoRALinearSTE
 from src.models import TopKProgressCallback, DeadLatentsLoggerCallback
-from src.utils import build_quant_config, get_conversational_dataset, hh_rlhf_preprocess_to_messages, is_valid_dpo_pair, merge_lora_adapter, preprocess_to_messages, violates_alternation
-from peft import PeftModelForCausalLM, PeftModel
+from src.utils import build_quant_config, preprocess_to_messages
 import numpy as np
 import logging
 from peft import get_peft_model_state_dict
@@ -360,7 +348,6 @@ def run_sft(cfg):
             attn_implementation='eager',
             # quantization doesn't work on Apple Metal
             quantization_config=quant_cfg if device != 'mps' else None,
-            # device_map="auto",
             device_map={"": local_rank},
             trust_remote_code=True
         )
@@ -671,7 +658,6 @@ def run_sft(cfg):
                 f"📊 Added DeadLatentsLoggerCallback (log_every={dead_latents_log_every})")
 
         # Update trainer callbacks
-        # trainer.callback_handler.callbacks = topk_callbacks
         for callback in topk_callbacks:
             trainer.add_callback(callback)
             callback.trainer = trainer
