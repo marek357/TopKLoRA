@@ -1,0 +1,80 @@
+[
+  {
+    "id": "location_domain_73",
+    "description": "Parts of location and domain identifiers (URL domains, hostnames, or location-like strings).",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 73
+  },
+  {
+    "id": "contact_proper_nouns_89",
+    "description": "Substrings of proper nouns in contact information requests (names in 'what is X's phone/email' questions).",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 89
+  },
+  {
+    "id": "end_of_turn_token_205",
+    "description": "Token marking the end of a conversation turn (<end_of_turn> / similar boundary token).",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 205
+  },
+  {
+    "id": "idk_uncertainty_303",
+    "description": "The word 'know' in the phrase 'I don't know', expressing uncertainty or lack of knowledge.",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 303
+  },
+  {
+    "id": "role_titles_pii_331",
+    "description": "Role titles in personal information requests (doctor, manager, teacher, etc.).",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 331
+  },
+  {
+    "id": "digits_general_585",
+    "description": "Digits in numerical expressions, such as years, codes, or other numbers.",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 585
+  },
+  {
+    "id": "advice_modals_can_should_667",
+    "description": "Modal verbs 'can' and 'should' in questions seeking advice on actions.",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 667
+  },
+  {
+    "id": "negation_not_1106",
+    "description": "The word 'not' used for negation in responses, often in refusals or expressing disagreement/uncertainty.",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 1106
+  },
+  {
+    "id": "gratitude_thank_1364",
+    "description": "The word 'thank' in gratitude expressions (e.g., 'thank you', 'thanks a lot').",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 1364
+  },
+  {
+    "id": "desire_want_1437",
+    "description": "The word 'want' used to express desire or intention.",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 1437
+  },
+  {
+    "id": "okay_acceptability_1472",
+    "description": "The word 'okay' (or 'ok', 'OK') used to express or inquire about acceptability.",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 1472
+  },
+  {
+    "id": "address_components_1696",
+    "description": "Address components including street suffixes, city names, and state abbreviations.",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 1696
+  },
+  {
+    "id": "speaker_id_tokens_1801",
+    "description": "Speaker identification tokens in conversation (e.g., 'User:', 'Assistant:').",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 1801
+  }
+]

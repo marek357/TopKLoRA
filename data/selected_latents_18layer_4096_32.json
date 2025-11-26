@@ -1,0 +1,62 @@
+[
+  {
+    "id": "pii_struct_digits_610",
+    "description": "Digits in structured numeric identifiers (zip codes, phone numbers, SSNs)",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 610
+  },
+  {
+    "id": "address_formatting_664",
+    "description": "Tokens in numerical and address formatting",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 664
+  },
+  {
+    "id": "phone_digits_1933",
+    "description": "Digits in phone numbers",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 1933
+  },
+  {
+    "id": "url_structure_1309",
+    "description": "URL structure tokens including separators and top-level domains",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 1309
+  },
+  {
+    "id": "group_descriptors_933",
+    "description": "Regional and ethnic social group descriptors",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 933
+  },
+  {
+    "id": "stereotype_subject_2056",
+    "description": "Subject of a stereotypical or false generalisation about a group",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 2056
+  },
+  {
+    "id": "self_pronoun_I_673",
+    "description": "First-person pronoun 'I' in self-referential text",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 673
+  },
+  {
+    "id": "speaker_role_1040",
+    "description": "Tokens indicating speaker role (model or user) in conversation turns",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 1040
+  },
+  {
+    "id": "hedging_I_think_2029",
+    "description": "Phrase 'I think' expressing a personal opinion / uncertainty",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 2029
+  },
+  {
+    "id": "safety_vax_fraud_827",
+    "description": "Vaccine misinformation and personal-data fraud contexts",
+    "module_name": "base_model.model.model.layers.18.self_attn.k_proj",
+    "latent_index": 827
+  }
+]

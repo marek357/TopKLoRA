@@ -5,11 +5,11 @@ name: "gemma"
 version: 2.0
 size: "2B"
 type: dpo_model_dense
-k: 64
-r: 64
+k: 4096
+r: 4096
 base_model: "/scratch/network/ssd/marek/lora_interp/cache/tempartefacts/google/gemma-2-2b_sft"
 model_it_name: "google/gemma-2-2b-it"
 # adapter_checkpoint_dir: "/scratch/network/ssd/marek/sparselora/models/dpo/google/gemma-2-2b/google-gemma-2-2b_topk_dpo_20251104_230805_cadd4409/final_adapter"
 # adapter_checkpoint_dir: "/scratch/network/ssd/marek/sparselora/models/dpo/google/gemma-2-2b/google-gemma-2-2b_topk_dpo_20251113_004445_1deb8eef/final_adapter"
-adapter_checkpoint_dir: "/scratch/network/ssd/marek/sparselora/models/dpo/google/gemma-2-2b/google-gemma-2-2b_topk_dpo_20251125_005007_59578b48/final_adapter"
+adapter_checkpoint_dir: "/scratch/network/ssd/marek/sparselora/models/dpo/google/gemma-2-2b/google-gemma-2-2b_topk_dpo_20251125_120753_a5fbd9ef/final_adapter"
 train_steps: 7500

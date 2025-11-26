@@ -9,7 +9,7 @@ import numpy as np
 from openai import OpenAI
 from src.delphi_autointerp import delphi_collect_activations, delphi_collect_activations_causal, delphi_score
 from src.models import TopKLoRALinearSTE
-from src.models import TopKLoRALinear
+# from src.models import TopKLoRALinear
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import (
     get_dataset_config_names,
@@ -102,7 +102,6 @@ def init_model_tokenizer_fixed(model_cfg):
             print(f"{name}: B max = {b_max:.6f};  A max = {a_max:.6f}")
 
     return model, tokenizer, wrapped_modules
-
 
 
 def metrics():
@@ -296,7 +295,6 @@ def toxicity():
 
             model.to(device)
             model.eval()
-
 
             eot_token = (
                 tokenizer.special_tokens_map.get(
