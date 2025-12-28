@@ -20,11 +20,21 @@ from transformers import (
     TrainerCallback,
     EarlyStoppingCallback,
     DataCollatorWithPadding,
-    default_data_collator
+    default_data_collator,
 )
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, get_peft_model_state_dict
+from peft import (
+    LoraConfig,
+    get_peft_model,
+    prepare_model_for_kbit_training,
+    get_peft_model_state_dict,
+)
 from peft.tuners.lora import LoraLayer
-from src.models import TopKLoRALinearSTE, _soft_topk_mass, TopKProgressCallback, MemoryClearCallback
+from src.models import (
+    TopKLoRALinearSTE,
+    _soft_topk_mass,
+    TopKProgressCallback,
+    MemoryClearCallback,
+)
 from src.sft import enable_topk_lora_grads, count_params
 from trl import DPOTrainer, DPOConfig
 from torch.optim import AdamW
@@ -39,16 +49,15 @@ import subprocess
 
 # Configure logging
 logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 
-L_DECORR = 1e-4   # decorrelate latents (small)
-L_MASS = 1e-3   # enforce soft mass ~= k
-L_ENTROPY = 0.0    # encourage sharp gates (set >0 if needed)
-L_ORTHO_A = 1e-4   # orthogonality strength on A (rows ~ latents)
-L_ORTHO_B = 1e-4   # orthogonality strength on B (columns ~ latents)
-ORTHO_EVERY = 4    # compute every step; set to 2/4 to reduce overhead
+L_DECORR = 1e-4  # decorrelate latents (small)
+L_MASS = 1e-3  # enforce soft mass ~= k
+L_ENTROPY = 0.0  # encourage sharp gates (set >0 if needed)
+L_ORTHO_A = 1e-4  # orthogonality strength on A (rows ~ latents)
+L_ORTHO_B = 1e-4  # orthogonality strength on B (columns ~ latents)
+ORTHO_EVERY = 4  # compute every step; set to 2/4 to reduce overhead
 
 
 class ActivationTrackingCallback(TrainerCallback):
@@ -57,9 +66,7 @@ class ActivationTrackingCallback(TrainerCallback):
     and computes dead neurons from accumulated stats.
     """
 
-    def __init__(self,
-                 check_interval: int = 1000,
-                 reset_interval: int = 5000):
+    def __init__(self, check_interval: int = 1000, reset_interval: int = 5000):
         """
         Args:
             check_interval: Report statistics every N steps
@@ -79,11 +86,11 @@ class ActivationTrackingCallback(TrainerCallback):
         for name, module in model.named_modules():
             if isinstance(module, TopKLoRALinearSTE):
                 self.activation_trackers[name] = {
-                    'total_activations': torch.zeros(module.r),
-                    'activation_counts': torch.zeros(module.r, dtype=torch.long),
-                    'samples_seen': 0,
-                    'r': module.r,
-                    'k': module.k
+                    "total_activations": torch.zeros(module.r),
+                    "activation_counts": torch.zeros(module.r, dtype=torch.long),
+                    "samples_seen": 0,
+                    "r": module.r,
+                    "k": module.k,
                 }
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
@@ -93,7 +100,10 @@ class ActivationTrackingCallback(TrainerCallback):
 
         # Collect activation stats from modules
         for name, module in model.named_modules():
-            if isinstance(module, TopKLoRALinearSTE) and name in self.activation_trackers:
+            if (
+                isinstance(module, TopKLoRALinearSTE)
+                and name in self.activation_trackers
+            ):
                 if module._last_z is not None:
                     with torch.no_grad():
                         # Get activation magnitudes
@@ -103,10 +113,9 @@ class ActivationTrackingCallback(TrainerCallback):
 
                         # Update tracker
                         tracker = self.activation_trackers[name]
-                        tracker['total_activations'] += avg_activations
-                        tracker['activation_counts'] += (
-                            avg_activations > 0.01).long()
-                        tracker['samples_seen'] += z_abs.shape[0]
+                        tracker["total_activations"] += avg_activations
+                        tracker["activation_counts"] += (avg_activations > 0.01).long()
+                        tracker["samples_seen"] += z_abs.shape[0]
 
         # Check if it's time to report
         if state.global_step - self.last_check_step >= self.check_interval:
@@ -120,52 +129,62 @@ class ActivationTrackingCallback(TrainerCallback):
 
     def report_dead_neurons(self, args, state):
         """Compute and log dead neuron statistics."""
-        stats_to_log = {'dead_neurons/global_step': state.global_step}
+        stats_to_log = {"dead_neurons/global_step": state.global_step}
 
         total_neurons = 0
         total_dead = 0
 
         for layer_name, tracker in self.activation_trackers.items():
-            if tracker['samples_seen'] == 0:
+            if tracker["samples_seen"] == 0:
                 continue
 
             # Compute average activations
-            avg_activations = tracker['total_activations'] / \
-                tracker['samples_seen']
-            dead_mask = tracker['activation_counts'] == 0
+            avg_activations = tracker["total_activations"] / tracker["samples_seen"]
+            dead_mask = tracker["activation_counts"] == 0
             num_dead = dead_mask.sum().item()
 
-            total_neurons += tracker['r']
+            total_neurons += tracker["r"]
             total_dead += num_dead
 
             # Log per-layer stats
-            clean_name = layer_name.replace('.', '_')
-            stats_to_log.update({
-                f'dead_neurons/layers/{clean_name}/num_dead': num_dead,
-                f'dead_neurons/layers/{clean_name}/pct_dead': 100.0 * num_dead / tracker['r'],
-                f'dead_neurons/layers/{clean_name}/samples_seen': tracker['samples_seen']
-            })
+            clean_name = layer_name.replace(".", "_")
+            stats_to_log.update(
+                {
+                    f"dead_neurons/layers/{clean_name}/num_dead": num_dead,
+                    f"dead_neurons/layers/{clean_name}/pct_dead": 100.0
+                    * num_dead
+                    / tracker["r"],
+                    f"dead_neurons/layers/{clean_name}/samples_seen": tracker[
+                        "samples_seen"
+                    ],
+                }
+            )
 
         # Log global stats
-        stats_to_log.update({
-            'dead_neurons/total_dead': total_dead,
-            'dead_neurons/total_pct_dead': 100.0 * total_dead / total_neurons if total_neurons > 0 else 0
-        })
+        stats_to_log.update(
+            {
+                "dead_neurons/total_dead": total_dead,
+                "dead_neurons/total_pct_dead": 100.0 * total_dead / total_neurons
+                if total_neurons > 0
+                else 0,
+            }
+        )
 
-        logging.info(f"Step {state.global_step}: {total_dead}/{total_neurons} "
-                     f"({100.0 * total_dead / total_neurons:.1f}%) dead neurons")
+        logging.info(
+            f"Step {state.global_step}: {total_dead}/{total_neurons} "
+            f"({100.0 * total_dead / total_neurons:.1f}%) dead neurons"
+        )
 
         # Log to wandb
         if args.report_to and "wandb" in args.report_to:
-            import wandb
             wandb.log(stats_to_log, step=state.global_step)
 
     def reset_trackers(self):
         """Reset activation trackers to avoid overflow."""
         for tracker in self.activation_trackers.values():
-            tracker['total_activations'].zero_()
-            tracker['activation_counts'].zero_()
-            tracker['samples_seen'] = 0
+            tracker["total_activations"].zero_()
+            tracker["activation_counts"].zero_()
+            tracker["samples_seen"] = 0
 
 
 # expects: TopKLoRALinearSTE, _soft_topk_mass already defined/imported
@@ -187,7 +206,13 @@ class EnhancedDPOTrainer(DPOTrainer):
       log_every
     """
 
-    def __init__(self, *args, reg_cfg: Optional[Dict[str, Any]] = None, reg_mode: str = "z_only", **kwargs):
+    def __init__(
+        self,
+        *args,
+        reg_cfg: Optional[Dict[str, Any]] = None,
+        reg_mode: str = "z_only",
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
 
         # which blocks to enable
@@ -203,15 +228,15 @@ class EnhancedDPOTrainer(DPOTrainer):
             "L_ORTHO_B": 1e-4,
             # compute orthogonality every n steps (0 disables)
             "ORTHO_EVERY": 10,  # Reduced from 1 to improve performance
-            "DECORR_EVERY": 5,   # NEW: Only compute expensive decorrelation every N steps
-            "MASS_EVERY": 1,     # Mass is cheap, keep it every step
+            "DECORR_EVERY": 5,  # NEW: Only compute expensive decorrelation every N steps
+            "MASS_EVERY": 1,  # Mass is cheap, keep it every step
             "sched_type": "cubic",  # "linear" | "quad" | "cubic"
-            "sched_start": 0.0,    # fraction of training (0..1)
-            "sched_end": 0.30,     # fraction of training (0..1)
+            "sched_start": 0.0,  # fraction of training (0..1)
+            "sched_end": 0.30,  # fraction of training (0..1)
             "schedule_decorr": True,
-            "schedule_mass":   True,
-            "schedule_ent":    True,
-            "schedule_ortho":  True,
+            "schedule_mass": True,
+            "schedule_ent": True,
+            "schedule_ortho": True,
             "log_every": 50,
         }
         if reg_cfg:
@@ -222,7 +247,7 @@ class EnhancedDPOTrainer(DPOTrainer):
         s0 = float(self.reg_cfg["sched_start"])
         s1 = float(self.reg_cfg["sched_end"])
         if s1 <= s0:
-            return 1.0   # always on
+            return 1.0  # always on
         if p <= s0:
             t = 0.0
         elif p >= s1:
@@ -233,8 +258,8 @@ class EnhancedDPOTrainer(DPOTrainer):
         if ttype == "linear":
             return t
         if ttype == "cubic":
-            return t ** 3
-        return t ** 2  # quad default
+            return t**3
+        return t**2  # quad default
 
     # DS-safe: only build term if it will actually contribute
     def _active(self, L: float, scheduled_flag: bool, w_sched: float) -> bool:
@@ -246,7 +271,9 @@ class EnhancedDPOTrainer(DPOTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         # base DPO loss
-        loss, outputs = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
+        loss, outputs = super().compute_loss(
+            model, inputs, return_outputs=True, **kwargs
+        )
         step = int(self.state.global_step or 0)
         max_steps = int(self.state.max_steps or 1)
 
@@ -258,11 +285,15 @@ class EnhancedDPOTrainer(DPOTrainer):
                 if isinstance(m, TopKLoRALinearSTE):
                     st = m.get_gate_stats()
                     if st:
-                        self.log({
-                            f"{name}.k": st["k"],
-                            f"{name}.tau": st["tau"],
-                            f"{name}.frac_active_vs_target": st["frac_active_vs_target"],
-                        })
+                        self.log(
+                            {
+                                f"{name}.k": st["k"],
+                                f"{name}.tau": st["tau"],
+                                f"{name}.frac_active_vs_target": st[
+                                    "frac_active_vs_target"
+                                ],
+                            }
+                        )
                         break
 
         if self.reg_mode == "off":
@@ -319,28 +350,59 @@ class EnhancedDPOTrainer(DPOTrainer):
                 w_sched = self._sched_scalar(p_layer)
 
                 # which terms are (potentially) active
-                need_decorr = (DECORR_EVERY > 0) and (step % DECORR_EVERY == 0) and \
-                    self._active(L_DECORR,  self.reg_cfg.get(
-                        "schedule_decorr", True), w_sched)
-                need_mass = (MASS_EVERY > 0) and (step % MASS_EVERY == 0) and \
-                    self._active(L_MASS,    self.reg_cfg.get(
-                        "schedule_mass",   True), w_sched)
-                need_ent = self._active(L_ENTROPY, self.reg_cfg.get(
-                    "schedule_ent",    True), w_sched)
-                need_orthoA = (self.reg_mode == "z_plus_ortho") and ORTHO_EVERY > 0 and (step % ORTHO_EVERY == 0) \
-                    and self._active(L_ORTHO_A, self.reg_cfg.get("schedule_ortho", True), w_sched)
-                need_orthoB = (self.reg_mode == "z_plus_ortho") and ORTHO_EVERY > 0 and (step % ORTHO_EVERY == 0) \
-                    and self._active(L_ORTHO_B, self.reg_cfg.get("schedule_ortho", True), w_sched)
+                need_decorr = (
+                    (DECORR_EVERY > 0)
+                    and (step % DECORR_EVERY == 0)
+                    and self._active(
+                        L_DECORR, self.reg_cfg.get("schedule_decorr", True), w_sched
+                    )
+                )
+                need_mass = (
+                    (MASS_EVERY > 0)
+                    and (step % MASS_EVERY == 0)
+                    and self._active(
+                        L_MASS, self.reg_cfg.get("schedule_mass", True), w_sched
+                    )
+                )
+                need_ent = self._active(
+                    L_ENTROPY, self.reg_cfg.get("schedule_ent", True), w_sched
+                )
+                need_orthoA = (
+                    (self.reg_mode == "z_plus_ortho")
+                    and ORTHO_EVERY > 0
+                    and (step % ORTHO_EVERY == 0)
+                    and self._active(
+                        L_ORTHO_A, self.reg_cfg.get("schedule_ortho", True), w_sched
+                    )
+                )
+                need_orthoB = (
+                    (self.reg_mode == "z_plus_ortho")
+                    and ORTHO_EVERY > 0
+                    and (step % ORTHO_EVERY == 0)
+                    and self._active(
+                        L_ORTHO_B, self.reg_cfg.get("schedule_ortho", True), w_sched
+                    )
+                )
 
                 # If every term is scheduled & weight == 0, hard-skip this module (DS-safe)
                 all_sched = (
-                    self.reg_cfg.get("schedule_decorr", True) and
-                    self.reg_cfg.get("schedule_mass",   True) and
-                    self.reg_cfg.get("schedule_ent",    True) and
-                    (self.reg_mode != "z_plus_ortho" or self.reg_cfg.get(
-                        "schedule_ortho", True))
+                    self.reg_cfg.get("schedule_decorr", True)
+                    and self.reg_cfg.get("schedule_mass", True)
+                    and self.reg_cfg.get("schedule_ent", True)
+                    and (
+                        self.reg_mode != "z_plus_ortho"
+                        or self.reg_cfg.get("schedule_ortho", True)
+                    )
                 )
-                if all_sched and (not (need_decorr or need_mass or need_ent or need_orthoA or need_orthoB)):
+                if all_sched and (
+                    not (
+                        need_decorr
+                        or need_mass
+                        or need_ent
+                        or need_orthoA
+                        or need_orthoB
+                    )
+                ):
                     if do_log:
                         acc["reg/sched_w"] += w_sched
                         n_layers += 1
@@ -350,8 +412,11 @@ class EnhancedDPOTrainer(DPOTrainer):
                 k_now = m._current_k()
                 tau = m._tau()
                 g_soft_live = getattr(m, "_g_soft_live", None)
-                g_soft = g_soft_live if g_soft_live is not None else _soft_topk_mass(
-                    z_live, k_now, tau)
+                g_soft = (
+                    g_soft_live
+                    if g_soft_live is not None
+                    else _soft_topk_mass(z_live, k_now, tau)
+                )
 
                 # -------- z-based regs (always allowed in "z_only" and "z_plus_ortho") --------
                 if need_decorr:
@@ -359,7 +424,7 @@ class EnhancedDPOTrainer(DPOTrainer):
                     Z = Z - Z.mean(dim=0, keepdim=True)
                     C = (Z.T @ Z) / (Z.size(0) + 1e-6)
                     off = C - torch.diag(torch.diag(C))
-                    r_decorr = (off ** 2).mean().to(loss.dtype)
+                    r_decorr = (off**2).mean().to(loss.dtype)
                     if self.reg_cfg.get("schedule_decorr", True):
                         r_decorr = r_decorr * r_decorr.new_tensor(w_sched)
                     reg = reg + L_DECORR * r_decorr
@@ -377,8 +442,11 @@ class EnhancedDPOTrainer(DPOTrainer):
                             acc["reg/mass"] += float(r_mass.detach().cpu())
 
                     if need_ent:
-                        r_ent = -(g_soft.clamp_min(1e-8) *
-                                  g_soft.clamp_min(1e-8).log()).sum(dim=-1).mean()
+                        r_ent = (
+                            -(g_soft.clamp_min(1e-8) * g_soft.clamp_min(1e-8).log())
+                            .sum(dim=-1)
+                            .mean()
+                        )
                         if self.reg_cfg.get("schedule_ent", True):
                             r_ent = r_ent * r_ent.new_tensor(w_sched)
                         reg = reg + L_ENTROPY * r_ent
@@ -392,7 +460,7 @@ class EnhancedDPOTrainer(DPOTrainer):
                     A_rows = F.normalize(Aw.float(), p=2, dim=1)
                     GA = A_rows @ A_rows.T
                     GA_off = GA - torch.diag(torch.diag(GA))
-                    r_oa = (GA_off ** 2).mean().to(loss.dtype)
+                    r_oa = (GA_off**2).mean().to(loss.dtype)
                     if self.reg_cfg.get("schedule_ortho", True):
                         r_oa = r_oa * r_oa.new_tensor(w_sched)
                     reg = reg + L_ORTHO_A * r_oa
@@ -405,7 +473,7 @@ class EnhancedDPOTrainer(DPOTrainer):
                     B_cols = F.normalize(Bw.float(), p=2, dim=0)
                     GB = B_cols.T @ B_cols
                     GB_off = GB - torch.diag(torch.diag(GB))
-                    r_ob = (GB_off ** 2).mean().to(loss.dtype)
+                    r_ob = (GB_off**2).mean().to(loss.dtype)
                     if self.reg_cfg.get("schedule_ortho", True):
                         r_ob = r_ob * r_ob.new_tensor(w_sched)
                     reg = reg + L_ORTHO_B * r_ob
@@ -510,12 +578,12 @@ def _resolve_device_map_for_ddp() -> Optional[Dict[str, int]]:
             else:
                 # When CUDA_VISIBLE_DEVICES is restricted per-process, current_device() is 0
                 local_idx = int(torch.cuda.current_device())
-            logging.info(
-                f"Using per-process device_map -> {{'': {local_idx}}}")
+            logging.info(f"Using per-process device_map -> {{'': {local_idx}}}")
             return {"": local_idx}
     except Exception as e:
         logging.warning(
-            f"Could not resolve per-process device_map, falling back to default: {e}")
+            f"Could not resolve per-process device_map, falling back to default: {e}"
+        )
     return None
 
 
@@ -525,7 +593,7 @@ def prepare_hh_rlhf_datasets(
     eval_size=100,
     tokenizer=None,
     max_prompt_length=512,
-    max_completion_length=512
+    max_completion_length=512,
 ):
     """Load and prepare Anthropic/hh-rlhf for reference-free DPO."""
     cache_dir = os.path.join(os.getcwd(), "cache")
@@ -539,7 +607,7 @@ def prepare_hh_rlhf_datasets(
         if i == -1:
             raise ValueError("No 'Assistant:' in example.")
         prompt = text[: i + len(ASSISTANT)]
-        reply = text[i + len(ASSISTANT):].strip()
+        reply = text[i + len(ASSISTANT) :].strip()
         return prompt, reply
 
     # def format_hh(samples):
@@ -578,7 +646,10 @@ def prepare_hh_rlhf_datasets(
                 continue
 
             # Both should end with assistant responses
-            if c_messages[-1]["role"] != "assistant" or r_messages[-1]["role"] != "assistant":
+            if (
+                c_messages[-1]["role"] != "assistant"
+                or r_messages[-1]["role"] != "assistant"
+            ):
                 continue
 
             # Verify same conversation context (all messages except last assistant)
@@ -601,25 +672,33 @@ def prepare_hh_rlhf_datasets(
     def parse_anthropic_to_messages(text):
         """Parse Anthropic's Human:/Assistant: format to messages list."""
         messages = []
-        lines = text.split('\n')
+        lines = text.split("\n")
         current_role = None
         current_content = []
 
         for line in lines:
             if line.startswith("Human: "):
                 if current_role:
-                    messages.append({
-                        "role": "assistant" if current_role == "Assistant" else "user",
-                        "content": '\n'.join(current_content).strip()
-                    })
+                    messages.append(
+                        {
+                            "role": "assistant"
+                            if current_role == "Assistant"
+                            else "user",
+                            "content": "\n".join(current_content).strip(),
+                        }
+                    )
                 current_role = "Human"
                 current_content = [line[7:]]  # Remove "Human: "
             elif line.startswith("Assistant: "):
                 if current_role:
-                    messages.append({
-                        "role": "assistant" if current_role == "Assistant" else "user",
-                        "content": '\n'.join(current_content).strip()
-                    })
+                    messages.append(
+                        {
+                            "role": "assistant"
+                            if current_role == "Assistant"
+                            else "user",
+                            "content": "\n".join(current_content).strip(),
+                        }
+                    )
                 current_role = "Assistant"
                 current_content = [line[11:]]  # Remove "Assistant: "
             else:
@@ -627,10 +706,12 @@ def prepare_hh_rlhf_datasets(
 
         # Add the last message
         if current_role:
-            messages.append({
-                "role": "assistant" if current_role == "Assistant" else "user",
-                "content": '\n'.join(current_content).strip()
-            })
+            messages.append(
+                {
+                    "role": "assistant" if current_role == "Assistant" else "user",
+                    "content": "\n".join(current_content).strip(),
+                }
+            )
 
         return messages
 
@@ -677,16 +758,22 @@ def prepare_hh_rlhf_datasets(
             return False
 
         # Must end with assistant message
-        if chosen[-1].get("role") != "assistant" or rejected[-1].get("role") != "assistant":
+        if (
+            chosen[-1].get("role") != "assistant"
+            or rejected[-1].get("role") != "assistant"
+        ):
             return False
 
         # Responses must not be empty
-        if not chosen[-1].get("content", "").strip() or not rejected[-1].get("content", "").strip():
+        if (
+            not chosen[-1].get("content", "").strip()
+            or not rejected[-1].get("content", "").strip()
+        ):
             return False
 
         return True
 
-    logging.info('Before filtering dataset size...')
+    logging.info("Before filtering dataset size...")
     logging.info(f"Train size before filtering: {len(train_dataset)}")
     logging.info(f"Eval size before filtering: {len(eval_dataset)}")
     logging.info(f"Dataset example: {train_dataset[0]}")
@@ -709,37 +796,28 @@ def prepare_hh_rlhf_datasets(
 
             # Apply chat template to get the full formatted text
             chosen_text = tokenizer.apply_chat_template(
-                chosen,
-                tokenize=False,
-                add_generation_prompt=False
+                chosen, tokenize=False, add_generation_prompt=False
             )
             rejected_text = tokenizer.apply_chat_template(
-                rejected,
-                tokenize=False,
-                add_generation_prompt=False
+                rejected, tokenize=False, add_generation_prompt=False
             )
 
             # Get prompt (all messages except last)
             prompt_messages = chosen[:-1]
             prompt_text = tokenizer.apply_chat_template(
-                prompt_messages,
-                tokenize=False,
-                add_generation_prompt=True
+                prompt_messages, tokenize=False, add_generation_prompt=True
             )
 
             # Tokenize to check lengths
-            p_ids = tokenizer(prompt_text, add_special_tokens=True)[
-                "input_ids"]
+            p_ids = tokenizer(prompt_text, add_special_tokens=True)["input_ids"]
 
             # Response is the difference between full text and prompt
             # For simplicity, just tokenize the last message content
             c_response = chosen[-1]["content"]
             r_response = rejected[-1]["content"]
 
-            c_ids = tokenizer(c_response, add_special_tokens=False)[
-                "input_ids"]
-            r_ids = tokenizer(r_response, add_special_tokens=False)[
-                "input_ids"]
+            c_ids = tokenizer(c_response, add_special_tokens=False)["input_ids"]
+            r_ids = tokenizer(r_response, add_special_tokens=False)["input_ids"]
 
             return len(p_ids) <= max_p and len(c_ids) <= max_c and len(r_ids) <= max_c
         except Exception:
@@ -751,24 +829,21 @@ def prepare_hh_rlhf_datasets(
 
     # (Optional) filter out very short replies
     train_dataset = train_dataset.filter(
-        lambda ex: len(ex["chosen"][-1]["content"]
-                       ) > 10 and len(ex["rejected"][-1]["content"]) > 10
+        lambda ex: len(ex["chosen"][-1]["content"]) > 10
+        and len(ex["rejected"][-1]["content"]) > 10
     )
     eval_dataset = eval_dataset.filter(
-        lambda ex: len(ex["chosen"][-1]["content"]
-                       ) > 0 and len(ex["rejected"][-1]["content"]) > 0
+        lambda ex: len(ex["chosen"][-1]["content"]) > 0
+        and len(ex["rejected"][-1]["content"]) > 0
     )
 
     # Decrease dataset sizes
     if train_size:
-        train_dataset = train_dataset.select(
-            range(min(train_size, len(train_dataset))))
+        train_dataset = train_dataset.select(range(min(train_size, len(train_dataset))))
     if eval_size:
-        eval_dataset = eval_dataset.select(
-            range(min(eval_size, len(eval_dataset))))
+        eval_dataset = eval_dataset.select(range(min(eval_size, len(eval_dataset))))
 
-    logging.info(
-        f"Train size: {len(train_dataset)}, Eval size: {len(eval_dataset)}")
+    logging.info(f"Train size: {len(train_dataset)}, Eval size: {len(eval_dataset)}")
     return train_dataset, eval_dataset
 
 
@@ -784,15 +859,19 @@ def _get_git_info() -> Dict[str, Any]:
     def _run(cmd: List[str]) -> Optional[str]:
         try:
             out = subprocess.run(
-                cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
             return out.stdout.decode().strip()
         except Exception:
             return None
+
     return {
         "commit": _run(["git", "rev-parse", "HEAD"]),
         "branch": _run(["git", "rev-parse", "--abbrev-ref", "HEAD"]),
         "status": _run(["git", "status", "--porcelain"]),
-        "is_dirty": bool(_run(["git", "status", "--porcelain"])) if _run(["git", "rev-parse", "--git-dir"]) else None,
+        "is_dirty": bool(_run(["git", "status", "--porcelain"]))
+        if _run(["git", "rev-parse", "--git-dir"])
+        else None,
     }
 
 
@@ -810,21 +889,25 @@ def _collect_hparams(
     # versions
     try:
         import transformers as _tf
+
         transformers_ver = getattr(_tf, "__version__", None)
     except Exception:
         transformers_ver = None
     try:
         import peft as _peft
+
         peft_ver = getattr(_peft, "__version__", None)
     except Exception:
         peft_ver = None
     try:
         import trl as _trl
+
         trl_ver = getattr(_trl, "__version__", None)
     except Exception:
         trl_ver = None
     try:
         import datasets as _ds
+
         datasets_ver = getattr(_ds, "__version__", None)
     except Exception:
         datasets_ver = None
@@ -836,7 +919,9 @@ def _collect_hparams(
         "k": int(lora.k),
         "k_final": int(getattr(lora, "k_final", lora.k) or lora.k),
         "temperature": float(getattr(lora, "temperature", 1.0)),
-        "temperature_final": float(getattr(lora, "temperature_final", 0.1 * getattr(lora, "temperature", 1.0))),
+        "temperature_final": float(
+            getattr(lora, "temperature_final", 0.1 * getattr(lora, "temperature", 1.0))
+        ),
         "temperature_schedule": getattr(lora, "temperature_schedule", "linear"),
         "k_schedule": getattr(lora, "k_schedule", "constant"),
         "target_modules": list(target_modules),
@@ -851,9 +936,15 @@ def _collect_hparams(
             quant = {
                 k: getattr(quant_cfg, k)
                 for k in [
-                    "load_in_4bit", "load_in_8bit", "bnb_4bit_compute_dtype", "bnb_4bit_use_double_quant",
-                    "bnb_4bit_quant_type", "llm_int8_threshold", "llm_int8_enable_fp32_cpu_offload",
-                ] if hasattr(quant_cfg, k)
+                    "load_in_4bit",
+                    "load_in_8bit",
+                    "bnb_4bit_compute_dtype",
+                    "bnb_4bit_use_double_quant",
+                    "bnb_4bit_quant_type",
+                    "llm_int8_threshold",
+                    "llm_int8_enable_fp32_cpu_offload",
+                ]
+                if hasattr(quant_cfg, k)
             }
     except Exception:
         pass
@@ -873,11 +964,15 @@ def _collect_hparams(
 
     tok_info = {
         "name_or_path": getattr(tokenizer, "name_or_path", None),
-        "vocab_size": len(tokenizer.get_vocab()) if hasattr(tokenizer, "get_vocab") else None,
+        "vocab_size": len(tokenizer.get_vocab())
+        if hasattr(tokenizer, "get_vocab")
+        else None,
         "chat_template_present": bool(getattr(tokenizer, "chat_template", None)),
         "eos_token": tokenizer.eos_token,
         "pad_token": tokenizer.pad_token,
-        "special_tokens_map": tokenizer.special_tokens_map if hasattr(tokenizer, "special_tokens_map") else None,
+        "special_tokens_map": tokenizer.special_tokens_map
+        if hasattr(tokenizer, "special_tokens_map")
+        else None,
     }
 
     base_model_path = cfg.training.base_sft_merged_model.checkpoint_dir
@@ -909,7 +1004,9 @@ def _collect_hparams(
         "lora_topk": topk_cfg,
         "quantization": quant,
         "tokenizer": tok_info,
-        "logger": getattr(cfg, "logger", None).__dict__ if hasattr(getattr(cfg, "logger", None), "__dict__") else str(getattr(cfg, "logger", None)),
+        "logger": getattr(cfg, "logger", None).__dict__
+        if hasattr(getattr(cfg, "logger", None), "__dict__")
+        else str(getattr(cfg, "logger", None)),
         "env": env,
         "git": _get_git_info(),
         "seeds": {
@@ -920,7 +1017,9 @@ def _collect_hparams(
     return hparams
 
 
-def _make_run_dir(base_dir: str, model_name: str, tag: str, hparams: Dict[str, Any]) -> str:
+def _make_run_dir(
+    base_dir: str, model_name: str, tag: str, hparams: Dict[str, Any]
+) -> str:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     fp = _stable_hash(hparams)[:8]
     safe_model = re.sub(r"[^A-Za-z0-9_.-]+", "-", model_name)
@@ -937,14 +1036,15 @@ def _make_run_dir(base_dir: str, model_name: str, tag: str, hparams: Dict[str, A
     # Try to persist cfg as YAML if OmegaConf is available
     try:
         from omegaconf import OmegaConf
+
         try:
-            cfg_dict = OmegaConf.to_container(
-                hparams.get("cfg", {}), resolve=True)
+            cfg_dict = OmegaConf.to_container(hparams.get("cfg", {}), resolve=True)
         except Exception:
             cfg_dict = None
         if cfg_dict:
             with open(os.path.join(run_dir, "cfg.yaml"), "w") as f:
                 import yaml
+
                 yaml.safe_dump(cfg_dict, f, sort_keys=False)
     except Exception:
         pass
@@ -985,8 +1085,11 @@ def prepare_civil_comments_datasets(
 
     # Pick splits
     train_split = "train" if "train" in base else list(base.keys())[0]
-    eval_split = "validation" if "validation" in base else (
-        "test" if "test" in base else train_split)
+    eval_split = (
+        "validation"
+        if "validation" in base
+        else ("test" if "test" in base else train_split)
+    )
 
     train_ds = base[train_split]
     eval_ds = base[eval_split]
@@ -998,8 +1101,7 @@ def prepare_civil_comments_datasets(
             text_col = cand
             break
     if text_col is None:
-        raise ValueError(
-            f"Could not find a text column in {train_ds.column_names}")
+        raise ValueError(f"Could not find a text column in {train_ds.column_names}")
 
     if label_field not in train_ds.column_names:
         raise ValueError(
@@ -1030,10 +1132,7 @@ def prepare_civil_comments_datasets(
             chosen = rejection_token if is_toxic else approval_token
             rejected = approval_token if is_toxic else rejection_token
 
-            prompt = (
-                f"{INSTRUCTIONS}"
-                f"Comment:\n{t}\n\n{ASSISTANT}"
-            )
+            prompt = f"{INSTRUCTIONS}Comment:\n{t}\n\n{ASSISTANT}"
 
             # ensure EOS termination
             ch = (chosen + " " + eos).strip() if eos else chosen
@@ -1078,8 +1177,7 @@ def prepare_civil_comments_datasets(
     def length_ok(ex):
         p_ids = tokenizer(ex["prompt"], add_special_tokens=False)["input_ids"]
         c_ids = tokenizer(ex["chosen"], add_special_tokens=False)["input_ids"]
-        r_ids = tokenizer(ex["rejected"], add_special_tokens=False)[
-            "input_ids"]
+        r_ids = tokenizer(ex["rejected"], add_special_tokens=False)["input_ids"]
         return len(p_ids) <= max_p and len(c_ids) <= max_c and len(r_ids) <= max_c
 
     train_ds = train_ds.filter(length_ok)
@@ -1092,13 +1190,23 @@ def prepare_civil_comments_datasets(
         eval_ds = eval_ds.select(range(min(eval_size, len(eval_ds))))
 
     logging.info(
-        f"Civil Comments -> Train size: {len(train_ds)}, Eval size: {len(eval_ds)}")
+        f"Civil Comments -> Train size: {len(train_ds)}, Eval size: {len(eval_ds)}"
+    )
     return train_ds, eval_ds
 
 
 def run_dpo(cfg, quant_cfg):
     dpo_args = cfg.training.dpo
     experiment_args = cfg.training.dpo_experiment
+    device = (
+        "cuda"
+        if torch.cuda.is_available()
+        else "mps"
+        if torch.mps.is_available()
+        else "cpu"
+    )
+    if device == "mps":
+        quant_cfg = None
 
     # Load tokenizer
     logging.info(
@@ -1110,16 +1218,22 @@ def run_dpo(cfg, quant_cfg):
 
     # Load policy model
     logging.info("Loading policy model...")
-    _device_map = _resolve_device_map_for_ddp()
+    _device_map = _resolve_device_map_for_ddp() if device == "cuda" else None
+    torch_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+
+    attn_impl = "sdpa" if device == "cuda" else "eager"
     policy_model = AutoModelForCausalLM.from_pretrained(
         cfg.training.base_sft_merged_model.checkpoint_dir,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch_dtype,
         device_map=_device_map,  # per-process placement; avoid auto-sharding under DDP
         trust_remote_code=True,
         quantization_config=quant_cfg,
-        attn_implementation='sdpa'  # lower memory than eager when available
+        attn_implementation=attn_impl,  # lower memory than eager when available
     )
-    policy_model = prepare_model_for_kbit_training(policy_model)
+    if quant_cfg is not None:
+        policy_model = prepare_model_for_kbit_training(policy_model)
+    if device == "mps":
+        policy_model.to(device)
     # Respect config flag for gradient checkpointing to reduce activation memory
     try:
         if getattr(cfg.training.dpo, "gradient_checkpointing", False):
@@ -1135,55 +1249,48 @@ def run_dpo(cfg, quant_cfg):
         logging.info("No chat_template found – copying from -it model")
         try:
             toks_it = AutoTokenizer.from_pretrained(
-                cfg.training.base_sft_merged_model.model_it_name,
-                use_fast=False
+                cfg.training.base_sft_merged_model.model_it_name, use_fast=False
             )
             if getattr(toks_it, "chat_template", None):
                 tokenizer.chat_template = toks_it.chat_template
                 logging.info("chat_template copied successfully")
             # Merge additional special tokens if needed
-            extra = toks_it.special_tokens_map.get(
-                "additional_special_tokens", []
-            )
+            extra = toks_it.special_tokens_map.get("additional_special_tokens", [])
             if extra:
-                new_tokens = [
-                    t for t in extra if t not in tokenizer.get_vocab()
-                ]
+                new_tokens = [t for t in extra if t not in tokenizer.get_vocab()]
                 if new_tokens:
                     tokenizer.add_special_tokens(
                         {"additional_special_tokens": new_tokens}
                     )
                     policy_model.resize_token_embeddings(len(tokenizer))
-                    logging.info(
-                        "Added %d extra special tokens",
-                        len(new_tokens)
-                    )
+        except OSError as exc:
+            logging.error("Failed to copy -it tokenizer: %s", exc)
+            raise exc
         except Exception as exc:  # noqa: BLE001
             logging.warning("Failed to copy -it tokenizer: %s", exc)
 
     eot_token = (
         tokenizer.special_tokens_map.get(
-            "additional_special_tokens",
-            [tokenizer.eos_token]
-        )[1] if len(tokenizer.special_tokens_map.get(
-            "additional_special_tokens", []
-        )) > 1 else tokenizer.eos_token
+            "additional_special_tokens", [tokenizer.eos_token]
+        )[1]
+        if len(tokenizer.special_tokens_map.get("additional_special_tokens", [])) > 1
+        else tokenizer.eos_token
     )
 
     eot_token_id = tokenizer.convert_tokens_to_ids(eot_token)
 
-    if hasattr(policy_model.generation_config, 'eos_token_id'):
+    if hasattr(policy_model.generation_config, "eos_token_id"):
         if isinstance(policy_model.generation_config.eos_token_id, list):
             if eot_token_id not in policy_model.generation_config.eos_token_id:
-                policy_model.generation_config.eos_token_id.append(
-                    eot_token_id)
+                policy_model.generation_config.eos_token_id.append(eot_token_id)
         else:
             prev_eos = policy_model.generation_config.eos_token_id
-            policy_model.generation_config.eos_token_id = [
-                prev_eos, eot_token_id]
+            policy_model.generation_config.eos_token_id = [prev_eos, eot_token_id]
     else:
         policy_model.generation_config.eos_token_id = [
-            tokenizer.eos_token_id, eot_token_id]
+            tokenizer.eos_token_id,
+            eot_token_id,
+        ]
 
     # Log the configuration
     print(f"EOT token: '{eot_token}' (ID: {eot_token_id})")
@@ -1192,36 +1299,40 @@ def run_dpo(cfg, quant_cfg):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Sanity logs about device placement and memory state
-    try:
-        if torch.cuda.is_available():
-            dev = torch.cuda.current_device()
-            logging.info(
-                f"Policy first param device: {next(policy_model.parameters()).device}; Ref first param device: {next(ref_model.parameters()).device}; current_device={dev}"
-            )
-            mem = torch.cuda.memory_allocated()
-            rsv = torch.cuda.memory_reserved()
-            logging.info(
-                f"CUDA mem at start: allocated={mem/1e9:.2f} GB, reserved={rsv/1e9:.2f} GB")
-    except Exception:
-        pass
-
     # Load reference model
     logging.info("Loading reference model...")
     ref_model = AutoModelForCausalLM.from_pretrained(
         cfg.training.base_sft_merged_model.checkpoint_dir,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch_dtype,
         device_map=_device_map,  # match policy placement per process
         trust_remote_code=True,
         quantization_config=quant_cfg,
-        attn_implementation='sdpa'
+        attn_implementation=attn_impl,
     )
+    if device == "mps":
+        ref_model.to(device)
     # Avoid cache growth on the ref model as well
     try:
         ref_model.config.use_cache = False
     except Exception:
         pass
-    ref_model.generation_config.eos_token_id = policy_model.generation_config.eos_token_id
+
+    # Sanity logs about device placement and memory state
+
+    if torch.cuda.is_available():
+        dev = torch.cuda.current_device()
+        logging.info(
+            f"Policy first param device: {next(policy_model.parameters()).device}; Ref first param device: {next(ref_model.parameters()).device}; current_device={dev}"
+        )
+        mem = torch.cuda.memory_allocated()
+        rsv = torch.cuda.memory_reserved()
+        logging.info(
+            f"CUDA mem at start: allocated={mem / 1e9:.2f} GB, reserved={rsv / 1e9:.2f} GB"
+        )
+
+    ref_model.generation_config.eos_token_id = (
+        policy_model.generation_config.eos_token_id
+    )
 
     ref_model.eval()
     for p in ref_model.parameters():
@@ -1229,33 +1340,30 @@ def run_dpo(cfg, quant_cfg):
 
     if extra and new_tokens:
         ref_model.resize_token_embeddings(len(tokenizer))
-        logging.info(
-            "Added %d extra special tokens to ref model",
-            len(new_tokens)
-        )
+        logging.info("Added %d extra special tokens to ref model", len(new_tokens))
 
     if cfg.training.dpo_dataset.name == "hh-rlhf":
         train_dataset, eval_dataset = prepare_hh_rlhf_datasets(
             max_length=dpo_args.max_prompt_length,
-            tokenizer=tokenizer, max_prompt_length=dpo_args.max_prompt_length,
+            tokenizer=tokenizer,
+            max_prompt_length=dpo_args.max_prompt_length,
             max_completion_length=dpo_args.max_completion_length,
         )
-    elif cfg.training.dpo_dataset.name == 'civil_comments':
+    elif cfg.training.dpo_dataset.name == "civil_comments":
         train_dataset, eval_dataset = prepare_civil_comments_datasets(
             tokenizer=tokenizer,
             max_prompt_length=getattr(dpo_args, "max_prompt_length", 512),
-            max_completion_length=getattr(
-                dpo_args, "max_completion_length", 16),
+            max_completion_length=getattr(dpo_args, "max_completion_length", 16),
             train_size=getattr(cfg.training.dpo_dataset, "train_size", None),
             eval_size=getattr(cfg.training.dpo_dataset, "eval_size", 100),
-            label_field=getattr(cfg.training.dpo_dataset,
-                                "label_field", "toxicity"),
-            threshold=float(
-                getattr(cfg.training.dpo_dataset, "threshold", 0.5)),
+            label_field=getattr(cfg.training.dpo_dataset, "label_field", "toxicity"),
+            threshold=float(getattr(cfg.training.dpo_dataset, "threshold", 0.5)),
             approval_token=getattr(
-                cfg.training.dpo_dataset, "approval_token", "APPROVE"),
+                cfg.training.dpo_dataset, "approval_token", "APPROVE"
+            ),
             rejection_token=getattr(
-                cfg.training.dpo_dataset, "rejection_token", "REJECT"),
+                cfg.training.dpo_dataset, "rejection_token", "REJECT"
+            ),
         )
 
     else:
@@ -1265,9 +1373,7 @@ def run_dpo(cfg, quant_cfg):
 
     # Configure LoRA
     target_modules = list(experiment_args.lora.target_modules)
-    logging.info(
-        f"Target modules: {len(target_modules)} modules"
-    )
+    logging.info(f"Target modules: {len(target_modules)} modules")
 
     lora_config = LoraConfig(
         r=experiment_args.lora.r,
@@ -1289,8 +1395,7 @@ def run_dpo(cfg, quant_cfg):
                 if hasattr(lora_B, "weight"):
                     nn.init.normal_(lora_B.weight, mean=0.0, std=1e-3)
                     initialised += 1
-    logging.info(
-        f"Initialized {initialised} LoRA layers with normal distribution")
+    logging.info(f"Initialized {initialised} LoRA layers with normal distribution")
 
     # Inject TopK wrappers (aligned with SFT pattern)
     logging.info("🔥 Injecting TopKLoRALinearSTE wrappers...")
@@ -1307,8 +1412,11 @@ def run_dpo(cfg, quant_cfg):
     replaced = 0
     for name in targets:
         peft_layer = model.get_submodule(name)
-        parent = model.get_submodule(
-            ".".join(name.split(".")[:-1])) if "." in name else model
+        parent = (
+            model.get_submodule(".".join(name.split(".")[:-1]))
+            if "." in name
+            else model
+        )
         attr = name.split(".")[-1]
 
         wrapped = TopKLoRALinearSTE(
@@ -1322,16 +1430,16 @@ def run_dpo(cfg, quant_cfg):
             hard_eval=True,
             relu_latents=True,
             alpha_over_r=True,
-            temperature_final=getattr(
-                experiment_args.lora, 'temperature_final', None),
-            is_topk_experiment=experiment_args.lora.get(
-                'top_k_experiment', False),
+            temperature_final=getattr(experiment_args.lora, "temperature_final", None),
+            is_topk_experiment=experiment_args.lora.get("top_k_experiment", False),
         )
         # Ensure wrapper buffers land on the same device as the underlying layer
         try:
             target_device = next(peft_layer.parameters()).device
         except StopIteration:
-            if hasattr(peft_layer, "base_layer") and hasattr(peft_layer.base_layer, "weight"):
+            if hasattr(peft_layer, "base_layer") and hasattr(
+                peft_layer.base_layer, "weight"
+            ):
                 target_device = peft_layer.base_layer.weight.device
             else:
                 target_device = next(model.parameters()).device
@@ -1382,6 +1490,7 @@ def run_dpo(cfg, quant_cfg):
     # Save the full cfg as YAML for exact reproducibility (if OmegaConf available)
     try:
         from omegaconf import OmegaConf
+
         with open(os.path.join(output_dir, "cfg.yaml"), "w") as f:
             f.write(OmegaConf.to_yaml(cfg))
     except Exception as e:
@@ -1393,8 +1502,11 @@ def run_dpo(cfg, quant_cfg):
         os.makedirs(env_dir, exist_ok=True)
         # pip freeze
         try:
-            frz = subprocess.run([sys.executable, "-m", "pip", "freeze"],
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            frz = subprocess.run(
+                [sys.executable, "-m", "pip", "freeze"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
             with open(os.path.join(env_dir, "requirements_freeze.txt"), "wb") as f:
                 f.write(frz.stdout)
         except Exception:
@@ -1402,7 +1514,8 @@ def run_dpo(cfg, quant_cfg):
         # nvidia-smi
         try:
             smi = subprocess.run(
-                ["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                ["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
             with open(os.path.join(env_dir, "nvidia-smi.txt"), "wb") as f:
                 f.write(smi.stdout or smi.stderr)
         except Exception:
@@ -1414,10 +1527,10 @@ def run_dpo(cfg, quant_cfg):
     try:
         summary = []
         summary.append(f"model: {cfg.training.model.model_name}")
+        summary.append(f"base: {cfg.training.base_sft_merged_model.checkpoint_dir}")
         summary.append(
-            f"base: {cfg.training.base_sft_merged_model.checkpoint_dir}")
-        summary.append(
-            f"dataset: {cfg.training.dpo_dataset.name} (train={len(train_dataset)}, eval={len(eval_dataset)})")
+            f"dataset: {cfg.training.dpo_dataset.name} (train={len(train_dataset)}, eval={len(eval_dataset)})"
+        )
         summary.append(
             f"lora_topk: r={experiment_args.lora.r}, k={experiment_args.lora.k}, k_final={getattr(experiment_args.lora, 'k_final', experiment_args.lora.k)}, "
             f"alpha={getattr(experiment_args.lora, 'alpha', getattr(experiment_args.lora, 'lora_alpha', 16))}, temp={getattr(experiment_args.lora, 'temperature', 1.0)}"
@@ -1458,7 +1571,7 @@ def run_dpo(cfg, quant_cfg):
         save_strategy="steps",
         eval_steps=dpo_args.eval_steps,
         save_steps=dpo_args.save_steps,
-        bf16=True,
+        bf16=True if device == "cuda" else False,
         report_to=cfg.logger.report_to,
         run_name=cfg.experiment_name,
         remove_unused_columns=False,
@@ -1472,8 +1585,14 @@ def run_dpo(cfg, quant_cfg):
     # Persist training args for reproducibility
     try:
         with open(os.path.join(output_dir, "dpo_config.json"), "w") as f:
-            json.dump(dpo_config.to_dict() if hasattr(dpo_config, "to_dict")
-                      else dpo_config.__dict__, f, indent=2, default=str)
+            json.dump(
+                dpo_config.to_dict()
+                if hasattr(dpo_config, "to_dict")
+                else dpo_config.__dict__,
+                f,
+                indent=2,
+                default=str,
+            )
     except Exception as e:
         logging.warning(f"Failed to write dpo_config.json: {e}")
 
@@ -1500,22 +1619,21 @@ def run_dpo(cfg, quant_cfg):
                 tot += val
                 cnt += 1
             if cnt:
-                logging.info(
-                    f"[gradnorm] mean={tot/cnt:.4f} over {cnt} params")
+                logging.info(f"[gradnorm] mean={tot / cnt:.4f} over {cnt} params")
 
     # Regularization config (aligned with SFT pattern)
     reg_cfg = {
-        "log_every": 100,      # Reduced logging frequency for speed
-        "L_DECORR": 1e-4,      # decorrelate latents
-        "L_MASS": 1e-3,        # enforce soft mass ~= k
-        "L_ENTROPY": 0.0,      # encourage sharp gates (disabled by default)
-        "L_ORTHO_A": 1e-4,     # orthogonality on A (rows ~ latents)
-        "L_ORTHO_B": 1e-4,     # orthogonality on B (columns ~ latents)
+        "log_every": 100,  # Reduced logging frequency for speed
+        "L_DECORR": 1e-4,  # decorrelate latents
+        "L_MASS": 1e-3,  # enforce soft mass ~= k
+        "L_ENTROPY": 0.0,  # encourage sharp gates (disabled by default)
+        "L_ORTHO_A": 1e-4,  # orthogonality on A (rows ~ latents)
+        "L_ORTHO_B": 1e-4,  # orthogonality on B (columns ~ latents)
         # Reduced from 4 to 20 for better speed (only for z_plus_ortho mode)
         "ORTHO_EVERY": 20,
         # CRITICAL: Decorrelation is expensive (r×r matrix), only do every 10 steps
         "DECORR_EVERY": 10,
-        "MASS_EVERY": 2,       # Mass is cheap but still skip some steps
+        "MASS_EVERY": 2,  # Mass is cheap but still skip some steps
         "schedule_decorr": True,
         "schedule_mass": True,
         "schedule_ent": True,
@@ -1532,28 +1650,26 @@ def run_dpo(cfg, quant_cfg):
     ]
 
     # Add dead latent logging if enabled in config
-    if getattr(experiment_args.lora, 'log_dead_latents', False):
+    if getattr(experiment_args.lora, "log_dead_latents", False):
         from src.models import DeadLatentsLoggerCallback
+
         dead_latents_log_every = getattr(
-            experiment_args.lora, 'dead_latents_log_every', 500)
-        callbacks.append(DeadLatentsLoggerCallback(
-            log_every=dead_latents_log_every))
+            experiment_args.lora, "dead_latents_log_every", 500
+        )
+        callbacks.append(DeadLatentsLoggerCallback(log_every=dead_latents_log_every))
         logging.info(
-            f"📊 Added DeadLatentsLoggerCallback (log_every={dead_latents_log_every})")
+            f"📊 Added DeadLatentsLoggerCallback (log_every={dead_latents_log_every})"
+        )
 
     # Verify dataset format before passing to DPOTrainer
     logging.info("\n=== Dataset format going into DPOTrainer ===")
     logging.info(f"Columns: {train_dataset.column_names}")
-    logging.info(
-        f"First example type - chosen: {type(train_dataset[0]['chosen'])}")
-    logging.info(
-        f"First example type - rejected: {type(train_dataset[0]['rejected'])}")
-    if isinstance(train_dataset[0]['chosen'], list):
+    logging.info(f"First example type - chosen: {type(train_dataset[0]['chosen'])}")
+    logging.info(f"First example type - rejected: {type(train_dataset[0]['rejected'])}")
+    if isinstance(train_dataset[0]["chosen"], list):
         logging.info("Format: Message lists ✅")
-        logging.info(
-            f"Sample chosen messages: {train_dataset[0]['chosen'][:2]}")
-        logging.info(
-            f"Sample rejected messages: {train_dataset[0]['rejected'][:2]}")
+        logging.info(f"Sample chosen messages: {train_dataset[0]['chosen'][:2]}")
+        logging.info(f"Sample rejected messages: {train_dataset[0]['rejected'][:2]}")
     else:
         logging.info("Format: Text strings ⚠️")
         logging.info(f"Sample chosen: {train_dataset[0]['chosen'][:200]}")
@@ -1580,8 +1696,7 @@ def run_dpo(cfg, quant_cfg):
 
     # No unwrapping needed! TopKLoRALinearSTE.state_dict() handles transparency
     # The wrapper delegates to lora_module automatically during save_model()
-    logging.info(
-        "Saving model (TopK wrappers are transparent to PEFT save)...")
+    logging.info("Saving model (TopK wrappers are transparent to PEFT save)...")
 
     # Save final model
     final_path = os.path.join(output_dir, "final_adapter")
@@ -1595,14 +1710,13 @@ def run_dpo(cfg, quant_cfg):
 
     # Explicit adapter state dict (belt and suspenders approach from SFT)
     adapter_state_dict = get_peft_model_state_dict(
-        model,
-        state_dict=model.state_dict(),
-        adapter_name="default"
+        model, state_dict=model.state_dict(), adapter_name="default"
     )
     torch.save(adapter_state_dict, f"{final_path}/adapter_model.bin")
 
     # Save as safetensors (preferred format)
     from safetensors.torch import save_file, load_file
+
     save_file(adapter_state_dict, f"{final_path}/adapter_model.safetensors")
 
     logging.info(f"✅ Adapter saved to: {final_path}")
@@ -1617,16 +1731,16 @@ def run_dpo(cfg, quant_cfg):
     logging.info(f"Model saved to {final_path}")
 
     # Print final summary
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Training Complete!")
     print(f"Final model saved to: {final_path}")
     print("\nConfiguration summary:")
     print(
-        f"  - LoRA: r={experiment_args.lora.r}, k={experiment_args.lora.k} (sparsity={(1-experiment_args.lora.k/experiment_args.lora.r)*100:.1f}%)")
-    print(
-        f"  - Soft masking with temperature={experiment_args.lora.temperature}")
+        f"  - LoRA: r={experiment_args.lora.r}, k={experiment_args.lora.k} (sparsity={(1 - experiment_args.lora.k / experiment_args.lora.r) * 100:.1f}%)"
+    )
+    print(f"  - Soft masking with temperature={experiment_args.lora.temperature}")
     print(f"  - DPO beta={dpo_args.beta}, lr={dpo_args.learning_rate}")
-    print("="*60)
+    print("=" * 60)
     logging.info(f"Train dataset size: {len(train_dataset)}")
     logging.info(f"Eval dataset size: {len(eval_dataset)}")
     # print the name of the dataset
