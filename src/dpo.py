@@ -1249,7 +1249,8 @@ def run_dpo(cfg, quant_cfg):
         logging.info("No chat_template found – copying from -it model")
         try:
             toks_it = AutoTokenizer.from_pretrained(
-                cfg.training.base_sft_merged_model.model_it_name, use_fast=False
+                cfg.training.base_sft_merged_model.model_it_name,
+                use_fast=False,
             )
             if getattr(toks_it, "chat_template", None):
                 tokenizer.chat_template = toks_it.chat_template
@@ -1263,6 +1264,7 @@ def run_dpo(cfg, quant_cfg):
                         {"additional_special_tokens": new_tokens}
                     )
                     policy_model.resize_token_embeddings(len(tokenizer))
+                    logging.info("Added %d extra special tokens", len(new_tokens))
         except OSError as exc:
             logging.error("Failed to copy -it tokenizer: %s", exc)
             raise exc

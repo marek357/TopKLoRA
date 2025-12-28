@@ -52,28 +52,33 @@ class TopKLoRALinearSTE(nn.Module):
         temperature: float = 1.0,
         # "constant" | "linear" | "exp" | "cubic"
         temperature_schedule: str = "linear",
-        k_schedule: str = "constant",           # "constant" | "linear" | "exp" | "cubic"
+        k_schedule: str = "constant",  # "constant" | "linear" | "exp" | "cubic"
         # target k at progress=1
         k_final: Optional[int] = None,
-        hard_eval: bool = True,                 # use hard mask in eval
-        relu_latents: bool = True,              # force z >= 0
-        alpha_over_r: bool = True,              # scaling mode
+        hard_eval: bool = True,  # use hard mask in eval
+        relu_latents: bool = True,  # force z >= 0
+        alpha_over_r: bool = True,  # scaling mode
         # optional target temperature at progress=1
         temperature_final: Optional[float] = None,
-        is_topk_experiment: bool = False
+        is_topk_experiment: bool = False,
     ):
         super().__init__()
         self.lora_module = base
         self.base_layer = base.base_layer
-        adapter = base.active_adapter if isinstance(
-            base.active_adapter, str) else base.active_adapter[0]
+        adapter = (
+            base.active_adapter
+            if isinstance(base.active_adapter, str)
+            else base.active_adapter[0]
+        )
         self.is_topk_experiment = is_topk_experiment
 
         self.A_module = base.lora_A[adapter]
         self.B_module = base.lora_B[adapter]
-        self.dropout = (base.lora_dropout[adapter]
-                        if hasattr(base, "lora_dropout") and adapter in base.lora_dropout
-                        else nn.Identity())
+        self.dropout = (
+            base.lora_dropout[adapter]
+            if hasattr(base, "lora_dropout") and adapter in base.lora_dropout
+            else nn.Identity()
+        )
 
         self.r = int(base.r[adapter])
         self.alpha = float(base.lora_alpha[adapter])
@@ -81,13 +86,17 @@ class TopKLoRALinearSTE(nn.Module):
         self.k_final = int(k_final) if k_final is not None else int(k)
         self.k_schedule = k_schedule
         self.t0 = float(temperature)
-        self.t_final = float(
-            temperature_final) if temperature_final is not None else 0.1 * self.t0
+        self.t_final = (
+            float(temperature_final) if temperature_final is not None else 0.1 * self.t0
+        )
         self.temperature_schedule = temperature_schedule
         self.hard_eval = hard_eval
         self.relu_latents = relu_latents
         self.scale = (
-            self.alpha / self.r) if alpha_over_r else (self.alpha / max(self.k_init, 1))
+            (self.alpha / self.r)
+            if alpha_over_r
+            else (self.alpha / max(self.k_init, 1))
+        )
         self.layer_name = layer_name
         self.topk = TopKModule(k_final)
 
@@ -103,16 +112,14 @@ class TopKLoRALinearSTE(nn.Module):
         self._last_g_soft: Optional[torch.Tensor] = None
         self._last_ghard_mean: torch.Tensor = torch.tensor(0.0)
 
-    def state_dict(self, destination=None, prefix='', keep_vars=False):
+    def state_dict(self, destination=None, prefix="", keep_vars=False):
         """
         Override to delegate to the wrapped lora_module's state_dict.
         This makes the wrapper transparent to PEFT saving.
         """
         # Get the lora_module's state dict
         lora_state = self.lora_module.state_dict(
-            destination=destination,
-            prefix=prefix,
-            keep_vars=keep_vars
+            destination=destination, prefix=prefix, keep_vars=keep_vars
         )
 
         # Also include our own buffers (progress, etc)
@@ -132,7 +139,7 @@ class TopKLoRALinearSTE(nn.Module):
         lora_state = {}
 
         for k, v in state_dict.items():
-            if k in ['progress', 'last_frac_grad_nonzero']:
+            if k in ["progress", "last_frac_grad_nonzero"]:
                 our_buffers[k] = v
             else:
                 lora_state[k] = v
@@ -142,8 +149,11 @@ class TopKLoRALinearSTE(nn.Module):
             self.lora_module.load_state_dict(lora_state, strict=strict)
 
             # Update our references to A and B modules
-            adapter = self.lora_module.active_adapter if isinstance(
-                self.lora_module.active_adapter, str) else self.lora_module.active_adapter[0]
+            adapter = (
+                self.lora_module.active_adapter
+                if isinstance(self.lora_module.active_adapter, str)
+                else self.lora_module.active_adapter[0]
+            )
             self.A_module = self.lora_module.lora_A[adapter]
             self.B_module = self.lora_module.lora_B[adapter]
 
@@ -164,21 +174,28 @@ class TopKLoRALinearSTE(nn.Module):
         # Save lora_module's parameters
         for name, param in self.lora_module.named_parameters():
             if param is not None:
-                destination[prefix +
-                            name] = param if keep_vars else param.detach()
+                destination[prefix + name] = param if keep_vars else param.detach()
 
         # Save our buffers
         for name, buf in self.named_buffers(recurse=False):
             if buf is not None:
                 destination[prefix + name] = buf if keep_vars else buf.detach()
 
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
-                              missing_keys, unexpected_keys, error_msgs):
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
         """
         Hook called by PyTorch during load_state_dict.
         """
         # Load our buffers
-        for name in ['progress', 'last_frac_grad_nonzero']:
+        for name in ["progress", "last_frac_grad_nonzero"]:
             key = prefix + name
             if key in state_dict:
                 setattr(self, name, state_dict[key])
@@ -189,8 +206,13 @@ class TopKLoRALinearSTE(nn.Module):
         # Delegate lora weights to the lora_module
         lora_prefix = prefix  # Keep same prefix for transparency
         self.lora_module._load_from_state_dict(
-            state_dict, lora_prefix, local_metadata, strict,
-            missing_keys, unexpected_keys, error_msgs
+            state_dict,
+            lora_prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
         )
 
     # -------- Progress control --------
@@ -208,18 +230,21 @@ class TopKLoRALinearSTE(nn.Module):
     def _tau(self):
         p = self._progress_scalar
         # If constant or already at target, keep t0
-        if self.temperature_schedule == "constant" or abs(self.t0 - self.t_final) < 1e-12:
+        if (
+            self.temperature_schedule == "constant"
+            or abs(self.t0 - self.t_final) < 1e-12
+        ):
             return self.t0
         if self.temperature_schedule == "linear":
             # linear interpolation from t0 to t_final
             return float(self.t0 + (self.t_final - self.t0) * p)
         if self.temperature_schedule == "cubic":
             # cubic interpolation, slower start, faster end
-            return float(self.t0 + (self.t_final - self.t0) * (p ** 3))
+            return float(self.t0 + (self.t_final - self.t0) * (p**3))
         if self.temperature_schedule == "exp":
             # geometric interpolation (monotonic)
             ratio = max(self.t_final, 1e-12) / max(self.t0, 1e-12)
-            return float(self.t0 * (ratio ** p))
+            return float(self.t0 * (ratio**p))
         return self.t0
 
     def _current_k(self):
@@ -231,7 +256,7 @@ class TopKLoRALinearSTE(nn.Module):
         if self.k_schedule == "linear":
             return int(round(self.k_init + (self.k_final - self.k_init) * warm))
         if self.k_schedule == "cubic":
-            return int(round(self.k_init + (self.k_final - self.k_init) * (warm ** 3)))
+            return int(round(self.k_init + (self.k_final - self.k_init) * (warm**3)))
         if self.k_schedule == "exp":
             ratio = (self.k_final / max(self.k_init, 1)) ** warm
             return int(round(self.k_init * ratio))
@@ -242,8 +267,8 @@ class TopKLoRALinearSTE(nn.Module):
         A = self.A_module.weight
         B = self.B_module.weight
 
-        out = self.base_layer(x)        # base path
-        x_lora = self.dropout(x)        # dropout only on LoRA
+        out = self.base_layer(x)  # base path
+        x_lora = self.dropout(x)  # dropout only on LoRA
 
         z_pre = F.linear(x_lora, A)
 
@@ -258,7 +283,7 @@ class TopKLoRALinearSTE(nn.Module):
 
         # keep both: live for regs, detached for callbacks
         # self._z_live = z                         # may carry graph
-        self._last_z = z.detach()                # safe for logging
+        self._last_z = z.detach()  # safe for logging
 
         tau = self._tau()
         k_now = self._current_k()
@@ -294,7 +319,8 @@ class TopKLoRALinearSTE(nn.Module):
         r = self.r
         frac_active = float(self._last_ghard_mean) / max(k / r, 1e-8)
         return {
-            "k": k, "r": r,
+            "k": k,
+            "r": r,
             "tau": self._tau(),
             "frac_active_vs_target": frac_active,
         }
@@ -347,7 +373,7 @@ class DeadLatentsLoggerCallback(TrainerCallback):
             if isinstance(module, TopKLoRALinearSTE):
                 self.stats[name] = {
                     "counts": torch.zeros(module.r, dtype=torch.long),
-                    "total": 0
+                    "total": 0,
                 }
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
@@ -356,7 +382,9 @@ class DeadLatentsLoggerCallback(TrainerCallback):
 
         # Track activations for each TopK module
         for name, module in model.named_modules():
-            if isinstance(module, TopKLoRALinearSTE) and hasattr(module, "_last_g_soft"):
+            if isinstance(module, TopKLoRALinearSTE) and hasattr(
+                module, "_last_g_soft"
+            ):
                 g_soft = module._last_g_soft  # [B, T, r]
                 # Mean gate activation per latent
                 mean_act = g_soft.mean(dim=(0, 1))
@@ -365,7 +393,11 @@ class DeadLatentsLoggerCallback(TrainerCallback):
                 self.stats[name]["total"] += 1
 
         # Periodic logging
-        if state.global_step % self.log_every == 0 and args.report_to and "wandb" in args.report_to:
+        if (
+            state.global_step % self.log_every == 0
+            and args.report_to
+            and "wandb" in args.report_to
+        ):
             log_dict = {}
             total_dead_all = 0
             total_latents_all = 0
@@ -386,8 +418,7 @@ class DeadLatentsLoggerCallback(TrainerCallback):
 
             if total_latents_all > 0:
                 log_dict["dead_latents/total_count"] = total_dead_all
-                log_dict["dead_latents/total_pct"] = 100.0 * \
-                    total_dead_all / total_latents_all
+                log_dict["dead_latents/total_pct"] = (
+                    100.0 * total_dead_all / total_latents_all
+                )
             wandb.log(log_dict, step=state.global_step)
-
-
