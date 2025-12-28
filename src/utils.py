@@ -5,154 +5,18 @@ from datasets import Dataset as HFDataset, concatenate_datasets, load_dataset
 from typing import List, Dict, Tuple
 import heapq
 from peft import PeftModel
-from datasets import load_dataset, load_from_disk
-from trl import apply_chat_template
 from openai import OpenAI
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig
-)
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from tqdm import tqdm
-from typing import Dict, Any, List, Mapping, Optional, Tuple
+from typing import Any, Mapping, Optional
 import hashlib
 import pickle
 import re
 import random
+
 # --- UltraChat token streaming utilities for TopKLoRA autointerp ---
 import os
 import torch
-from typing import Tuple
-
-
-def ultrachat_to_flat_tokens(
-    tokenizer,
-    splits=("train_sft",),
-    add_eos_between=True,
-    eos_id=None,
-    num_proc=None,
-    render_batch_size=256,
-    encode_batch_size=1024,
-    token_budget=None,  # int or None
-):
-    """
-    Returns a 1-D torch.LongTensor of token ids from UltraChat, normalized and rendered with chat template.
-    """
-    if eos_id is None:
-        eos_id = tokenizer.eos_token_id
-    from src.utils import load_ultrachat, normalize_ultrachat_messages
-    ds = load_ultrachat()
-
-    def render_batch(batch):
-        texts = []
-        for msgs in batch["messages"]:
-            fixed, need_gen = normalize_ultrachat_messages(msgs)
-            txt = tokenizer.apply_chat_template(
-                fixed,
-                tokenize=False,
-                add_generation_prompt=need_gen
-            )
-            texts.append(txt)
-        return {"text": texts}
-
-    ds = ds.remove_columns([c for c in ds.column_names if c != "messages"])
-    ds = ds.map(
-        render_batch,
-        batched=True,
-        batch_size=render_batch_batch_size if render_batch_size is None else render_batch_size,
-        num_proc=(num_proc or os.cpu_count() or 4),
-        desc="Render chat templates",
-    )
-    texts = ds["text"]
-
-    pieces = []
-    total = 0
-    for i in range(0, len(texts), encode_batch_size):
-        chunk = texts[i:i + encode_batch_size]
-        enc = tokenizer(
-            chunk,
-            add_special_tokens=False,
-            return_attention_mask=False,
-            padding=False,
-            truncation=False,
-            return_tensors=None,
-        )["input_ids"]
-
-        for ids in enc:
-            if add_eos_between and eos_id is not None:
-                ids = ids + [eos_id]
-            t = torch.tensor(ids, dtype=torch.long)
-            if token_budget is None:
-                pieces.append(t)
-            else:
-                if total >= token_budget:
-                    break
-                need = token_budget - total
-                if t.numel() <= need:
-                    pieces.append(t)
-                    total += t.numel()
-                else:
-                    pieces.append(t[:need])
-                    total += need
-                    break
-        if token_budget is not None and total >= token_budget:
-            break
-
-    if not pieces:
-        return torch.empty(0, dtype=torch.long)
-
-    return torch.cat(pieces, dim=0)
-
-
-def pack_1d_stream(tokens_1d: torch.Tensor, seq_len: int) -> torch.Tensor:
-    usable = (tokens_1d.numel() // seq_len) * seq_len
-    if usable == 0:
-        raise ValueError("Not enough tokens to form a single window.")
-    return tokens_1d.narrow(0, 0, usable).view(-1, seq_len)
-
-
-def get_conversational_dataset(dataset_name, tokenizer):
-    dataset = load_dataset(dataset_name)
-
-    if dataset_name == 'xlangai/spider':
-        return get_spider_dataset(dataset_name, tokenizer)
-
-    train, test = dataset['train'], dataset['test']
-
-    train_dataset = train.map(
-        apply_chat_template, fn_kwargs={'tokenizer': tokenizer}
-    )
-    test_dataset = test.map(
-        apply_chat_template, fn_kwargs={'tokenizer': tokenizer}
-    )
-
-    return train_dataset, test_dataset
-
-
-def get_spider_dataset(dataset_name, tokenizer):
-    # source: https://medium.com/%40shekhars271991/finetuning-llama-3-2-eef3114b5f6c
-    def format_entries(entry):
-        # Format conversations as list of dictionaries with alternating user/assistant messages
-        conversations = [
-            [
-                {"role": "user", "content": question},
-                {"role": "assistant", "content": query}
-            ]
-            for question, query in zip(entry["question"], entry["query"])
-        ]
-        # Apply chat template to each conversation
-        texts = [
-            tokenizer.apply_chat_template(
-                convo, tokenize=False, add_generation_prompt=False)
-            for convo in conversations
-        ]
-        return {"text": texts}
-
-    train = load_dataset(dataset_name, split='train')
-    test = load_dataset(dataset_name, split='validation[:10%]')
-    train_dataset = train.map(format_entries, batched=True)
-    test_dataset = test.map(format_entries, batched=True)
-    return train_dataset, test_dataset
 
 
 def merge_lora_adapter(
