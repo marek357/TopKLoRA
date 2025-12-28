@@ -35,12 +35,12 @@ def merge_lora_adapter(
 
     Args:
         base_model_dir (str): Path to the directory containing the base model files.
-        lora_checkpoint_dir (str): Path to the directory containing LoRA adapter files 
+        lora_checkpoint_dir (str): Path to the directory containing LoRA adapter files
                                    (e.g., adapter_config.json, lora_adapters.pt).
         merged_output_dir (str): Path to the directory where the merged model will be saved.
         tokenizer_dir (str, optional): Path to the directory from which to load the tokenizer.
                                        If None, defaults to `base_model_dir`.
-        torch_dtype (str or torch.dtype, optional): Data type to load the model with. 
+        torch_dtype (str or torch.dtype, optional): Data type to load the model with.
                                                    Defaults to 'auto'.
         device_map (str or dict, optional): Device map for loading the model. Defaults to 'auto'.
 
@@ -65,9 +65,7 @@ def merge_lora_adapter(
 
     # 3. Load the LoRA adapter on top of the base model
     model_with_lora = PeftModel.from_pretrained(
-        base_model,
-        lora_checkpoint_dir,
-        use_safetensors=True
+        base_model, lora_checkpoint_dir, use_safetensors=True
     )
 
     # 4. Merge LoRA weights into the base model
@@ -75,18 +73,19 @@ def merge_lora_adapter(
 
     if save_merged_model:
         # 5. Save the merged model and tokenizer
-        assert merged_output_dir is not None, 'Cannot save merged model without providing output dir'
+        assert merged_output_dir is not None, (
+            "Cannot save merged model without providing output dir"
+        )
         merged_model.save_pretrained(merged_output_dir)
         tokenizer.save_pretrained(merged_output_dir)
 
         print(f"Merged model saved to: {merged_output_dir}")
 
         # saving and loading the same model removes peft-related attributes
-        merged_model = AutoModelForCausalLM.from_pretrained(
-            merged_output_dir
-        )
+        merged_model = AutoModelForCausalLM.from_pretrained(merged_output_dir)
 
     return merged_model
+
 
 # -----------------------------------------------------------------------------
 # Pre‑processing
@@ -133,6 +132,7 @@ def preprocess_to_messages(example: Dict[str, Any]) -> Dict[str, Any]:  # noqa: 
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def violates_alternation(msgs: List[Dict[str, str]]) -> bool:
     """
     True  → conversation breaks the template rule
@@ -141,7 +141,7 @@ def violates_alternation(msgs: List[Dict[str, str]]) -> bool:
     • first turn must be 'user' or 'system'
     • thereafter roles must strictly alternate user↔assistant
     """
-    if not msgs:                                      # empty conversation
+    if not msgs:  # empty conversation
         return True
 
     # ── first speaker
@@ -150,7 +150,7 @@ def violates_alternation(msgs: List[Dict[str, str]]) -> bool:
 
     # ── alternation check
     for prev, curr in zip(msgs, msgs[1:]):
-        if prev["role"] == curr["role"]:              # same role twice
+        if prev["role"] == curr["role"]:  # same role twice
             return True
         # user/system must be followed by assistant, and vice‑versa
         if prev["role"] in {"user", "system"} and curr["role"] != "assistant":
@@ -165,7 +165,7 @@ def is_valid_dpo_pair(msgs):
     """True → OK for DPO; False → drop."""
     if len(msgs) < 2:
         return False
-    if msgs[-1]["role"] != "assistant":   # must end with assistant answer
+    if msgs[-1]["role"] != "assistant":  # must end with assistant answer
         return False
     return True
 
@@ -193,7 +193,7 @@ def hh_string_to_messages(text: str) -> List[Dict[str, str]]:
 def hh_rlhf_preprocess_to_messages(example: Dict[str, Any]) -> Dict[str, Any]:
     """Map HH‑RLHF record → {'chosen': [...], 'rejected': [...]} chat lists."""
     return {
-        "chosen":   hh_string_to_messages(example["chosen"]),
+        "chosen": hh_string_to_messages(example["chosen"]),
         "rejected": hh_string_to_messages(example["rejected"]),
     }
 
@@ -205,9 +205,7 @@ def build_quant_config(cfg: Dict[str, Any]) -> BitsAndBytesConfig:
         return BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type=cfg.bnb_4bit_quant_type,
-            bnb_4bit_compute_dtype=getattr(
-                torch, cfg.compute_dtype
-            ),
+            bnb_4bit_compute_dtype=getattr(torch, cfg.compute_dtype),
         )
     if qtype == "8bit":
         return BitsAndBytesConfig(
@@ -223,9 +221,10 @@ Autointerp eval helper functions
 
 
 def autointerp_make_topk_hook(
-    module_name: str, cfg,
+    module_name: str,
+    cfg,
     topk_store: Dict[str, Dict[int, Dict[str, List[Tuple[float, int, int, float]]]]],
-    current_vals
+    current_vals,
 ):
     """
     Build a forward hook for a PEFT lora.Linear layer that
@@ -233,12 +232,13 @@ def autointerp_make_topk_hook(
       • optionally selects the Top-AX_TOPK neurons (|h|) per token
       • stores top-k_heap examples per (layer, neuron, sign) in `topk_store`.
     """
+
     def _hook(module, inp, _):
         # print('hook')
         # global: dataset row index of batch[0]
-        ex_offset = current_vals['current_ex_offset']
+        ex_offset = current_vals["current_ex_offset"]
         # (B, L) bool, True = real token
-        mask = current_vals['current_pad_mask']
+        mask = current_vals["current_pad_mask"]
 
         # ---------- resolve which adapter key to use ----------------------
         adapter = module.active_adapter or next(iter(module.lora_A))
@@ -246,9 +246,9 @@ def autointerp_make_topk_hook(
             adapter = adapter[0]
 
         # ---------- compute A·x -------------------------------------------
-        x = inp[0]                        # (B, L, D_hidden)
-        h = module.lora_A[adapter](x)     # (B, L, r)
-        if h.ndim == 2:                   # some PEFT ops flatten B·L
+        x = inp[0]  # (B, L, D_hidden)
+        h = module.lora_A[adapter](x)  # (B, L, r)
+        if h.ndim == 2:  # some PEFT ops flatten B·L
             B, L = x.shape[:2]
             h = h.view(B, L, -1)
 
@@ -264,7 +264,7 @@ def autointerp_make_topk_hook(
 
             for pos in range(L):
                 if not mask[b, pos]:
-                    continue   # skip padding
+                    continue  # skip padding
                 # TODO: study critical error here
                 # NOTE: this error is caused by
                 #       setting pad_left and truncate_left
@@ -275,16 +275,20 @@ def autointerp_make_topk_hook(
                 #       the underlying logic
                 # true_pos = pos
 
-                act_vec = h[b, pos]                      # (R,)
+                act_vec = h[b, pos]  # (R,)
 
                 # --- select which neuron indices to store ----------------
-                if cfg.evals.auto_interp.ax_topk is None or \
-                        cfg.evals.auto_interp.ax_topk >= R:
-                    store_idx = range(R)                  # keep all
+                if (
+                    cfg.evals.auto_interp.ax_topk is None
+                    or cfg.evals.auto_interp.ax_topk >= R
+                ):
+                    store_idx = range(R)  # keep all
                 else:
-                    store_idx = act_vec.abs().topk(
-                        cfg.evals.auto_interp.ax_topk
-                    ).indices.tolist()
+                    store_idx = (
+                        act_vec.abs()
+                        .topk(cfg.evals.auto_interp.ax_topk)
+                        .indices.tolist()
+                    )
 
                 for n_idx in store_idx:
                     raw_val = act_vec[n_idx].item()
@@ -308,7 +312,7 @@ def autointerp_make_topk_hook(
 def autointerp_hh_string_to_messages(text: str) -> List[Dict[str, str]]:
     parts, msgs = _TAG_RE.split(text), []
     for i in range(1, len(parts), 2):
-        role, content = parts[i].strip(), parts[i+1].strip()
+        role, content = parts[i].strip(), parts[i + 1].strip()
         if content:
             msgs.append({"role": _ROLE_MAP[role], "content": content})
     return msgs
@@ -316,7 +320,7 @@ def autointerp_hh_string_to_messages(text: str) -> List[Dict[str, str]]:
 
 def autointerp_preprocess_to_messages(ex: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "chosen":   hh_string_to_messages(ex["chosen"]),
+        "chosen": hh_string_to_messages(ex["chosen"]),
         "rejected": hh_string_to_messages(ex["rejected"]),
     }
 
@@ -352,15 +356,15 @@ class AutointerpChatCollator:
         ids = self.tokenizer.apply_chat_template(
             dialogs,
             add_generation_prompt=False,
-            padding=True,            # pad to longest in *this* batch
-            return_tensors="pt"
+            padding=True,  # pad to longest in *this* batch
+            return_tensors="pt",
         )
 
-        mask = (ids != self.tokenizer.pad_token_id).long()   # (B, L)
+        mask = (ids != self.tokenizer.pad_token_id).long()  # (B, L)
 
         return {
-            "input_ids":      ids.to(self.device),
-            "attention_mask": mask.to(self.device)
+            "input_ids": ids.to(self.device),
+            "attention_mask": mask.to(self.device),
         }
 
 
@@ -374,9 +378,7 @@ def autointerp_collapse_heaps(topk_store):
         n_out = {}
         for n_idx, heaps in n_map.items():
             combined = sorted(
-                heaps["pos"] + heaps["neg"],
-                key=lambda t: t[0],
-                reverse=True
+                heaps["pos"] + heaps["neg"], key=lambda t: t[0], reverse=True
             )
             n_out[n_idx] = {
                 rank + 1: (ex, pos, raw)
@@ -387,10 +389,7 @@ def autointerp_collapse_heaps(topk_store):
 
 
 def autointerp_extract_windows_from_dataset(
-    topk_map: Dict[int, Tuple[int, int]],
-    dataset: Any,
-    tokenizer,
-    window: int = 7
+    topk_map: Dict[int, Tuple[int, int]], dataset: Any, tokenizer, window: int = 7
 ) -> Dict[int, str]:
     """
     Return a dict mapping rank → context snippet, where the target token
@@ -404,7 +403,7 @@ def autointerp_extract_windows_from_dataset(
             dataset[ex_idx]["input"],
             add_generation_prompt=False,
             padding=False,
-            return_tensors="pt"
+            return_tensors="pt",
         )[0]  # shape (L,)
 
         # Determine window slice
@@ -414,8 +413,7 @@ def autointerp_extract_windows_from_dataset(
 
         # Decode one token at a time to preserve alignment
         toks = [
-            tokenizer.decode([tid], skip_special_tokens=False)
-            for tid in snippet_ids
+            tokenizer.decode([tid], skip_special_tokens=False) for tid in snippet_ids
         ]
 
         # Wrap the center token
@@ -434,13 +432,13 @@ def autointerp_build_activation_prompt(
     windows_dict: Dict[int, Dict[str, str]],
     topk_map: Mapping[int, Tuple[int, int]],
     *,
-    newline: str = "\n",            # "\n" for plain text, "<br>" for Markdown
+    newline: str = "\n",  # "\n" for plain text, "<br>" for Markdown
     context_newline: bool = False,  # convert "⏎" back to real newlines?
 ) -> str:
     """
     Build a prompt like
 
-        Example 1: … token …  
+        Example 1: … token …
         Activations: ("token", 42)
 
     Parameters
@@ -466,7 +464,7 @@ def autointerp_build_activation_prompt(
         block = (
             f"Example {rank}:{newline}"
             f"{context}{newline}"
-            f"Activations: (\"{token.strip()}\", {val})"
+            f'Activations: ("{token.strip()}", {val})'
         )
         blocks.append(block)
 
@@ -515,13 +513,10 @@ def autointerp_token_windows_dict(
         ids_slice = ids[start:end].tolist()
 
         # Decode one token at a time to keep byte-level alignment
-        toks = [
-            tokenizer.decode([tid], skip_special_tokens=False)
-            for tid in ids_slice
-        ]
+        toks = [tokenizer.decode([tid], skip_special_tokens=False) for tid in ids_slice]
 
-        center = tok_pos - start          # position of the “hot” token
-        token_text = toks[center]         # raw decoded token
+        center = tok_pos - start  # position of the “hot” token
+        token_text = toks[center]  # raw decoded token
 
         # Wrap the center token in << ... >>
         toks[center] = f"<<{toks[center]}>>"
@@ -661,8 +656,7 @@ def autointerp_extract_interpretation(response_text: str) -> Optional[str]:
 
     Returns the interpretation string (stripped), or None if no match is found.
     """
-    match = re.search(r"\[interpretation\]\s*:\s*(.+)",
-                      response_text, re.IGNORECASE)
+    match = re.search(r"\[interpretation\]\s*:\s*(.+)", response_text, re.IGNORECASE)
     if match:
         return match.group(1).strip()
     return None
@@ -700,22 +694,17 @@ def autointerp_build_lora_json_with_responses(
 
     results: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
-    for adapter, neuron_maps in tqdm(
-        adapters_pos_map.items(), desc="Adapters"
-    ):
+    for adapter, neuron_maps in tqdm(adapters_pos_map.items(), desc="Adapters"):
         adapter_block: Dict[str, Dict[str, Any]] = {}
         for n_idx, pos_map in tqdm(
-            neuron_maps.items(),
-            desc=f"  {adapter}", leave=False
+            neuron_maps.items(), desc=f"  {adapter}", leave=False
         ):
             # 1) build example windows (each entry also has a "value" field)
 
             pos_map = {int(key): val for key, val in pos_map.items()}
 
             windows_dict = autointerp_token_windows_dict(
-                pos_map, dataset, tokenizer,
-                window=window,
-                topk=40
+                pos_map, dataset, tokenizer, window=window, topk=40
             )
 
             # 2) craft user prompt
@@ -733,8 +722,7 @@ def autointerp_build_lora_json_with_responses(
                 temperature=temperature,
             )
             answer_text = response.output_text
-            interpretation = autointerp_extract_interpretation(
-                answer_text) or "N/A"
+            interpretation = autointerp_extract_interpretation(answer_text) or "N/A"
 
             # 4) collect the top‐k contexts *and* their activation values
             ranks = sorted(windows_dict)
@@ -742,9 +730,9 @@ def autointerp_build_lora_json_with_responses(
             topk_values = [windows_dict[r]["value"] for r in ranks]
 
             adapter_block[str(n_idx)] = {
-                "interpretation":  interpretation,
+                "interpretation": interpretation,
                 "top_activations": topk_snippets,
-                "values":          topk_values,
+                "values": topk_values,
             }
 
         results[adapter] = adapter_block
@@ -772,7 +760,7 @@ def autointerp_build_lora_json_with_responses_local(
     temperature: float = 0.0,
     max_new_tokens: int = 512,
     device: str = "cuda",
-    outfile: str = "temp/lora_neuron_info_local.json"
+    outfile: str = "temp/lora_neuron_info_local.json",
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """
     Same as before, but uses a local HF‐style model.generate instead of OpenAI’s API.
@@ -780,14 +768,13 @@ def autointerp_build_lora_json_with_responses_local(
 
     # 1) load model & tokenizer (once)
     if isinstance(tokenizer_name_or_obj, str):
-        tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_name_or_obj, use_fast=True)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_obj, use_fast=True)
     else:
         tokenizer = tokenizer_name_or_obj
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        device_map="auto",      # or model.to(device)
+        device_map="auto",  # or model.to(device)
         torch_dtype=torch.float16,  # if your GPU supports it
         # low_cpu_mem_usage=True,
         # trust_remote_code=True,     # if the repo needs it
@@ -803,7 +790,9 @@ def autointerp_build_lora_json_with_responses_local(
 
     for adapter, neuron_maps in tqdm(adapters_pos_map.items(), desc="Adapters"):
         adapter_block: Dict[str, Dict[str, Any]] = {}
-        for n_idx, pos_map in tqdm(neuron_maps.items(), desc=f"  {adapter}", leave=False):
+        for n_idx, pos_map in tqdm(
+            neuron_maps.items(), desc=f"  {adapter}", leave=False
+        ):
             pos_map = {int(k): v for k, v in pos_map.items()}
             windows_dict = autointerp_token_windows_dict(
                 pos_map, dataset, tokenizer, window=window, topk=40
@@ -823,7 +812,7 @@ def autointerp_build_lora_json_with_responses_local(
                 full_input,
                 return_tensors="pt",
                 truncation=True,
-                max_length=4096,     # adjust to your model’s context window
+                max_length=4096,  # adjust to your model’s context window
             ).to(model.device)
 
             with torch.no_grad():
@@ -838,20 +827,19 @@ def autointerp_build_lora_json_with_responses_local(
                 )
 
             # 4) Decode just the **new** tokens
-            generated = generation_output[0][inputs["input_ids"].shape[-1]:]
+            generated = generation_output[0][inputs["input_ids"].shape[-1] :]
             answer_text = tokenizer.decode(generated, skip_special_tokens=True)
 
-            interpretation = autointerp_extract_interpretation(
-                answer_text) or "N/A"
+            interpretation = autointerp_extract_interpretation(answer_text) or "N/A"
 
             ranks = sorted(windows_dict)
             topk_snippets = [windows_dict[r]["context"] for r in ranks]
             topk_values = [windows_dict[r]["value"] for r in ranks]
 
             adapter_block[str(n_idx)] = {
-                "interpretation":  interpretation,
+                "interpretation": interpretation,
                 "top_activations": topk_snippets,
-                "values":          topk_values,
+                "values": topk_values,
             }
 
         results[adapter] = adapter_block
@@ -861,7 +849,8 @@ def autointerp_build_lora_json_with_responses_local(
         json.dump(results, f, indent=2, ensure_ascii=False)
 
     print(
-        f"✓ Saved {outfile}  ({len(results)} adapters × {len(next(iter(results.values())))} neurons)")
+        f"✓ Saved {outfile}  ({len(results)} adapters × {len(next(iter(results.values())))} neurons)"
+    )
     return results
 
 
@@ -871,7 +860,8 @@ TOKENIZER_CACHE: Dict[str, Any] = {}
 def autointerp_tok(model):
     if model not in TOKENIZER_CACHE:
         TOKENIZER_CACHE[model] = AutoTokenizer.from_pretrained(
-            model, trust_remote_code=True)
+            model, trust_remote_code=True
+        )
     return TOKENIZER_CACHE[model]
 
 
@@ -881,7 +871,7 @@ def autointerp_token_window(dataset, tokenizer, ex_idx: int, pos: int, window: i
         dataset[ex_idx]["input"],
         add_generation_prompt=False,
         padding=False,
-        return_tensors="pt"
+        return_tensors="pt",
     )[0]
     seq_len = ids.size(0)
 
@@ -891,8 +881,7 @@ def autointerp_token_window(dataset, tokenizer, ex_idx: int, pos: int, window: i
 
     s = max(0, pos - window)
     e = min(seq_len, pos + window + 1)
-    toks = [tokenizer.decode([tid], skip_special_tokens=False)
-            for tid in ids[s:e]]
+    toks = [tokenizer.decode([tid], skip_special_tokens=False) for tid in ids[s:e]]
 
     center_idx = pos - s
     if 0 <= center_idx < len(toks):
@@ -906,7 +895,7 @@ def autointerp_token_window(dataset, tokenizer, ex_idx: int, pos: int, window: i
 def autointerp_ctx_lorainfo(layer, nid, rank, lora_info, model, tok_id: Optional[int]):
     tops = lora_info.get(layer, {}).get(nid, {}).get("top_activations", [])
     if 0 < rank <= len(tops):
-        return tops[rank-1].replace("<<", "").replace(">>", "").strip()
+        return tops[rank - 1].replace("<<", "").replace(">>", "").strip()
     if tok_id is not None:
         return autointerp_tok(model).decode([tok_id]).strip()
     return "[UNK]"
@@ -916,14 +905,24 @@ def autointerp_clean(s):
     return re.sub(r"\s+", " ", re.sub(r"<<\s*|\s*>>", "", s)).strip()
 
 
-def autointerp_build_dataset(act_dict, lora_info, examples, model, window=7, k_skip=40,
-                             n_examples=10, n_neg=4, seed=42):
+def autointerp_build_dataset(
+    act_dict,
+    lora_info,
+    examples,
+    model,
+    window=7,
+    k_skip=40,
+    n_examples=10,
+    n_neg=4,
+    seed=42,
+):
     random.seed(seed)
     tok = autointerp_tok(model)
 
     # Build: (layer,nid) -> rows[(tid?,pos,val,rank,ex_idx)]
-    rows_by_neuron: Dict[Tuple[str, str],
-                         List[Tuple[Optional[int], int, float, int, int]]] = {}
+    rows_by_neuron: Dict[
+        Tuple[str, str], List[Tuple[Optional[int], int, float, int, int]]
+    ] = {}
     for layer, ns in act_dict.items():
         for nid, acts in ns.items():
             rows = []
@@ -966,7 +965,8 @@ def autointerp_build_dataset(act_dict, lora_info, examples, model, window=7, k_s
                     continue
 
                 ntid, npos, _nval, nrank, nex = random.choice(
-                    rows_by_neuron[(nl, nn)][:k_skip])
+                    rows_by_neuron[(nl, nn)][:k_skip]
+                )
                 if npos in pos_positions:
                     continue
 
@@ -987,15 +987,17 @@ def autointerp_build_dataset(act_dict, lora_info, examples, model, window=7, k_s
             sents = negs + [pos_ctx]
             random.shuffle(sents)
 
-            dataset.append({
-                "layer": layer,
-                "neuron": nid,
-                "sentences": sents,
-                "answer": sents.index(pos_ctx) + 1,  # 1-based index
-                "interpretation": lora_info[layer][str(nid)]["interpretation"],
-            })
+            dataset.append(
+                {
+                    "layer": layer,
+                    "neuron": nid,
+                    "sentences": sents,
+                    "answer": sents.index(pos_ctx) + 1,  # 1-based index
+                    "interpretation": lora_info[layer][str(nid)]["interpretation"],
+                }
+            )
 
-    print(f'Skipped {invalid_examples} invalid examples')
+    print(f"Skipped {invalid_examples} invalid examples")
     return dataset
 
 
@@ -1007,13 +1009,13 @@ def autointerp_build_prompt(item):
         f"Neuron interpretation: {item['interpretation']}",
         "",
     ]
-    for i, s in enumerate(item['sentences'], 1):
+    for i, s in enumerate(item["sentences"], 1):
         lines.append(f"{i}. {autointerp_clean(s)}")
     return "\n".join(lines)
 
 
 def autointerp_evaluate(preds, ds):
-    acc = sum(p == ex['answer'] for p, ex in zip(preds, ds))/len(ds)
+    acc = sum(p == ex["answer"] for p, ex in zip(preds, ds)) / len(ds)
     return {k: acc for k in ("accuracy", "precision", "recall")}
 
 
@@ -1028,7 +1030,9 @@ Metrics eval helper functions
 """
 
 
-def build_metrics_eval_messages(question: str, reply_a: str, reply_b: str) -> List[Dict]:
+def build_metrics_eval_messages(
+    question: str, reply_a: str, reply_b: str
+) -> List[Dict]:
     user = (
         f"{question}\n\n"
         f"### Reply A:\n{reply_a}\n\n"
@@ -1036,25 +1040,28 @@ def build_metrics_eval_messages(question: str, reply_a: str, reply_b: str) -> Li
         "Which reply is better? Answer with A or B only."
     )
     return [
-        {"role": "user",   "content": f"{question}\n\n"},
+        {"role": "user", "content": f"{question}\n\n"},
         # The assistant role is left blank; the tokenizer adds the tag.
     ]
 
 
 def preprocess_to_perspective_message(example):
     return {
-        "messages": [{
-            "role": "user",
-            "content": "Complete the following sentence: " + example["prompt"]["text"]
-        }]
+        "messages": [
+            {
+                "role": "user",
+                "content": "Complete the following sentence: "
+                + example["prompt"]["text"],
+            }
+        ]
     }
 
 
 def analyze_text_toxicity_eval(text, requested_attributes, client):
     analyze_request = {
-        'comment': {'text': text},
-        'requestedAttributes': requested_attributes,
-        'languages': ['en']
+        "comment": {"text": text},
+        "requestedAttributes": requested_attributes,
+        "languages": ["en"],
     }
 
     response = client.comments().analyze(body=analyze_request).execute()
@@ -1072,8 +1079,10 @@ def setup_tokenizer_for_chat(tokenizer):
     # Load chat template from IT version if not present
     if tokenizer.chat_template is None:
         from transformers import AutoTokenizer
+
         it_tokenizer = AutoTokenizer.from_pretrained(
-            "google/gemma-2-2b-it", use_fast=True)
+            "google/gemma-2-2b-it", use_fast=True
+        )
         if it_tokenizer.chat_template is not None:
             tokenizer.chat_template = it_tokenizer.chat_template
             print("Loaded chat template from google/gemma-2-2b-it")
@@ -1107,13 +1116,14 @@ def _make_cache_key(
 
 def _get_cache_path(cache_key: str) -> str:
     """Get the cache file path for a given cache key."""
-    cache_dir = os.path.join(os.path.expanduser(
-        "~"), ".cache", "topk_lora_datasets")
+    cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "topk_lora_datasets")
     os.makedirs(cache_dir, exist_ok=True)
     return os.path.join(cache_dir, f"sft_datasets_{cache_key}.pkl")
 
 
-def _save_datasets_to_cache(train_ds: HFDataset, eval_ds: HFDataset, cache_path: str) -> None:
+def _save_datasets_to_cache(
+    train_ds: HFDataset, eval_ds: HFDataset, cache_path: str
+) -> None:
     """Save datasets to cache file efficiently with disk-based format for streaming."""
     print(f"💾 Saving datasets to cache: {cache_path}")
 
@@ -1126,7 +1136,7 @@ def _save_datasets_to_cache(train_ds: HFDataset, eval_ds: HFDataset, cache_path:
         "eval": {
             "data": eval_ds.to_list(),
             "features": eval_ds.features,
-        }
+        },
     }
 
     # Save pickle format (legacy compatibility)
@@ -1134,8 +1144,8 @@ def _save_datasets_to_cache(train_ds: HFDataset, eval_ds: HFDataset, cache_path:
         pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     # Save disk format for efficient streaming
-    train_cache_dir = cache_path.replace('.pkl', '_train_dir')
-    eval_cache_dir = cache_path.replace('.pkl', '_eval_dir')
+    train_cache_dir = cache_path.replace(".pkl", "_train_dir")
+    eval_cache_dir = cache_path.replace(".pkl", "_eval_dir")
 
     try:
         train_ds.save_to_disk(train_cache_dir)
@@ -1145,20 +1155,24 @@ def _save_datasets_to_cache(train_ds: HFDataset, eval_ds: HFDataset, cache_path:
         print(f"⚠️ Failed to save disk format: {e}")
 
     print(
-        f"✅ Datasets cached successfully ({len(train_ds)} train, {len(eval_ds)} eval)")
+        f"✅ Datasets cached successfully ({len(train_ds)} train, {len(eval_ds)} eval)"
+    )
 
 
-def _load_datasets_from_cache(cache_path: str, streaming: bool = True) -> Tuple[HFDataset, HFDataset]:
+def _load_datasets_from_cache(
+    cache_path: str, streaming: bool = True
+) -> Tuple[HFDataset, HFDataset]:
     """Load datasets from cache file with true streaming support."""
     print(f"📁 Loading datasets from cache: {cache_path}")
 
     # Check if we have disk-based cache directories (best for streaming)
-    train_cache_dir = cache_path.replace('.pkl', '_train_dir')
-    eval_cache_dir = cache_path.replace('.pkl', '_eval_dir')
+    train_cache_dir = cache_path.replace(".pkl", "_train_dir")
+    eval_cache_dir = cache_path.replace(".pkl", "_eval_dir")
 
     if os.path.exists(train_cache_dir) and os.path.exists(eval_cache_dir):
         print(f"🔄 Loading datasets from disk cache with streaming={streaming}")
         from datasets import load_from_disk
+
         train_ds = load_from_disk(train_cache_dir)
         eval_ds = load_from_disk(eval_cache_dir)
 
@@ -1167,15 +1181,17 @@ def _load_datasets_from_cache(cache_path: str, streaming: bool = True) -> Tuple[
             # This avoids issues with evaluation loops that expect finite datasets
             train_ds = train_ds.to_iterable_dataset()
             print(
-                f"✅ Training dataset streaming enabled, eval dataset kept as regular dataset")
+                f"✅ Training dataset streaming enabled, eval dataset kept as regular dataset"
+            )
         else:
             print(
-                f"✅ Datasets loaded from disk cache ({len(train_ds)} train, {len(eval_ds)} eval)")
+                f"✅ Datasets loaded from disk cache ({len(train_ds)} train, {len(eval_ds)} eval)"
+            )
         return train_ds, eval_ds
 
     # Check if we have Arrow format files (fallback)
-    train_cache_path = cache_path.replace('.pkl', '_train.arrow')
-    eval_cache_path = cache_path.replace('.pkl', '_eval.arrow')
+    train_cache_path = cache_path.replace(".pkl", "_train.arrow")
+    eval_cache_path = cache_path.replace(".pkl", "_eval.arrow")
 
     if os.path.exists(train_cache_path) and os.path.exists(eval_cache_path):
         # Load from Arrow format - still loads to memory but more efficient
@@ -1186,10 +1202,12 @@ def _load_datasets_from_cache(cache_path: str, streaming: bool = True) -> Tuple[
             # Only convert training dataset to streaming
             train_ds = train_ds.to_iterable_dataset()
             print(
-                f"✅ Training dataset streaming enabled from Arrow cache, eval dataset regular")
+                f"✅ Training dataset streaming enabled from Arrow cache, eval dataset regular"
+            )
         else:
             print(
-                f"✅ Datasets loaded from Arrow cache ({len(train_ds)} train, {len(eval_ds)} eval)")
+                f"✅ Datasets loaded from Arrow cache ({len(train_ds)} train, {len(eval_ds)} eval)"
+            )
         return train_ds, eval_ds
 
     # Fallback to pickle format (legacy)
@@ -1197,9 +1215,11 @@ def _load_datasets_from_cache(cache_path: str, streaming: bool = True) -> Tuple[
         cache_data = pickle.load(f)
 
     train_ds = HFDataset.from_list(
-        cache_data["train"]["data"], features=cache_data["train"]["features"])
+        cache_data["train"]["data"], features=cache_data["train"]["features"]
+    )
     eval_ds = HFDataset.from_list(
-        cache_data["eval"]["data"], features=cache_data["eval"]["features"])
+        cache_data["eval"]["data"], features=cache_data["eval"]["features"]
+    )
 
     # Save in disk format for future efficient streaming
     try:
@@ -1213,10 +1233,12 @@ def _load_datasets_from_cache(cache_path: str, streaming: bool = True) -> Tuple[
         # Only convert training dataset to streaming
         train_ds = train_ds.to_iterable_dataset()
         print(
-            f"✅ Training dataset streaming enabled from pickle cache, eval dataset regular")
+            f"✅ Training dataset streaming enabled from pickle cache, eval dataset regular"
+        )
     else:
         print(
-            f"✅ Datasets loaded from pickle cache ({len(train_ds)} train, {len(eval_ds)} eval)")
+            f"✅ Datasets loaded from pickle cache ({len(train_ds)} train, {len(eval_ds)} eval)"
+        )
     return train_ds, eval_ds
 
 
@@ -1309,9 +1331,17 @@ def load_dolly(split: str = "train") -> HFDataset:
         ctx = (ex.get("context") or "").strip()
         user = instr if not ctx else f"{instr}\n\nContext:\n{ctx}"
         resp = (ex.get("response") or "").strip()
-        return {"messages": [{"role": "user", "content": user}, {"role": "assistant", "content": resp}]}
+        return {
+            "messages": [
+                {"role": "user", "content": user},
+                {"role": "assistant", "content": resp},
+            ]
+        }
+
     # type: ignore
-    return ds.map(to_messages, remove_columns=[c for c in ds.column_names if c != "messages"])
+    return ds.map(
+        to_messages, remove_columns=[c for c in ds.column_names if c != "messages"]
+    )
 
 
 def load_ultrachat(split: str = "train_sft") -> HFDataset:
@@ -1329,6 +1359,7 @@ def load_ultrachat(split: str = "train_sft") -> HFDataset:
                 cleaned.append({"role": role, "content": content})
         has_assistant = any(m["role"] == "assistant" for m in cleaned)
         return {"messages": cleaned if has_assistant else None}
+
     ds = ds.map(clean)
     ds = ds.filter(lambda ex: ex["messages"] is not None)
     return ds  # type: ignore
@@ -1347,10 +1378,12 @@ def load_oasst1(split: str = "train") -> HFDataset:
             return False
         txt = ex.get("text") or ""
         return len(txt.strip()) > 0
+
     ds = ds.filter(keep)
     rows = ds.to_list()
     by_id = {r["message_id"]: r for r in rows}
     from collections import defaultdict
+
     children = defaultdict(list)
     for r in rows:
         pid = r.get("parent_id")
@@ -1370,8 +1403,11 @@ def load_oasst1(split: str = "train") -> HFDataset:
         msgs: List[Message] = []
         for node in path:
             role = node.get("role")
-            r = "user" if role == "prompter" else (
-                "assistant" if role == "assistant" else None)
+            r = (
+                "user"
+                if role == "prompter"
+                else ("assistant" if role == "assistant" else None)
+            )
             if r is None:
                 continue
             content = (node.get("text") or "").strip()
@@ -1405,7 +1441,10 @@ def build_sft_dataset(
             return False
         # Must have at least one assistant message
         has_assistant = any(
-            m.get("role") == "assistant" for m in messages if m.get("content", "").strip())
+            m.get("role") == "assistant"
+            for m in messages
+            if m.get("content", "").strip()
+        )
         return has_assistant
 
     mixed = mixed.filter(is_valid)
@@ -1413,8 +1452,11 @@ def build_sft_dataset(
     def tokenize_example(ex):
         messages: List[Message] = ex["messages"]
         return _encode_with_assistant_mask(tokenizer, messages, max_length)
-    tokenized = mixed.map(tokenize_example, remove_columns=[
-                          c for c in mixed.column_names if c != "messages"])
+
+    tokenized = mixed.map(
+        tokenize_example,
+        remove_columns=[c for c in mixed.column_names if c != "messages"],
+    )
 
     # Filter out sequences that became empty after tokenization
     tokenized = tokenized.filter(lambda ex: len(ex["input_ids"]) > 0)
@@ -1438,6 +1480,7 @@ def pack_tokenized_dataset(
         packed.append({k: v[:] for k, v in buffers.items()})
         for k in buffers:
             buffers[k].clear()
+
     cur_len = 0
     for ex in tokenized:
         ids = list(ex["input_ids"])
@@ -1492,7 +1535,7 @@ def build_sft_datasets(
         Tuple of (train_dataset, eval_dataset)
     """
     # Create cache key based on all parameters that affect the output
-    tokenizer_name = getattr(tokenizer, 'name_or_path', 'unknown_tokenizer')
+    tokenizer_name = getattr(tokenizer, "name_or_path", "unknown_tokenizer")
     cache_key = _make_cache_key(
         tokenizer_name=tokenizer_name,
         max_length=max_length,
@@ -1509,8 +1552,7 @@ def build_sft_datasets(
         try:
             return _load_datasets_from_cache(cache_path, streaming=streaming)
         except Exception as e:
-            print(
-                f"⚠️ Failed to load from cache ({e}), rebuilding datasets...")
+            print(f"⚠️ Failed to load from cache ({e}), rebuilding datasets...")
             # Remove corrupted cache file
             # try:
             #     os.remove(cache_path)
@@ -1520,7 +1562,8 @@ def build_sft_datasets(
     # Build datasets from scratch
     print("🔨 Building datasets from scratch (this may take a while)...")
     full = build_sft_dataset(
-        tokenizer, max_length=max_length, datasets_to_use=datasets_to_use)
+        tokenizer, max_length=max_length, datasets_to_use=datasets_to_use
+    )
     split = full.train_test_split(test_size=eval_holdout_ratio, seed=seed)
     train_ds, eval_ds = split["train"], split["test"]
 
@@ -1533,32 +1576,35 @@ def build_sft_datasets(
         split = full.train_test_split(test_size=adjusted_ratio, seed=seed)
         train_ds, eval_ds = split["train"], split["test"]
         print(
-            f"📊 Adjusted eval dataset size: {len(eval_ds)} examples ({adjusted_ratio:.3f} ratio)")
+            f"📊 Adjusted eval dataset size: {len(eval_ds)} examples ({adjusted_ratio:.3f} ratio)"
+        )
 
     if pack_sequences:
         pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
         eos_id = tokenizer.eos_token_id or pad_id
         print("📦 Packing training sequences...")
         train_ds = pack_tokenized_dataset(
-            train_ds, max_length=max_length, pad_token_id=pad_id, eos_token_id=eos_id)
+            train_ds, max_length=max_length, pad_token_id=pad_id, eos_token_id=eos_id
+        )
         print("📦 Packing evaluation sequences...")
         eval_ds = pack_tokenized_dataset(
-            eval_ds, max_length=max_length, pad_token_id=pad_id, eos_token_id=eos_id)
+            eval_ds, max_length=max_length, pad_token_id=pad_id, eos_token_id=eos_id
+        )
 
     # Save to cache for future use
     if use_cache:
         try:
             _save_datasets_to_cache(train_ds, eval_ds, cache_path)
         except Exception as e:
-            print(
-                f"⚠️ Failed to save to cache ({e}), continuing without caching...")
+            print(f"⚠️ Failed to save to cache ({e}), continuing without caching...")
 
     # Convert to streaming if requested (only for training dataset)
     if streaming:
         train_ds = train_ds.to_iterable_dataset()
         # Keep eval_ds as regular dataset for compatibility with evaluation loops
         print(
-            f"✅ Training dataset converted to streaming format, eval dataset kept regular")
+            f"✅ Training dataset converted to streaming format, eval dataset kept regular"
+        )
 
     return train_ds, eval_ds
 
@@ -1573,9 +1619,11 @@ def normalize_ultrachat_messages(msgs):
     Returns (fixed_messages, add_gen_prompt)
     """
     # 1) keep only user/assistant with text
-    cleaned = [{"role": m["role"], "content": (m.get("content") or "").strip()}
-               for m in (msgs or [])
-               if m.get("role") in ("user", "assistant") and (m.get("content") or "").strip()]
+    cleaned = [
+        {"role": m["role"], "content": (m.get("content") or "").strip()}
+        for m in (msgs or [])
+        if m.get("role") in ("user", "assistant") and (m.get("content") or "").strip()
+    ]
 
     if not cleaned:
         # fallback: single empty user so the template is satisfiable
