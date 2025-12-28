@@ -19,10 +19,16 @@ import torch.nn.functional as F
 
 
 local_rank = int(os.environ.get("LOCAL_RANK", 0))
-torch.cuda.set_device(local_rank)
+if torch.cuda.is_available():
+    torch.cuda.set_device(local_rank)
 
-device = 'cuda' if torch.cuda.is_available() else \
-    'mps' if torch.mps.is_available() else 'cpu'
+device = (
+    "cuda"
+    if torch.cuda.is_available()
+    else "mps"
+    if torch.mps.is_available()
+    else "cpu"
+)
 
 
 class EnhancedSFTTrainer(SFTTrainer):
@@ -336,30 +342,30 @@ def run_sft(cfg):
         cfg.training.model.model_name, fast=False
     )
 
-    quant_cfg = build_quant_config(
-        cfg.training.quantization
-    )
+    quant_cfg = build_quant_config(cfg.training.quantization)
+    if device == "mps":
+        quant_cfg = None
     logging.info("Using quantisation: %s", quant_cfg)
 
     if 'gemma' in cfg.training.model.name:
         tokenizer.padding_side = 'right'
         model = AutoModelForCausalLM.from_pretrained(
             cfg.training.model.model_name,
-            attn_implementation='eager',
-            # quantization doesn't work on Apple Metal
-            quantization_config=quant_cfg if device != 'mps' else None,
-            device_map={"": local_rank},
-            trust_remote_code=True
+            attn_implementation="eager",
+            quantization_config=quant_cfg,
+            device_map={"": local_rank} if device == "cuda" else None,
+            trust_remote_code=True,
         )
     else:
         model = AutoModelForCausalLM.from_pretrained(
             cfg.training.model.model_name,
-            # quantization doesn't work on Apple Metal
-            quantization_config=quant_cfg if device != 'mps' else None,
-            # device_map="auto",
-            device_map={"": local_rank},
-            trust_remote_code=True
+            quantization_config=quant_cfg,
+            device_map={"": local_rank} if device == "cuda" else None,
+            trust_remote_code=True,
         )
+
+    if device == "mps":
+        model.to(device)
 
     print("Model loaded")
     count_params(model)
@@ -374,8 +380,9 @@ def run_sft(cfg):
         target_modules=list(cfg.training.sft_experiment.lora.target_modules),
     )
 
-    model = prepare_model_for_kbit_training(model)
-    print("Model prepared for kbit training")
+    if quant_cfg is not None:
+        model = prepare_model_for_kbit_training(model)
+        print("Model prepared for kbit training")
     count_params(model)
     model.enable_input_require_grads()  # QLoRA needs this
     model = get_peft_model(model, peft_config)  # inject LoraLinear now

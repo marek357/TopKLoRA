@@ -1,13 +1,11 @@
 from typing import Optional
 from transformers import TrainerCallback
 from peft.tuners.lora import LoraLayer
-from trl import DPOTrainer
 import torch.nn.functional as F
 import torch.nn as nn
-import logging
 import torch
 import gc
-
+import wandb
 
 
 def _soft_topk_mass(z, k, tau):
@@ -307,15 +305,18 @@ class MemoryClearCallback(TrainerCallback):
 
     def on_step_end(self, args, state, control, **kwargs):
         if state.global_step % args.gradient_accumulation_steps == 0:
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             gc.collect()
         return control
 
-
     def on_evaluate(self, args, state, control, **kwargs):
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         gc.collect()
         return control
+
+
 class TopKProgressCallback(TrainerCallback):
     """Update training progress in TopK modules"""
 

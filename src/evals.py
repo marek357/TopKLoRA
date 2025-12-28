@@ -291,6 +291,9 @@ def toxicity():
                                 "Added %d extra special tokens",
                                 len(new_tokens)
                             )
+                except OSError as exc:
+                    logging.error("Failed to copy -it tokenizer: %s", exc)
+                    raise exc
                 except Exception as exc:  # noqa: BLE001
                     logging.warning("Failed to copy -it tokenizer: %s", exc)
 
@@ -559,6 +562,9 @@ def instruction_following():
                                 "Added %d extra special tokens",
                                 len(new_tokens)
                             )
+                except OSError as exc:
+                    logging.error("Failed to copy -it tokenizer: %s", exc)
+                    raise exc
                 except Exception as exc:  # noqa: BLE001
                     logging.warning("Failed to copy -it tokenizer: %s", exc)
 
