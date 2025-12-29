@@ -29,7 +29,9 @@ from src.utils import (
     build_metrics_eval_messages,
     configure_eos_eot,
     ensure_chat_template_and_special_tokens,
+    format_adapter_suffix,
     preprocess_to_perspective_message,
+    write_json,
     wrap_topk_lora_modules,
 )
 
@@ -374,9 +376,10 @@ def toxicity():
             torch.cuda.empty_cache()
 
         if cfg.evals.toxicity.dump_generated:
-            os.makedirs(cfg.evals.toxicity.dump_path, exist_ok=True)
-            with open(cfg.evals.toxicity.dump_path + "/generated.json", "w+") as f:
-                json.dump([full_outputs, completions_only], f)
+            write_json(
+                os.path.join(cfg.evals.toxicity.dump_path, "generated.json"),
+                [full_outputs, completions_only],
+            )
 
         # TODO: make configurable by hydra
         requested_attributes = {
@@ -409,34 +412,17 @@ def toxicity():
             }
 
         if cfg.evals.toxicity.dump_analysis:
-            # ensure the directory exists before dumping
-            path = Path(cfg.evals.toxicity.dump_path)
-            path.mkdir(parents=True, exist_ok=True)
-            if not cfg.evals.toxicity.eval_base_model:
-                with open(
-                    cfg.model.adapter_checkpoint_dir + "/../hparams.json", "r"
-                ) as f:
-                    model_hparams = json.load(f)
-                r = model_hparams["lora_topk"]["r"]
-                k = model_hparams["lora_topk"]["k_final"]
-
-            # ensure the directory exists before dumping
-            os.makedirs(
-                f"{cfg.evals.toxicity.dump_path}_{'base' if cfg.evals.toxicity.eval_base_model else f'adapter_{r}_{k}'}",
-                exist_ok=True,
+            model_tag = (
+                "base"
+                if cfg.evals.toxicity.eval_base_model
+                else format_adapter_suffix(cfg.model.adapter_checkpoint_dir)
             )
-            # dump the analysis
-            print(
-                f"Dumping toxicity analysis to: {cfg.evals.toxicity.dump_path}_{'base' if cfg.evals.toxicity.eval_base_model else f'adapter_{r}_{k}'}"
+            analysis_dir = f"{cfg.evals.toxicity.dump_path}_{model_tag}"
+            print(f"Dumping toxicity analysis to: {analysis_dir}")
+            write_json(
+                os.path.join(analysis_dir, "toxicity_analysis.json"),
+                analysis_dump,
             )
-            with open(
-                os.path.join(
-                    f"{cfg.evals.toxicity.dump_path}_{'base' if cfg.evals.toxicity.eval_base_model else f'adapter_{r}_{k}'}",
-                    "toxicity_analysis.json",
-                ),
-                "w+",
-            ) as f:
-                json.dump(analysis_dump, f)
         return toxicity_scores
 
     return eval_toxicity
@@ -533,25 +519,13 @@ def instruction_following():
         )
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Determine filename based on model type
-        if cfg.evals.instruction_following.eval_base_model:
-            filename = "report_base_model.json"
-        else:
-            # Load hyperparameters if available
-            try:
-                with open(
-                    cfg.model.adapter_checkpoint_dir + "/../hparams.json", "r"
-                ) as f:
-                    model_hparams = json.load(f)
-                r = model_hparams["lora_topk"]["r"]
-                k = model_hparams["lora_topk"]["k_final"]
-                filename = f"report_adapter_{r}_{k}.json"
-            except FileNotFoundError:
-                filename = "report_adapter.json"
-
-        report_path = output_dir / filename
-        with open(report_path, "w") as f:
-            json.dump(report, f, indent=2)
+        model_tag = (
+            "base_model"
+            if cfg.evals.instruction_following.eval_base_model
+            else format_adapter_suffix(cfg.model.adapter_checkpoint_dir)
+        )
+        report_path = output_dir / f"report_{model_tag}.json"
+        write_json(str(report_path), report)
 
         print(f"Report saved to: {report_path}")
 

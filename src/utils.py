@@ -1,5 +1,7 @@
 from __future__ import annotations
 import json
+import subprocess
+import sys
 from transformers import PreTrainedTokenizerBase
 from datasets import Dataset as HFDataset, concatenate_datasets, load_dataset
 from typing import List, Dict, Tuple
@@ -247,6 +249,111 @@ def wrap_topk_lora_modules(
         replaced += 1
 
     return replaced, wrapped_modules
+
+
+def save_hparams(output_dir: str, hparams: Dict[str, Any]) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    try:
+        with open(os.path.join(output_dir, "hparams.json"), "w") as f:
+            json.dump(hparams, f, indent=2, default=str)
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Failed to write hparams.json: %s", exc)
+
+
+def save_cfg_yaml(output_dir: str, cfg) -> None:
+    try:
+        from omegaconf import OmegaConf
+
+        with open(os.path.join(output_dir, "cfg.yaml"), "w") as f:
+            f.write(OmegaConf.to_yaml(cfg))
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Could not serialize cfg to YAML: %s", exc)
+
+
+def capture_env_snapshot(output_dir: str) -> None:
+    try:
+        env_dir = os.path.join(output_dir, "env")
+        os.makedirs(env_dir, exist_ok=True)
+
+        # pip freeze
+        try:
+            frz = subprocess.run(
+                [sys.executable, "-m", "pip", "freeze"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            with open(os.path.join(env_dir, "requirements_freeze.txt"), "wb") as f:
+                f.write(frz.stdout)
+        except Exception:
+            pass
+
+        # nvidia-smi
+        try:
+            smi = subprocess.run(
+                ["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            with open(os.path.join(env_dir, "nvidia-smi.txt"), "wb") as f:
+                f.write(smi.stdout or smi.stderr)
+        except Exception:
+            pass
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Failed to capture environment info: %s", exc)
+
+
+def save_summary(output_dir: str, lines: List[str]) -> None:
+    try:
+        with open(os.path.join(output_dir, "README.txt"), "w") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Failed to write summary README.txt: %s", exc)
+
+
+def maybe_update_wandb_config(
+    cfg_logger, hparams: Dict[str, Any], run_name: str
+) -> None:
+    if (
+        not getattr(cfg_logger, "report_to", None)
+        or "wandb" not in cfg_logger.report_to
+    ):
+        return
+    try:
+        import wandb
+
+        if wandb.run is not None:
+            wandb.config.update(hparams, allow_val_change=True)
+            wandb.run.name = run_name
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Could not update wandb config: %s", exc)
+
+
+def load_adapter_hparams(adapter_checkpoint_dir: str) -> Optional[Dict[str, Any]]:
+    hparams_path = os.path.join(adapter_checkpoint_dir, "..", "hparams.json")
+    try:
+        with open(hparams_path, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Failed to read adapter hparams: %s", exc)
+        return None
+
+
+def format_adapter_suffix(adapter_checkpoint_dir: str) -> str:
+    hparams = load_adapter_hparams(adapter_checkpoint_dir)
+    if not hparams:
+        return "adapter"
+    lora = hparams.get("lora_topk", {})
+    r = lora.get("r")
+    k = lora.get("k_final", lora.get("k"))
+    if r is None or k is None:
+        return "adapter"
+    return f"adapter_{r}_{k}"
+
+
+def write_json(path: str, data: Any) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
 
 
 # -----------------------------------------------------------------------------

@@ -17,11 +17,17 @@ from src.utils import (
     ensure_chat_template_and_special_tokens,
     configure_eos_eot,
     wrap_topk_lora_modules,
+    save_hparams,
+    save_cfg_yaml,
+    capture_env_snapshot,
+    save_summary,
+    maybe_update_wandb_config,
 )
 import numpy as np
 import logging
 from peft import get_peft_model_state_dict
 import torch.nn.functional as F
+import wandb
 
 
 local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -657,9 +663,6 @@ def run_sft(cfg):
     logging.info(f"EOS: {str(trainer.processing_class.eos_token_id)}")
 
     # ----------------------- Enhanced Logging & Output Structure -----------------------
-    import subprocess
-    import sys
-    import json
 
     # Create structured output directory similar to DPO
     model_str = f"{cfg.training.model.name}_{cfg.training.model.version}_{cfg.training.model.size}"
@@ -731,48 +734,9 @@ def run_sft(cfg):
                 }
             )
 
-    # Save hyperparameters
-    os.makedirs(base_output_dir, exist_ok=True)
-    with open(os.path.join(base_output_dir, "hparams.json"), "w") as f:
-        json.dump(hparams, f, indent=2, default=str)
-
-    # Save full config as YAML for reproducibility
-    try:
-        from omegaconf import OmegaConf
-
-        with open(os.path.join(base_output_dir, "cfg.yaml"), "w") as f:
-            f.write(OmegaConf.to_yaml(cfg))
-    except Exception as e:
-        logging.warning(f"Could not serialize cfg to YAML: {e}")
-
-    # Capture environment snapshots
-    try:
-        env_dir = os.path.join(base_output_dir, "env")
-        os.makedirs(env_dir, exist_ok=True)
-
-        # pip freeze
-        try:
-            frz = subprocess.run(
-                [sys.executable, "-m", "pip", "freeze"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            with open(os.path.join(env_dir, "requirements_freeze.txt"), "wb") as f:
-                f.write(frz.stdout)
-        except Exception:
-            pass
-
-        # nvidia-smi
-        try:
-            smi = subprocess.run(
-                ["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
-            with open(os.path.join(env_dir, "nvidia-smi.txt"), "wb") as f:
-                f.write(smi.stdout or smi.stderr)
-        except Exception:
-            pass
-    except Exception as e:
-        logging.warning(f"Failed to capture environment info: {e}")
+    save_hparams(base_output_dir, hparams)
+    save_cfg_yaml(base_output_dir, cfg)
+    capture_env_snapshot(base_output_dir)
 
     # Human-readable summary
     try:
@@ -789,22 +753,14 @@ def run_sft(cfg):
             f"sft: lr={cfg.training.sft.lr}, steps={cfg.training.sft.max_steps}, bs={cfg.training.sft.batch_size_train}x{cfg.training.sft.gradient_accumulation_steps}"
         )
 
-        with open(os.path.join(base_output_dir, "README.txt"), "w") as f:
-            f.write("\\n".join(summary) + "\\n")
+        save_summary(base_output_dir, summary)
     except Exception as e:
-        logging.warning(f"Failed to write summary README.txt: {e}")
+        logging.warning(f"Failed to build summary README.txt: {e}")
 
-    # Update WandB config if enabled
-    if getattr(cfg.logger, "report_to", None) and "wandb" in cfg.logger.report_to:
-        try:
-            import wandb
-
-            if wandb.run is not None:
-                wandb.config.update(hparams, allow_val_change=True)
-                if not getattr(cfg, "experiment_name", None):
-                    wandb.run.name = os.path.basename(base_output_dir)
-        except Exception as e:
-            logging.warning(f"Could not update wandb config: {e}")
+    run_name = getattr(cfg, "experiment_name", None) or os.path.basename(
+        base_output_dir
+    )
+    maybe_update_wandb_config(cfg.logger, hparams, run_name)
 
     logging.info(f"📊 Enhanced logging setup complete. Output dir: {base_output_dir}")
 

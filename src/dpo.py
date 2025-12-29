@@ -39,6 +39,10 @@ from src.utils import (
     configure_eos_eot,
     ensure_chat_template_and_special_tokens,
     wrap_topk_lora_modules,
+    save_cfg_yaml,
+    capture_env_snapshot,
+    save_summary,
+    maybe_update_wandb_config,
 )
 
 # Configure logging
@@ -1368,41 +1372,8 @@ def run_dpo(cfg, quant_cfg):
     except Exception as e:
         logging.warning(f"Could not create 'latest' symlink: {e}")
 
-    # Save the full cfg as YAML for exact reproducibility (if OmegaConf available)
-    try:
-        from omegaconf import OmegaConf
-
-        with open(os.path.join(output_dir, "cfg.yaml"), "w") as f:
-            f.write(OmegaConf.to_yaml(cfg))
-    except Exception as e:
-        logging.warning(f"Could not serialize cfg to YAML: {e}")
-
-    # Capture environment snapshots
-    try:
-        env_dir = os.path.join(output_dir, "env")
-        os.makedirs(env_dir, exist_ok=True)
-        # pip freeze
-        try:
-            frz = subprocess.run(
-                [sys.executable, "-m", "pip", "freeze"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            with open(os.path.join(env_dir, "requirements_freeze.txt"), "wb") as f:
-                f.write(frz.stdout)
-        except Exception:
-            pass
-        # nvidia-smi
-        try:
-            smi = subprocess.run(
-                ["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
-            with open(os.path.join(env_dir, "nvidia-smi.txt"), "wb") as f:
-                f.write(smi.stdout or smi.stderr)
-        except Exception:
-            pass
-    except Exception as e:
-        logging.warning(f"Failed to capture environment info: {e}")
+    save_cfg_yaml(output_dir, cfg)
+    capture_env_snapshot(output_dir)
 
     # Human-readable summary
     try:
@@ -1419,21 +1390,12 @@ def run_dpo(cfg, quant_cfg):
         summary.append(
             f"dpo: beta={dpo_args.beta}, lr={dpo_args.learning_rate}, steps={dpo_args.max_steps}, bs={dpo_args.per_device_train_batch_size}x{dpo_args.gradient_accumulation_steps}"
         )
-        with open(os.path.join(output_dir, "README.txt"), "w") as f:
-            f.write("\n".join(summary) + "\n")
+        save_summary(output_dir, summary)
     except Exception as e:
-        logging.warning(f"Failed to write summary README.txt: {e}")
+        logging.warning(f"Failed to build summary README.txt: {e}")
 
-    # Optionally sync hparams into Weights & Biases config
-    if getattr(cfg.logger, "report_to", None) and "wandb" in cfg.logger.report_to:
-        try:
-            if wandb.run is not None:
-                wandb.config.update(hparams, allow_val_change=True)
-                # Prefer the folder name as run_name if not provided
-                if not getattr(cfg, "experiment_name", None):
-                    wandb.run.name = os.path.basename(output_dir)
-        except Exception as e:
-            logging.warning(f"Could not update wandb config: {e}")
+    run_name = getattr(cfg, "experiment_name", None) or os.path.basename(output_dir)
+    maybe_update_wandb_config(cfg.logger, hparams, run_name)
 
     # DPO configuration
     dpo_config = DPOConfig(
