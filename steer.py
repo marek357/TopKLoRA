@@ -39,7 +39,11 @@ from src.steering import (
     list_available_adapters,
     remove_steering_hooks
 )
-from src.utils import build_quant_config
+from src.utils import (
+    build_quant_config,
+    ensure_chat_template_and_special_tokens,
+    configure_eos_eot,
+)
 
 
 def load_model_and_adapter(cfg: DictConfig):
@@ -71,9 +75,6 @@ def load_model_and_adapter(cfg: DictConfig):
         trust_remote_code=True
     )
     
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    
     # Load base model
     dtype_map = {
         "float16": torch.float16,
@@ -89,6 +90,13 @@ def load_model_and_adapter(cfg: DictConfig):
         trust_remote_code=True,
         attn_implementation='eager'
     )
+
+    ensure_chat_template_and_special_tokens(
+        tokenizer,
+        model,
+        cfg.model.model_it_name
+    )
+    configure_eos_eot(tokenizer, model)
     
     # Load adapter if specified
     if cfg.model.adapter_path:
