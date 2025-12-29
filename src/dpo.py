@@ -1234,7 +1234,6 @@ def run_dpo(cfg, quant_cfg):
         pass
 
     # Sanity logs about device placement and memory state
-
     if torch.cuda.is_available():
         dev = torch.cuda.current_device()
         logging.info(
