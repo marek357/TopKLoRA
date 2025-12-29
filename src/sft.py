@@ -82,7 +82,7 @@ class EnhancedSFTTrainer(SFTTrainer):
 
     def _clear_topk_caches(self, model):
         # Drop live caches to avoid cross-step graph retention
-        from types import SimpleNamespace  # just to reduce overhead if absent
+        # from types import SimpleNamespace  # just to reduce overhead if absent
 
         for m in model.modules():
             # isinstance check is cheap; avoids hasattr chain when irrelevant

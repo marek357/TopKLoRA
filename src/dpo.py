@@ -1,52 +1,41 @@
-from trl import DPOTrainer
-from typing import Optional, Dict, Any
+import hashlib
+import json
+import logging
 import os
+import platform
+import re
+import subprocess
 import sys
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import logging
-import argparse
-import gc
-import re
-from typing import List, Optional, Dict, Any
-from collections import defaultdict
 from datasets import load_dataset
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    TrainerCallback,
-    EarlyStoppingCallback,
-    DataCollatorWithPadding,
-    default_data_collator,
-)
 from peft import (
     LoraConfig,
     get_peft_model,
-    prepare_model_for_kbit_training,
     get_peft_model_state_dict,
+    prepare_model_for_kbit_training,
 )
 from peft.tuners.lora import LoraLayer
-from src.models import (
-    TopKLoRALinearSTE,
-    _soft_topk_mass,
-    TopKProgressCallback,
-    MemoryClearCallback,
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    TrainerCallback,
 )
-from src.sft import enable_topk_lora_grads, count_params
-from src.utils import ensure_chat_template_and_special_tokens, configure_eos_eot
-from trl import DPOTrainer, DPOConfig
-from torch.optim import AdamW
-import wandb
+from trl import DPOConfig, DPOTrainer
 
-# NEW: utilities for structured run tracking
-import json
-import hashlib
-from datetime import datetime
-import platform
-import subprocess
+import wandb
+from src.models import (
+    MemoryClearCallback,
+    TopKLoRALinearSTE,
+    TopKProgressCallback,
+    _soft_topk_mass,
+)
+from src.sft import count_params, enable_topk_lora_grads
+from src.utils import configure_eos_eot, ensure_chat_template_and_special_tokens
 
 # Configure logging
 logging.basicConfig(
@@ -140,7 +129,7 @@ class ActivationTrackingCallback(TrainerCallback):
                 continue
 
             # Compute average activations
-            avg_activations = tracker["total_activations"] / tracker["samples_seen"]
+            # avg_activations = tracker["total_activations"] / tracker["samples_seen"]
             dead_mask = tracker["activation_counts"] == 0
             num_dead = dead_mask.sum().item()
 
@@ -521,27 +510,6 @@ class EnhancedDPOTrainer(DPOTrainer):
         return (loss, outputs) if return_outputs else loss
 
 
-class MemoryClearCallback(TrainerCallback):
-    """Memory management callback"""
-
-    def on_step_end(self, args, state, control, **kwargs):
-        try:
-            if (
-                hasattr(args, "gradient_accumulation_steps")
-                and args.gradient_accumulation_steps > 0
-                and state.global_step % args.gradient_accumulation_steps == 0
-            ):
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()
-        except Exception:
-            pass
-
-    def on_evaluate(self, args, state, control, **kwargs):
-        torch.cuda.empty_cache()
-        gc.collect()
-
-
 def _resolve_device_map_for_ddp() -> Optional[Dict[str, int]]:
     """Resolve a safe device_map when running under DDP/Accelerate.
     try:
@@ -599,7 +567,7 @@ def prepare_hh_rlhf_datasets(
     """Load and prepare Anthropic/hh-rlhf for reference-free DPO."""
     cache_dir = os.path.join(os.getcwd(), "cache")
     os.makedirs(cache_dir, exist_ok=True)
-    eos = tokenizer.eos_token
+    # eos = tokenizer.eos_token
 
     ASSISTANT = "Assistant:"
 
@@ -794,14 +762,6 @@ def prepare_hh_rlhf_datasets(
         try:
             chosen = ex["chosen"]
             rejected = ex["rejected"]
-
-            # Apply chat template to get the full formatted text
-            chosen_text = tokenizer.apply_chat_template(
-                chosen, tokenize=False, add_generation_prompt=False
-            )
-            rejected_text = tokenizer.apply_chat_template(
-                rejected, tokenize=False, add_generation_prompt=False
-            )
 
             # Get prompt (all messages except last)
             prompt_messages = chosen[:-1]
@@ -1552,7 +1512,7 @@ def run_dpo(cfg, quant_cfg):
     except Exception as e:
         logging.warning(f"Failed to write dpo_config.json: {e}")
 
-    collator = None
+    # collator = None
 
     class GradNormLogger(TrainerCallback):
         def __init__(self, every=100):
@@ -1671,7 +1631,7 @@ def run_dpo(cfg, quant_cfg):
     torch.save(adapter_state_dict, f"{final_path}/adapter_model.bin")
 
     # Save as safetensors (preferred format)
-    from safetensors.torch import save_file, load_file
+    from safetensors.torch import load_file, save_file
 
     save_file(adapter_state_dict, f"{final_path}/adapter_model.safetensors")
 
