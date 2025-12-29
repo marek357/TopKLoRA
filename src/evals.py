@@ -30,6 +30,7 @@ from src.utils import (
     configure_eos_eot,
     ensure_chat_template_and_special_tokens,
     preprocess_to_perspective_message,
+    wrap_topk_lora_modules,
 )
 
 device = (
@@ -59,29 +60,17 @@ def init_model_tokenizer_fixed(model_cfg):
     )
 
     # NOW wrap with TopK for inference
-    wrapped_modules = {}
-    replaced = 0
-    for name, module in model.named_modules():
-        if hasattr(module, "lora_A") and not isinstance(module, TopKLoRALinearSTE):
-            parent = model.get_submodule(".".join(name.split(".")[:-1]))
-            attr = name.split(".")[-1]
-
-            # Use the PEFT-compatible wrapper
-            wrapped = TopKLoRALinearSTE(
-                base=module,
-                layer_name=name,
-                k=model_cfg.k,
-                temperature=0.0,  # Not used in eval
-                hard_eval=True,
-                relu_latents=True,
-                alpha_over_r=True,
-                k_final=model_cfg.k,
-                temperature_final=0.0,
-                is_topk_experiment=True,
-            )
-            setattr(parent, attr, wrapped)
-            wrapped_modules[name] = wrapped
-            replaced += 1
+    replaced, wrapped_modules = wrap_topk_lora_modules(
+        model,
+        k=model_cfg.k,
+        temperature=0.0,
+        temperature_schedule="constant",
+        k_schedule="constant",
+        k_final=model_cfg.k,
+        temperature_final=0.0,
+        is_topk_experiment=True,
+        set_train=False,
+    )
 
     print(f"Wrapped {replaced} LoRA modules with TopK for inference")
     model.to(device)

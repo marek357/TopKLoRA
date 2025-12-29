@@ -14,6 +14,7 @@ import pickle
 import re
 import random
 import logging
+from src.models import TopKLoRALinearSTE
 
 # --- UltraChat token streaming utilities for TopKLoRA autointerp ---
 import os
@@ -180,6 +181,72 @@ def configure_eos_eot(tokenizer, model):
         tokenizer.pad_token = tokenizer.eos_token
 
     return eot_token, eot_token_id
+
+
+def wrap_topk_lora_modules(
+    model,
+    *,
+    k: int,
+    temperature: float,
+    temperature_schedule: str,
+    k_schedule: str,
+    k_final: Optional[int],
+    temperature_final: Optional[float],
+    is_topk_experiment: bool,
+    hard_eval: bool = True,
+    relu_latents: bool = True,
+    alpha_over_r: bool = True,
+    set_train: Optional[bool] = None,
+):
+    """Wrap PEFT LoRA layers with TopKLoRALinearSTE and return (count, mapping)."""
+    targets = []
+    for name, module in model.named_modules():
+        if getattr(module, "lora_A", None) is not None:
+            targets.append(name)
+
+    wrapped_modules = {}
+    replaced = 0
+    for name in targets:
+        peft_layer = model.get_submodule(name)
+        parent = (
+            model.get_submodule(".".join(name.split(".")[:-1]))
+            if "." in name
+            else model
+        )
+        attr = name.split(".")[-1]
+        wrapped = TopKLoRALinearSTE(
+            base=peft_layer,
+            layer_name=name,
+            k=k,
+            temperature=temperature,
+            temperature_schedule=temperature_schedule,
+            k_schedule=k_schedule,
+            k_final=k_final,
+            hard_eval=hard_eval,
+            relu_latents=relu_latents,
+            alpha_over_r=alpha_over_r,
+            temperature_final=temperature_final,
+            is_topk_experiment=is_topk_experiment,
+        )
+        try:
+            target_device = next(peft_layer.parameters()).device
+        except StopIteration:
+            if hasattr(peft_layer, "base_layer") and hasattr(
+                peft_layer.base_layer, "weight"
+            ):
+                target_device = peft_layer.base_layer.weight.device
+            else:
+                target_device = next(model.parameters()).device
+        wrapped = wrapped.to(device=target_device)
+        if set_train is True:
+            wrapped.train()
+        elif set_train is False:
+            wrapped.eval()
+        setattr(parent, attr, wrapped)
+        wrapped_modules[name] = wrapped
+        replaced += 1
+
+    return replaced, wrapped_modules
 
 
 # -----------------------------------------------------------------------------

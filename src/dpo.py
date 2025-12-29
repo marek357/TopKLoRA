@@ -35,7 +35,11 @@ from src.models import (
     _soft_topk_mass,
 )
 from src.sft import count_params, enable_topk_lora_grads
-from src.utils import configure_eos_eot, ensure_chat_template_and_special_tokens
+from src.utils import (
+    configure_eos_eot,
+    ensure_chat_template_and_special_tokens,
+    wrap_topk_lora_modules,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -1314,55 +1318,17 @@ def run_dpo(cfg, quant_cfg):
 
     # Inject TopK wrappers (aligned with SFT pattern)
     logging.info("🔥 Injecting TopKLoRALinearSTE wrappers...")
-
-    # Step 1: Find all LoRA layers
-    targets = []
-    for name, module in model.named_modules():
-        if getattr(module, "lora_A", None) is not None:
-            targets.append(name)
-
-    logging.info(f"Found {len(targets)} LoRA layers to wrap")
-
-    # Step 2: Wrap them properly
-    replaced = 0
-    for name in targets:
-        peft_layer = model.get_submodule(name)
-        parent = (
-            model.get_submodule(".".join(name.split(".")[:-1]))
-            if "." in name
-            else model
-        )
-        attr = name.split(".")[-1]
-
-        wrapped = TopKLoRALinearSTE(
-            base=peft_layer,
-            layer_name=name,
-            k=experiment_args.lora.k,
-            temperature=experiment_args.lora.temperature,
-            temperature_schedule=experiment_args.lora.temperature_schedule,
-            k_schedule=experiment_args.lora.k_schedule,
-            k_final=experiment_args.lora.k_final,
-            hard_eval=True,
-            relu_latents=True,
-            alpha_over_r=True,
-            temperature_final=getattr(experiment_args.lora, "temperature_final", None),
-            is_topk_experiment=experiment_args.lora.get("top_k_experiment", False),
-        )
-        # Ensure wrapper buffers land on the same device as the underlying layer
-        try:
-            target_device = next(peft_layer.parameters()).device
-        except StopIteration:
-            if hasattr(peft_layer, "base_layer") and hasattr(
-                peft_layer.base_layer, "weight"
-            ):
-                target_device = peft_layer.base_layer.weight.device
-            else:
-                target_device = next(model.parameters()).device
-        wrapped = wrapped.to(device=target_device)
-        wrapped.train()  # Set to train mode
-        setattr(parent, attr, wrapped)
-        replaced += 1
-
+    replaced, _ = wrap_topk_lora_modules(
+        model,
+        k=experiment_args.lora.k,
+        temperature=experiment_args.lora.temperature,
+        temperature_schedule=experiment_args.lora.temperature_schedule,
+        k_schedule=experiment_args.lora.k_schedule,
+        k_final=experiment_args.lora.k_final,
+        temperature_final=getattr(experiment_args.lora, "temperature_final", None),
+        is_topk_experiment=experiment_args.lora.get("top_k_experiment", False),
+        set_train=True,
+    )
     logging.info(f"✅ Injected TopK STE wrappers in {replaced} layers")
     model.print_trainable_parameters()
 
