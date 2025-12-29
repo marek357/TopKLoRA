@@ -528,7 +528,7 @@ def autointerp_build_activation_prompt(
     for rank in sorted(windows_dict):
         token = windows_dict[rank]["token"]
         context = windows_dict[rank]["context"]
-        pos = topk_map[rank][1]
+        # pos = topk_map[rank][1]
         val = topk_map[rank][2]
 
         if context_newline:

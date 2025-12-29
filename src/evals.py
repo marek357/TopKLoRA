@@ -469,7 +469,7 @@ def instruction_following():
         max_length = getattr(cfg.evals.instruction_following, "max_length", 512)
         max_new_tokens = getattr(cfg.evals.instruction_following, "max_new_tokens", 256)
         do_sample = getattr(cfg.evals.instruction_following, "do_sample", False)
-        temperature = getattr(cfg.evals.instruction_following, "temperature", 0.0)
+        # temperature = getattr(cfg.evals.instruction_following, "temperature", 0.0)
         top_p = getattr(cfg.evals.instruction_following, "top_p", 1.0)
         repetition_penalty = getattr(
             cfg.evals.instruction_following, "repetition_penalty", 1.0
