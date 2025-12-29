@@ -88,6 +88,57 @@ def init_model_tokenizer_fixed(model_cfg):
     return model, tokenizer, wrapped_modules
 
 
+def generate_completions_from_prompts(
+    model,
+    tokenizer,
+    prompts,
+    *,
+    device: str,
+    max_length=None,
+    truncation: bool = True,
+    gen_kwargs=None,
+    end_of_turn_id=None,
+):
+    """Tokenize prompts, generate, and return decoded completions."""
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    pad_id = tokenizer.pad_token_id
+
+    enc = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=truncation,
+        max_length=max_length,
+    ).to(device)
+
+    # ── Autoregressive generation
+    with torch.no_grad():
+        generated = model.generate(**enc, **(gen_kwargs or {}))
+
+    # ── Extract only the newly generated continuation
+    # Precompute prompt lengths for the batch (excluding pad tokens)
+    prompt_lengths = (enc["input_ids"] != pad_id).sum(dim=1)
+    completions = []
+    for i, output_ids in enumerate(generated):
+        if end_of_turn_id is not None:
+            # Locate the first END‑OF‑TURN token in the *generated* sequence
+            eot_positions = (output_ids == end_of_turn_id).nonzero(as_tuple=True)[0]
+            if len(eot_positions) > 0:
+                # after the EOT
+                completion_ids = output_ids[eot_positions[0].item() + 1 :]
+            else:
+                # Fallback: trim the prompt length, using precomputed length
+                completion_ids = output_ids[prompt_lengths[i].item() :]
+        else:
+            completion_ids = output_ids[prompt_lengths[i].item() :]
+        completions.append(
+            tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
+        )
+
+    return completions
+
+
 def load_base_model_for_eval(cfg):
     """Load base model/tokenizer and apply shared eval-time setup."""
     tokenizer = AutoTokenizer.from_pretrained(
@@ -292,7 +343,6 @@ def toxicity():
         full_outputs = []
         completions_only = []
 
-        pad_id = tokenizer.pad_token_id
         batch_size = cfg.evals.toxicity.batch_size
 
         for start in tqdm(range(0, len(prompt_only), batch_size), desc="Generating"):
@@ -307,50 +357,16 @@ def toxicity():
                 for msgs in batch_messages
             ]
 
-            # ── Tokenise & push to GPU
-            enc = tokenizer(
+            batch_completions = generate_completions_from_prompts(
+                model,
+                tokenizer,
                 batch_prompts,
-                return_tensors="pt",
-                padding=True,
+                device=device,
                 max_length=256,
                 truncation=True,
-            ).to(device)
-
-            # ── Autoregressive generation
-            with torch.no_grad():
-                gen_ids = model.generate(**enc)
-
-            # ── Extract only the newly generated continuation
-            # Precompute prompt lengths for the batch (excluding pad tokens)
-            prompt_lengths = (enc["input_ids"] != pad_id).sum(dim=1).tolist()
-            for i, (prompt_ids, output_ids) in enumerate(
-                zip(enc["input_ids"], gen_ids)
-            ):
-                # Locate the first END‑OF‑TURN token in the *generated* sequence
-                eot_positions = (
-                    output_ids == cfg.evals.toxicity.end_of_turn_id
-                ).nonzero(as_tuple=True)[0]
-                if len(eot_positions) > 0:
-                    first_eot = eot_positions[0].item()
-                    # after the EOT
-                    completion_ids = output_ids[first_eot + 1 :]
-                else:
-                    # Fallback: trim the prompt length, using precomputed length
-                    prompt_len = prompt_lengths[i]
-                    completion_ids = output_ids[prompt_len:]
-
-                completions_only.append(
-                    # TODO: decode or batch decode?
-                    tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
-                )
-
-                completions_only.append(
-                    # TODO: decode or batch decode?
-                    tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
-                )
-
-            # optional: free VRAM early
-            del enc, gen_ids
+                end_of_turn_id=cfg.evals.toxicity.end_of_turn_id,
+            )
+            completions_only.extend(batch_completions)
 
         model.cpu()
 
@@ -479,20 +495,9 @@ def instruction_following():
             batch = prompts_with_text[start : start + batch_size]
             batch_texts = [rendered for _, rendered in batch]
 
-            enc = tokenizer(
-                batch_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=max_length,
-            ).to(device)
-
-            prompt_lengths = (enc["input_ids"] != pad_id).sum(dim=1)
-
             gen_kwargs = dict(
-                **enc,
                 max_new_tokens=max_new_tokens,
-                do_sample=False,
+                do_sample=do_sample,
                 # temperature=temperature if do_sample else 0.0,
                 top_p=top_p if do_sample else 1.0,
                 repetition_penalty=repetition_penalty,
@@ -502,19 +507,18 @@ def instruction_following():
                 ),
             )
 
-            with torch.no_grad():
-                generated = model.generate(**gen_kwargs)
+            completions = generate_completions_from_prompts(
+                model,
+                tokenizer,
+                batch_texts,
+                device=device,
+                max_length=max_length,
+                truncation=True,
+                gen_kwargs=gen_kwargs,
+            )
 
             for idx, (raw_prompt, _) in enumerate(batch):
-                output_ids = generated[idx]
-                prompt_len = prompt_lengths[idx].item()
-                continuation_ids = output_ids[prompt_len:]
-                completion = tokenizer.decode(
-                    continuation_ids, skip_special_tokens=True
-                ).strip()
-                responses[raw_prompt] = completion
-
-            del enc, generated
+                responses[raw_prompt] = completions[idx]
             if device == "cuda":
                 torch.cuda.empty_cache()
 
