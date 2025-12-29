@@ -36,6 +36,7 @@ from src.models import (
     MemoryClearCallback,
 )
 from src.sft import enable_topk_lora_grads, count_params
+from src.utils import ensure_chat_template_and_special_tokens, configure_eos_eot
 from trl import DPOTrainer, DPOConfig
 from torch.optim import AdamW
 import wandb
@@ -1243,63 +1244,16 @@ def run_dpo(cfg, quant_cfg):
             policy_model.config.use_cache = False
     except Exception as e:
         logging.warning(f"Could not enable gradient checkpointing: {e}")
-    extra = False
-
-    if not getattr(tokenizer, "chat_template", None):
-        logging.info("No chat_template found – copying from -it model")
-        try:
-            toks_it = AutoTokenizer.from_pretrained(
-                cfg.training.base_sft_merged_model.model_it_name,
-                use_fast=False,
-            )
-            if getattr(toks_it, "chat_template", None):
-                tokenizer.chat_template = toks_it.chat_template
-                logging.info("chat_template copied successfully")
-            # Merge additional special tokens if needed
-            extra = toks_it.special_tokens_map.get("additional_special_tokens", [])
-            if extra:
-                new_tokens = [t for t in extra if t not in tokenizer.get_vocab()]
-                if new_tokens:
-                    tokenizer.add_special_tokens(
-                        {"additional_special_tokens": new_tokens}
-                    )
-                    policy_model.resize_token_embeddings(len(tokenizer))
-                    logging.info("Added %d extra special tokens", len(new_tokens))
-        except OSError as exc:
-            logging.error("Failed to copy -it tokenizer: %s", exc)
-            raise exc
-        except Exception as exc:  # noqa: BLE001
-            logging.warning("Failed to copy -it tokenizer: %s", exc)
-
-    eot_token = (
-        tokenizer.special_tokens_map.get(
-            "additional_special_tokens", [tokenizer.eos_token]
-        )[1]
-        if len(tokenizer.special_tokens_map.get("additional_special_tokens", [])) > 1
-        else tokenizer.eos_token
+    new_tokens = ensure_chat_template_and_special_tokens(
+        tokenizer,
+        policy_model,
+        cfg.training.base_sft_merged_model.model_it_name,
     )
-
-    eot_token_id = tokenizer.convert_tokens_to_ids(eot_token)
-
-    if hasattr(policy_model.generation_config, "eos_token_id"):
-        if isinstance(policy_model.generation_config.eos_token_id, list):
-            if eot_token_id not in policy_model.generation_config.eos_token_id:
-                policy_model.generation_config.eos_token_id.append(eot_token_id)
-        else:
-            prev_eos = policy_model.generation_config.eos_token_id
-            policy_model.generation_config.eos_token_id = [prev_eos, eot_token_id]
-    else:
-        policy_model.generation_config.eos_token_id = [
-            tokenizer.eos_token_id,
-            eot_token_id,
-        ]
+    eot_token, eot_token_id = configure_eos_eot(tokenizer, policy_model)
 
     # Log the configuration
     print(f"EOT token: '{eot_token}' (ID: {eot_token_id})")
     print(f"EOS token ID(s): {policy_model.generation_config.eos_token_id}")
-
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
 
     # Load reference model
     logging.info("Loading reference model...")
@@ -1340,7 +1294,7 @@ def run_dpo(cfg, quant_cfg):
     for p in ref_model.parameters():
         p.requires_grad = False
 
-    if extra and new_tokens:
+    if new_tokens:
         ref_model.resize_token_embeddings(len(tokenizer))
         logging.info("Added %d extra special tokens to ref model", len(new_tokens))
 
