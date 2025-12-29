@@ -112,6 +112,9 @@ def preprocess_to_messages(example: Dict[str, Any]) -> Dict[str, Any]:  # noqa: 
 def ensure_chat_template_and_special_tokens(tokenizer, model, model_it_name: str):
     """Ensure a chat template exists, and merge any special tokens from a -it tokenizer."""
     if getattr(tokenizer, "chat_template", None):
+        logging.info(
+            "chat_template already exists in the model provided, no need to copy"
+        )
         return []
 
     logging.info("No chat_template found – copying from -it model")
