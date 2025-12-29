@@ -1212,8 +1212,8 @@ def run_dpo(cfg, quant_cfg):
     eot_token, eot_token_id = configure_eos_eot(tokenizer, policy_model)
 
     # Log the configuration
-    print(f"EOT token: '{eot_token}' (ID: {eot_token_id})")
-    print(f"EOS token ID(s): {policy_model.generation_config.eos_token_id}")
+    logging.info(f"EOT token: '{eot_token}' (ID: {eot_token_id})")
+    logging.info(f"EOS token ID(s): {policy_model.generation_config.eos_token_id}")
 
     # Load reference model
     logging.info("Loading reference model...")
