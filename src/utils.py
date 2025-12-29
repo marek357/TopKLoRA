@@ -18,6 +18,8 @@ import random
 import os
 import torch
 
+NUM_PROC = os.cpu_count() // 2
+
 
 def merge_lora_adapter(
     base_model_dir: str,
@@ -1456,10 +1458,14 @@ def build_sft_dataset(
     tokenized = mixed.map(
         tokenize_example,
         remove_columns=[c for c in mixed.column_names if c != "messages"],
+        num_proc=NUM_PROC,
     )
 
     # Filter out sequences that became empty after tokenization
-    tokenized = tokenized.filter(lambda ex: len(ex["input_ids"]) > 0)
+    tokenized = tokenized.filter(
+        lambda ex: len(ex["input_ids"]) > 0,
+        num_proc=NUM_PROC,
+    )
     return tokenized
 
 
