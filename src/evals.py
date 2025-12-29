@@ -154,7 +154,11 @@ def metrics():
                 choices = ex["targets"]["choices"]
                 gold_idx = ex["targets"]["labels"].index(1)
 
-                base_prompt_raw = build_metrics_eval_messages(q, choices[0], choices[1])
+                base_prompt_raw = build_metrics_eval_messages(
+                    q,
+                    choices[0],
+                    choices[1],
+                )
 
                 # Render prompt up to "Reply A:" and then append one of the replies
                 base_prompt = tokenizer.apply_chat_template(
