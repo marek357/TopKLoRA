@@ -1113,7 +1113,7 @@ def build_metrics_eval_messages(
         "Which reply is better? Answer with A or B only."
     )
     return [
-        {"role": "user", "content": f"{question}\n\n"},
+        {"role": "user", "content": f"{user}\n\n"},
         # The assistant role is left blank; the tokenizer adds the tag.
     ]
 
@@ -1223,7 +1223,7 @@ def _save_datasets_to_cache(
     try:
         train_ds.save_to_disk(train_cache_dir)
         eval_ds.save_to_disk(eval_cache_dir)
-        print(f"💾 Also saved disk format for efficient streaming")
+        print("💾 Also saved disk format for efficient streaming")
     except Exception as e:
         print(f"⚠️ Failed to save disk format: {e}")
 
@@ -1254,7 +1254,7 @@ def _load_datasets_from_cache(
             # This avoids issues with evaluation loops that expect finite datasets
             train_ds = train_ds.to_iterable_dataset()
             print(
-                f"✅ Training dataset streaming enabled, eval dataset kept as regular dataset"
+                "✅ Training dataset streaming enabled, eval dataset kept as regular dataset"
             )
         else:
             print(
@@ -1275,7 +1275,7 @@ def _load_datasets_from_cache(
             # Only convert training dataset to streaming
             train_ds = train_ds.to_iterable_dataset()
             print(
-                f"✅ Training dataset streaming enabled from Arrow cache, eval dataset regular"
+                "✅ Training dataset streaming enabled from Arrow cache, eval dataset regular"
             )
         else:
             print(
@@ -1298,7 +1298,7 @@ def _load_datasets_from_cache(
     try:
         train_ds.save_to_disk(train_cache_dir)
         eval_ds.save_to_disk(eval_cache_dir)
-        print(f"💾 Converted cache to disk format for future streaming")
+        print("💾 Converted cache to disk format for future streaming")
     except Exception as e:
         print(f"⚠️ Failed to convert to disk format: {e}")
 
@@ -1306,7 +1306,7 @@ def _load_datasets_from_cache(
         # Only convert training dataset to streaming
         train_ds = train_ds.to_iterable_dataset()
         print(
-            f"✅ Training dataset streaming enabled from pickle cache, eval dataset regular"
+            "✅ Training dataset streaming enabled from pickle cache, eval dataset regular"
         )
     else:
         print(
@@ -1680,7 +1680,7 @@ def build_sft_datasets(
         train_ds = train_ds.to_iterable_dataset()
         # Keep eval_ds as regular dataset for compatibility with evaluation loops
         print(
-            f"✅ Training dataset converted to streaming format, eval dataset kept regular"
+            "✅ Training dataset converted to streaming format, eval dataset kept regular"
         )
 
     return train_ds, eval_ds
