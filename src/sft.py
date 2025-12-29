@@ -16,6 +16,7 @@ from src.utils import (
     preprocess_to_messages,
     ensure_chat_template_and_special_tokens,
     configure_eos_eot,
+    wrap_topk_lora_modules,
 )
 import numpy as np
 import logging
@@ -542,61 +543,29 @@ def run_sft(cfg):
     # Check if TopK is enabled in the configuration
     if getattr(cfg.training.sft_experiment.lora, "use_topk", False):
         logging.info("🔥 Injecting TopKLoRALinearSTE wrappers...")
-        targets = []
-        for name, module in model.named_modules():
-            if getattr(module, "lora_A", None) is not None:
-                targets.append(name)
-
-        replaced = 0
-        for name in targets:
-            peft_layer = model.get_submodule(name)
-            parent = (
-                model.get_submodule(".".join(name.split(".")[:-1]))
-                if "." in name
-                else model
-            )
-            attr = name.split(".")[-1]
-            wrapped = TopKLoRALinearSTE(
-                base=peft_layer,
-                layer_name=name,
-                k=cfg.training.sft_experiment.lora.k,
-                temperature=getattr(
-                    cfg.training.sft_experiment.lora, "temperature", 1.0
-                ),
-                temperature_schedule=getattr(
-                    cfg.training.sft_experiment.lora, "temperature_schedule", "constant"
-                ),
-                k_schedule=getattr(
-                    cfg.training.sft_experiment.lora, "k_schedule", "constant"
-                ),
-                k_final=getattr(
-                    cfg.training.sft_experiment.lora,
-                    "k_final",
-                    cfg.training.sft_experiment.lora.k,
-                ),
-                hard_eval=True,
-                relu_latents=True,
-                alpha_over_r=True,
-                temperature_final=getattr(
-                    cfg.training.sft_experiment.lora, "temperature_final", None
-                ),
-                is_topk_experiment=cfg.training.sft_experiment.lora.get(
-                    "top_k_experiment", False
-                ),
-            )
-            try:
-                target_device = next(peft_layer.parameters()).device
-            except StopIteration:
-                if hasattr(peft_layer, "base_layer") and hasattr(
-                    peft_layer.base_layer, "weight"
-                ):
-                    target_device = peft_layer.base_layer.weight.device
-                else:
-                    target_device = next(model.parameters()).device
-            wrapped = wrapped.to(device=target_device)
-            wrapped.train()
-            setattr(parent, attr, wrapped)
-            replaced += 1
+        replaced, _ = wrap_topk_lora_modules(
+            model,
+            k=cfg.training.sft_experiment.lora.k,
+            temperature=getattr(cfg.training.sft_experiment.lora, "temperature", 1.0),
+            temperature_schedule=getattr(
+                cfg.training.sft_experiment.lora, "temperature_schedule", "constant"
+            ),
+            k_schedule=getattr(
+                cfg.training.sft_experiment.lora, "k_schedule", "constant"
+            ),
+            k_final=getattr(
+                cfg.training.sft_experiment.lora,
+                "k_final",
+                cfg.training.sft_experiment.lora.k,
+            ),
+            temperature_final=getattr(
+                cfg.training.sft_experiment.lora, "temperature_final", None
+            ),
+            is_topk_experiment=cfg.training.sft_experiment.lora.get(
+                "top_k_experiment", False
+            ),
+            set_train=True,
+        )
         logging.info(f"✅ Injected TopK STE wrappers in {replaced} layers")
         enable_topk_lora_grads(model)
         print("Model after TopK injection")
