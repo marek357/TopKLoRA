@@ -195,10 +195,10 @@ def wrap_topk_lora_modules(
     k_final: Optional[int],
     temperature_final: Optional[float],
     is_topk_experiment: bool,
+    set_train: bool,
     hard_eval: bool = True,
     relu_latents: bool = True,
     alpha_over_r: bool = True,
-    set_train: Optional[bool] = None,
 ):
     """Wrap PEFT LoRA layers with TopKLoRALinearSTE and return (count, mapping)."""
     targets = []
@@ -240,9 +240,9 @@ def wrap_topk_lora_modules(
             else:
                 target_device = next(model.parameters()).device
         wrapped = wrapped.to(device=target_device)
-        if set_train is True:
+        if set_train:
             wrapped.train()
-        elif set_train is False:
+        else:
             wrapped.eval()
         setattr(parent, attr, wrapped)
         wrapped_modules[name] = wrapped
@@ -284,8 +284,8 @@ def capture_env_snapshot(output_dir: str) -> None:
             )
             with open(os.path.join(env_dir, "requirements_freeze.txt"), "wb") as f:
                 f.write(frz.stdout)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Failed to capture pip freeze: %s", exc)
 
         # nvidia-smi
         try:
@@ -294,8 +294,8 @@ def capture_env_snapshot(output_dir: str) -> None:
             )
             with open(os.path.join(env_dir, "nvidia-smi.txt"), "wb") as f:
                 f.write(smi.stdout or smi.stderr)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Failed to capture nvidia-smi output: %s", exc)
     except Exception as exc:  # noqa: BLE001
         logging.warning("Failed to capture environment info: %s", exc)
 
@@ -351,7 +351,9 @@ def format_adapter_suffix(adapter_checkpoint_dir: str) -> str:
 
 
 def write_json(path: str, data: Any) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    dir_name = os.path.dirname(path)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
 
