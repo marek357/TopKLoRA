@@ -39,7 +39,7 @@ Example usage:
 """
 
 import logging
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Any
 import torch
 import torch.nn as nn
 from contextlib import contextmanager

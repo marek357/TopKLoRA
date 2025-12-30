@@ -1,4 +1,3 @@
-import json
 import os
 from collections import defaultdict
 from pathlib import Path
@@ -369,6 +368,8 @@ def toxicity():
                 end_of_turn_id=cfg.evals.toxicity.end_of_turn_id,
             )
             completions_only.extend(batch_completions)
+            for prompt, completion in zip(batch_prompts, batch_completions):
+                full_outputs.append(prompt + completion)
 
         model.cpu()
 
@@ -463,9 +464,6 @@ def instruction_following():
         batch_size = getattr(cfg.evals.instruction_following, "batch_size", 100)
         max_length = getattr(cfg.evals.instruction_following, "max_length", 512)
         max_new_tokens = getattr(cfg.evals.instruction_following, "max_new_tokens", 256)
-        do_sample = getattr(cfg.evals.instruction_following, "do_sample", False)
-        # temperature = getattr(cfg.evals.instruction_following, "temperature", 0.0)
-        top_p = getattr(cfg.evals.instruction_following, "top_p", 1.0)
         repetition_penalty = getattr(
             cfg.evals.instruction_following, "repetition_penalty", 1.0
         )
@@ -483,9 +481,11 @@ def instruction_following():
 
             gen_kwargs = dict(
                 max_new_tokens=max_new_tokens,
-                do_sample=do_sample,
+                # this should in principle be set to False because we want to have a
+                # deterministic behaviour -- greedy decoding decreases noise in eval results
+                do_sample=False,
                 # temperature=temperature if do_sample else 0.0,
-                top_p=top_p if do_sample else 1.0,
+                top_p=1.0,
                 repetition_penalty=repetition_penalty,
                 pad_token_id=pad_id,
                 eos_token_id=getattr(
