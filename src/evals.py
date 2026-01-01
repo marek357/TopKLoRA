@@ -1143,10 +1143,13 @@ def perplexity():
         if cfg.evals.perplexity.max_samples > 0:
             dataset = dataset.select(range(cfg.evals.perplexity.max_samples))
 
+        processing_func = (
+            wikitext_detokenizer
+            if cfg.evals.perplexity.dataset_name == "wikitext"
+            else (lambda x: x)
+        )
         texts = [
-            wikitext_detokenizer(t)
-            for t in dataset[text_column]
-            if t and not t.isspace()
+            processing_func(t) for t in dataset[text_column] if t and not t.isspace()
         ]
         enc = tokenizer("\n\n".join(texts), return_tensors="pt")
         input_ids = enc.input_ids
