@@ -1,4 +1,0 @@
-name: instruction_following
-eval_base_model: True
-build_eval_function:
-  _target_: src.evals.instruction_following

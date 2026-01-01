@@ -1,0 +1,13 @@
+name: perplexity
+dataset_name: "wikitext"
+dataset_config: "wikitext-2-raw-v1"
+split: "test"
+text_column: "text"
+eval_base_model: False
+block_size: 1024
+stride: 512
+max_samples: -1
+max_tokens: 1000
+output_dir: eval_outputs/perplexity
+build_eval_function:
+  _target_: src.evals.perplexity
