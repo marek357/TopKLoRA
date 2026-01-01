@@ -549,6 +549,11 @@ def perplexity():
             logging.info("Evaluating perplexity on the adapter model...")
             model, tokenizer, _ = init_model_tokenizer_fixed(cfg.model)
 
+        if cfg.evals.perplexity.dataset_config is None:
+            raise ValueError(
+                "Please specify dataset_config for perplexity eval (e.g., 'wikitext-2-raw-v1')."
+            )
+
         dataset = load_dataset(
             cfg.evals.perplexity.dataset_name,
             cfg.evals.perplexity.dataset_config,
@@ -590,6 +595,8 @@ def perplexity():
             if cfg.evals.perplexity.stride is None
             else cfg.evals.perplexity.stride
         )
+        if stride == 0:
+            raise ValueError("Stride cannot be zero.")
 
         total_nll = 0.0
         total_tokens = 0
