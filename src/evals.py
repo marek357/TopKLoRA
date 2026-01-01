@@ -1,3 +1,5 @@
+import logging
+import math
 import os
 from collections import defaultdict
 from pathlib import Path
@@ -30,8 +32,9 @@ from src.utils import (
     ensure_chat_template_and_special_tokens,
     format_adapter_suffix,
     preprocess_to_perspective_message,
-    write_json,
     wrap_topk_lora_modules,
+    write_json,
+    wikitext_detokenizer,
 )
 
 device = (
@@ -76,6 +79,7 @@ def init_model_tokenizer_fixed(model_cfg):
     print(f"Wrapped {replaced} LoRA modules with TopK for inference")
     model.to(device)
     model.eval()
+    print(f"Loaded model dtype: {model.dtype}")
 
     print("Sanity checking LoRA B weights...")
     for name, module in model.named_modules():
@@ -151,6 +155,7 @@ def load_base_model_for_eval(cfg):
         torch_dtype="auto",
         device_map="cpu",
     )
+    print(f"Loaded model dtype: {model.dtype}")
 
     model.to(device)
     model.eval()
@@ -530,3 +535,101 @@ def instruction_following():
         print(f"Report saved to: {report_path}")
 
     return eval_instruction_following
+
+
+def perplexity():
+    def eval_perplexity(cfg):
+        if cfg.evals.perplexity.eval_base_model:
+            logging.info("Evaluating perplexity on the base model...")
+            model, tokenizer = load_base_model_for_eval(cfg)
+            logging.info(
+                "Note that the chat template is NOT applied for perplexity eval."
+            )
+        else:
+            logging.info("Evaluating perplexity on the adapter model...")
+            model, tokenizer, _ = init_model_tokenizer_fixed(cfg.model)
+
+        dataset = load_dataset(
+            cfg.evals.perplexity.dataset_name,
+            cfg.evals.perplexity.dataset_config,
+            split=cfg.evals.perplexity.split,
+        )
+        text_column = cfg.evals.perplexity.text_column
+        if cfg.evals.perplexity.max_samples > 0:
+            dataset = dataset.select(range(cfg.evals.perplexity.max_samples))
+
+        texts = [
+            wikitext_detokenizer(t)
+            for t in dataset[text_column]
+            if t and not t.isspace()
+        ]
+        enc = tokenizer("\n\n".join(texts), return_tensors="pt")
+        input_ids = enc.input_ids
+
+        # Show the decoded first 100 tokens
+        logging.info("Decoded first 100 tokens:")
+        preview_tokens = input_ids[0, : min(100, input_ids.size(1))]
+        logging.info(tokenizer.decode(preview_tokens))
+
+        logging.info(f"Total tokens in input: {input_ids.size(1)}")
+        max_tokens = cfg.evals.perplexity.max_tokens
+        logging.info(f"Using {max_tokens} max tokens for scoring.")
+        if max_tokens > 0 and input_ids.size(1) > max_tokens:
+            input_ids = input_ids[:, :max_tokens]
+
+        model_max_length = getattr(model.config, "max_position_embeddings", None)
+        block_size = cfg.evals.perplexity.block_size
+        if model_max_length is not None:
+            block_size = min(block_size, model_max_length)
+        block_size = min(block_size, tokenizer.model_max_length)
+        stride = (
+            block_size
+            if cfg.evals.perplexity.stride is None
+            else cfg.evals.perplexity.stride
+        )
+
+        total_nll = 0.0
+        total_tokens = 0
+        for i in tqdm(range(0, input_ids.size(1), stride), desc="Scoring"):
+            begin_loc = max(i + stride - block_size, 0)
+            end_loc = min(i + stride, input_ids.size(1))
+            trg_len = end_loc - i
+            input_ids_slice = input_ids[:, begin_loc:end_loc].to(device)
+            target_ids = input_ids_slice.clone()
+            target_ids[:, :-trg_len] = -100
+
+            with torch.no_grad():
+                outputs = model(input_ids_slice, labels=target_ids)
+                total_nll += outputs.loss.item() * trg_len
+                total_tokens += trg_len
+
+        ppl = math.exp(total_nll / max(total_tokens, 1))
+        logging.info(f"Perplexity: {ppl:.4f} over {total_tokens} tokens.")
+        report = {
+            "perplexity": ppl,
+            "tokens_scored": total_tokens,
+            "dataset_name": cfg.evals.perplexity.dataset_name,
+            "dataset_config": cfg.evals.perplexity.dataset_config,
+            "split": cfg.evals.perplexity.split,
+            "block_size": block_size,
+            "stride": stride,
+            "max_tokens": max_tokens,
+        }
+        print(report)
+
+        output_dir = Path(
+            cfg.evals.perplexity.get("output_dir", "eval_outputs/perplexity")
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        model_tag = (
+            "base_model"
+            if cfg.evals.perplexity.eval_base_model
+            else format_adapter_suffix(cfg.model.adapter_checkpoint_dir)
+        )
+        report_path = output_dir / f"report_{model_tag}.json"
+        write_json(str(report_path), report)
+        print(f"Report saved to: {report_path}")
+
+        return report
+
+    return eval_perplexity
