@@ -25,6 +25,36 @@ import torch
 NUM_PROC = os.cpu_count() // 2
 
 
+def get_local_rank() -> int:
+    return int(os.environ.get("LOCAL_RANK", 0))
+
+
+def get_global_rank() -> int:
+    return int(os.environ.get("RANK", 0))
+
+
+def get_world_size() -> int:
+    return int(os.environ.get("WORLD_SIZE", 1))
+
+
+def is_distributed() -> bool:
+    return get_world_size() > 1
+
+
+def is_main_process() -> bool:
+    return get_global_rank() == 0
+
+
+def init_distributed(backend: str = "nccl") -> int:
+    if torch.cuda.is_available():
+        if is_distributed() and not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend=backend, init_method="env://")
+        local_rank = get_local_rank()
+        torch.cuda.set_device(local_rank)
+        return local_rank
+    return get_local_rank()
+
+
 def merge_lora_adapter(
     base_model_dir: str,
     lora_checkpoint_dir: str,

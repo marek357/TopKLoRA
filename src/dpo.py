@@ -43,6 +43,10 @@ from src.utils import (
     capture_env_snapshot,
     save_summary,
     maybe_update_wandb_config,
+    get_local_rank,
+    get_world_size,
+    init_distributed,
+    is_main_process,
 )
 
 # Configure logging
@@ -548,13 +552,7 @@ def _resolve_device_map_for_ddp() -> Optional[Dict[str, int]]:
     """
     try:
         if torch.cuda.is_available():
-            # Prefer LOCAL_RANK when provided by torch.distributed/accelerate
-            local_rank_env = os.environ.get("LOCAL_RANK")
-            if local_rank_env is not None:
-                local_idx = int(local_rank_env)
-            else:
-                # When CUDA_VISIBLE_DEVICES is restricted per-process, current_device() is 0
-                local_idx = int(torch.cuda.current_device())
+            local_idx = get_local_rank()
             logging.info(f"Using per-process device_map -> {{'': {local_idx}}}")
             return {"": local_idx}
     except Exception as e:
@@ -1167,6 +1165,8 @@ def prepare_civil_comments_datasets(
 def run_dpo(cfg, quant_cfg):
     dpo_args = cfg.training.dpo
     experiment_args = cfg.training.dpo_experiment
+    init_distributed()
+    world_size = get_world_size()
     device = (
         "cuda"
         if torch.cuda.is_available()
@@ -1360,20 +1360,21 @@ def run_dpo(cfg, quant_cfg):
     )
     logging.info(f"Run artifacts will be saved under: {output_dir}")
 
-    # Mark this as the latest run via symlink (best-effort)
-    try:
-        latest_link = os.path.join(cfg.training.dump_path, "latest")
-        if os.path.islink(latest_link) or os.path.exists(latest_link):
-            try:
-                os.remove(latest_link)
-            except Exception:
-                pass
-        os.symlink(output_dir, latest_link)
-    except Exception as e:
-        logging.warning(f"Could not create 'latest' symlink: {e}")
+    if is_main_process():
+        # Mark this as the latest run via symlink (best-effort)
+        try:
+            latest_link = os.path.join(cfg.training.dump_path, "latest")
+            if os.path.islink(latest_link) or os.path.exists(latest_link):
+                try:
+                    os.remove(latest_link)
+                except Exception:
+                    pass
+            os.symlink(output_dir, latest_link)
+        except Exception as e:
+            logging.warning(f"Could not create 'latest' symlink: {e}")
 
-    save_cfg_yaml(output_dir, cfg)
-    capture_env_snapshot(output_dir)
+        save_cfg_yaml(output_dir, cfg)
+        capture_env_snapshot(output_dir)
 
     # Human-readable summary
     try:
@@ -1390,14 +1391,18 @@ def run_dpo(cfg, quant_cfg):
         summary.append(
             f"dpo: beta={dpo_args.beta}, lr={dpo_args.learning_rate}, steps={dpo_args.max_steps}, bs={dpo_args.per_device_train_batch_size}x{dpo_args.gradient_accumulation_steps}"
         )
-        save_summary(output_dir, summary)
+        if is_main_process():
+            save_summary(output_dir, summary)
     except Exception as e:
         logging.warning(f"Failed to build summary README.txt: {e}")
 
     run_name = getattr(cfg, "experiment_name", None) or os.path.basename(output_dir)
-    maybe_update_wandb_config(cfg.logger, hparams, run_name)
+    if is_main_process():
+        maybe_update_wandb_config(cfg.logger, hparams, run_name)
 
     # DPO configuration
+    ddp_backend = "nccl" if world_size > 1 and device == "cuda" else None
+    ddp_find_unused = False if world_size > 1 else None
     dpo_config = DPOConfig(
         output_dir=output_dir,
         # num_train_epochs=args.epochs,
@@ -1423,21 +1428,24 @@ def run_dpo(cfg, quant_cfg):
         metric_for_best_model="eval_rewards/accuracies",
         greater_is_better=True,
         save_total_limit=3,
+        ddp_backend=ddp_backend,
+        ddp_find_unused_parameters=ddp_find_unused,
     )
 
     # Persist training args for reproducibility
-    try:
-        with open(os.path.join(output_dir, "dpo_config.json"), "w") as f:
-            json.dump(
-                dpo_config.to_dict()
-                if hasattr(dpo_config, "to_dict")
-                else dpo_config.__dict__,
-                f,
-                indent=2,
-                default=str,
-            )
-    except Exception as e:
-        logging.warning(f"Failed to write dpo_config.json: {e}")
+    if is_main_process():
+        try:
+            with open(os.path.join(output_dir, "dpo_config.json"), "w") as f:
+                json.dump(
+                    dpo_config.to_dict()
+                    if hasattr(dpo_config, "to_dict")
+                    else dpo_config.__dict__,
+                    f,
+                    indent=2,
+                    default=str,
+                )
+        except Exception as e:
+            logging.warning(f"Failed to write dpo_config.json: {e}")
 
     # collator = None
 
@@ -1545,33 +1553,34 @@ def run_dpo(cfg, quant_cfg):
     final_path = os.path.join(output_dir, "final_adapter")
 
     # Primary save via trainer
-    trainer.save_model(final_path)
-    tokenizer.save_pretrained(final_path)
+    if trainer.is_world_process_zero():
+        trainer.save_model(final_path)
+        tokenizer.save_pretrained(final_path)
 
-    # Also explicit PEFT save for compatibility
-    trainer.model.save_pretrained(final_path)
+        # Also explicit PEFT save for compatibility
+        trainer.model.save_pretrained(final_path)
 
-    # Explicit adapter state dict (belt and suspenders approach from SFT)
-    adapter_state_dict = get_peft_model_state_dict(
-        model, state_dict=model.state_dict(), adapter_name="default"
-    )
-    torch.save(adapter_state_dict, f"{final_path}/adapter_model.bin")
+        # Explicit adapter state dict (belt and suspenders approach from SFT)
+        adapter_state_dict = get_peft_model_state_dict(
+            model, state_dict=model.state_dict(), adapter_name="default"
+        )
+        torch.save(adapter_state_dict, f"{final_path}/adapter_model.bin")
 
-    # Save as safetensors (preferred format)
-    from safetensors.torch import load_file, save_file
+        # Save as safetensors (preferred format)
+        from safetensors.torch import load_file, save_file
 
-    save_file(adapter_state_dict, f"{final_path}/adapter_model.safetensors")
+        save_file(adapter_state_dict, f"{final_path}/adapter_model.safetensors")
 
-    logging.info(f"✅ Adapter saved to: {final_path}")
+        logging.info(f"✅ Adapter saved to: {final_path}")
 
-    # print dataset used
-    # Verification: print saved keys
-    saved = load_file(f"{final_path}/adapter_model.safetensors")
-    print("Saved keys sample:")
-    for key in list(saved.keys())[:5]:
-        print(f"  {key}")
+        # print dataset used
+        # Verification: print saved keys
+        saved = load_file(f"{final_path}/adapter_model.safetensors")
+        print("Saved keys sample:")
+        for key in list(saved.keys())[:5]:
+            print(f"  {key}")
 
-    logging.info(f"Model saved to {final_path}")
+        logging.info(f"Model saved to {final_path}")
 
     # Print final summary
     print("\n" + "=" * 60)
@@ -1589,5 +1598,5 @@ def run_dpo(cfg, quant_cfg):
     # print the name of the dataset
     logging.info(f"Dataset used: {cfg.training.dpo_dataset.name}")
 
-    if cfg.logger.wandb_mode != "disabled":
+    if cfg.logger.wandb_mode != "disabled" and trainer.is_world_process_zero():
         wandb.finish()
