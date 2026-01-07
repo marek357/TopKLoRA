@@ -871,6 +871,10 @@ def run_sft(cfg):
         for key in list(saved.keys())[:5]:
             print(f"  {key}")
 
-        wandb.finish()
+        # Only finish the Weights & Biases run if WandB logging is enabled.
+        logger_cfg = getattr(cfg, "logger", None)
+        wandb_mode = getattr(logger_cfg, "wandb_mode", None) if logger_cfg is not None else None
+        if wandb_mode != "disabled":
+            wandb.finish()
 
     return trainer.model
