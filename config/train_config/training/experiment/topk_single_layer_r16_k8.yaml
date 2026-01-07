@@ -1,0 +1,27 @@
+size: "recommended_topk_single_layer"
+lora:
+  r: 16
+  bias: 'none'
+  alpha: 32
+  dropout: 0.05
+
+  use_topk: true
+  k: 8
+  k_final: 4
+  k_schedule: "linear"
+
+  temperature: 1.0
+  temperature_final: 0.1
+  temperature_schedule: "cubic"
+
+  log_dead_latents: false
+  dead_latents_log_every: 250
+
+  target_modules:
+    - layers.13.self_attn.q_proj
+    - layers.13.self_attn.k_proj
+    - layers.13.self_attn.v_proj
+    - layers.13.self_attn.o_proj
+    - layers.13.mlp.gate_proj
+    - layers.13.mlp.up_proj
+    - layers.13.mlp.down_proj

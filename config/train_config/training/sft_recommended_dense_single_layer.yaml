@@ -1,0 +1,10 @@
+defaults:
+  - sft_recommended_base
+  - experiment/dense_single_layer_r16@sft_experiment
+
+dump_trained_model: True
+dump_path: "models/sft_dense_single_layer/${training.model.model_name}"
+
+sft:
+  save_steps: 500
+  max_steps: 6000

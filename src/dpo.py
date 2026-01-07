@@ -1165,6 +1165,10 @@ def prepare_civil_comments_datasets(
 
 
 def run_dpo(cfg, quant_cfg):
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+
     dpo_args = cfg.training.dpo
     experiment_args = cfg.training.dpo_experiment
     device = (
@@ -1398,7 +1402,7 @@ def run_dpo(cfg, quant_cfg):
     maybe_update_wandb_config(cfg.logger, hparams, run_name)
 
     # DPO configuration
-    dpo_config = DPOConfig(
+    dpo_kwargs = {
         output_dir=output_dir,
         # num_train_epochs=args.epochs,
         reference_free=False,
@@ -1423,7 +1427,17 @@ def run_dpo(cfg, quant_cfg):
         metric_for_best_model="eval_rewards/accuracies",
         greater_is_better=True,
         save_total_limit=3,
-    )
+    }
+
+    deepspeed_config = getattr(cfg.training, "deepspeed", None)
+    if deepspeed_config:
+        dpo_kwargs["deepspeed"] = deepspeed_config
+
+    ddp_find_unused = getattr(cfg.training, "ddp_find_unused_parameters", None)
+    if ddp_find_unused is not None:
+        dpo_kwargs["ddp_find_unused_parameters"] = ddp_find_unused
+
+    dpo_config = DPOConfig(**dpo_kwargs)
 
     # Persist training args for reproducibility
     try:

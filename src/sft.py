@@ -43,6 +43,19 @@ device = (
 )
 
 
+def _resolve_device_map_for_ddp() -> dict | None:
+    """Resolve a per-process device map when running under DDP/torchrun."""
+    if not torch.cuda.is_available():
+        return None
+    local_rank_env = os.environ.get("LOCAL_RANK")
+    if local_rank_env is not None:
+        local_idx = int(local_rank_env)
+    else:
+        local_idx = int(torch.cuda.current_device())
+    logging.info(f"Using per-process device_map -> {{'': {local_idx}}}")
+    return {"": local_idx}
+
+
 class EnhancedSFTTrainer(SFTTrainer):
     """
     Enhanced SFT Trainer with TopK monitoring and optional regularization.
@@ -384,20 +397,22 @@ def run_sft(cfg):
         quant_cfg = None
     logging.info("Using quantisation: %s", quant_cfg)
 
+    device_map = _resolve_device_map_for_ddp() if device == "cuda" else None
+
     if "gemma" in cfg.training.model.name:
         tokenizer.padding_side = "right"
         model = AutoModelForCausalLM.from_pretrained(
             cfg.training.model.model_name,
             attn_implementation="eager",
             quantization_config=quant_cfg,
-            device_map={"": local_rank} if device == "cuda" else None,
+            device_map=device_map,
             trust_remote_code=True,
         )
     else:
         model = AutoModelForCausalLM.from_pretrained(
             cfg.training.model.model_name,
             quantization_config=quant_cfg,
-            device_map={"": local_rank} if device == "cuda" else None,
+            device_map=device_map,
             trust_remote_code=True,
         )
 
@@ -489,7 +504,7 @@ def run_sft(cfg):
 
     model_str = f"{cfg.training.model.name}_{cfg.training.model.version}_{cfg.training.model.size}"
     base_output_dir = f"experiments/{model_str}_sparse_sft"
-    training_args = SFTConfig(
+    training_kwargs = {
         packing=cfg.training.sft.packing,
         # changes the tokenizers eos token to eot and the google gemma-2b-it doesn't have that will default to the list [...] in the tokenizer bos and end of turn
         eos_token=eot_token,
@@ -524,7 +539,17 @@ def run_sft(cfg):
         weight_decay=cfg.training.sft.weight_decay,
         push_to_hub=cfg.training.sft.push_to_hub,
         do_eval=cfg.training.sft.do_eval,
-    )
+    }
+
+    deepspeed_config = getattr(cfg.training, "deepspeed", None)
+    if deepspeed_config:
+        training_kwargs["deepspeed"] = deepspeed_config
+
+    ddp_find_unused = getattr(cfg.training, "ddp_find_unused_parameters", None)
+    if ddp_find_unused is not None:
+        training_kwargs["ddp_find_unused_parameters"] = ddp_find_unused
+
+    training_args = SFTConfig(**training_kwargs)
 
     # Prepare regularization config for enhanced trainer
     reg_cfg = {
