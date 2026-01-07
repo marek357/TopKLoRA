@@ -1367,8 +1367,8 @@ def run_dpo(cfg, quant_cfg):
             if os.path.islink(latest_link) or os.path.exists(latest_link):
                 try:
                     os.remove(latest_link)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logging.warning(f"Could not remove existing 'latest' link '{latest_link}': {e}")
             os.symlink(output_dir, latest_link)
         except Exception as e:
             logging.warning(f"Could not create 'latest' symlink: {e}")
