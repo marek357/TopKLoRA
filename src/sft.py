@@ -607,8 +607,10 @@ def run_sft(cfg):
     count_params(ft_model)
 
     # Some launchers flip flags during init; enforce again just before training:
-    enable_topk_lora_grads(trainer.model)
-    count_trainables(trainer.model, "right before train()")
+    if use_topk:
+        enable_topk_lora_grads(trainer.model)
+    trainables = count_trainables(trainer.model, "right before train()")
+    assert trainables > 0, "No trainable params in dense/TopK LoRA path."
 
     # (Optional) sanity: ensure the optimizer really has params
     num_opt_params = sum(
