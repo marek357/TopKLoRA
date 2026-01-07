@@ -824,7 +824,8 @@ def run_sft(cfg):
                         logs[f"update_norm/{name}"] = float(
                             (p.detach().cpu() - self.prev[name]).norm()
                         )
-            wandb.log(logs, step=state.global_step)
+            if args.report_to and "wandb" in args.report_to:
+                wandb.log(logs, step=state.global_step)
             print(logs)
 
     # add it
