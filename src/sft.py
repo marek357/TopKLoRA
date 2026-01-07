@@ -488,7 +488,9 @@ def run_sft(cfg):
         logging.info("Using legacy streaming datasets")
 
     model_str = f"{cfg.training.model.name}_{cfg.training.model.version}_{cfg.training.model.size}"
-    base_output_dir = f"experiments/{model_str}_sparse_sft"
+    use_topk = getattr(cfg.training.sft_experiment.lora, "use_topk", False)
+    output_suffix = "_sparse_sft" if use_topk else "_dense_sft"
+    base_output_dir = f"experiments/{model_str}{output_suffix}"
     training_args = SFTConfig(
         packing=cfg.training.sft.packing,
         # changes the tokenizers eos token to eot and the google gemma-2b-it doesn't have that will default to the list [...] in the tokenizer bos and end of turn
@@ -542,7 +544,6 @@ def run_sft(cfg):
     }
 
     # Use enhanced trainer if TopK is enabled, otherwise regular trainer
-    use_topk = getattr(cfg.training.sft_experiment.lora, "use_topk", False)
     reg_mode = "z_only" if use_topk else "off"
 
     # ----------------------- TopK Injection (Enhanced) -----------------------
