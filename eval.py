@@ -1,23 +1,16 @@
-from collections import defaultdict
 import wandb
 import torch
 import hydra
 import random
 import numpy as np
-from trl import setup_chat_format
-from transformers import AutoTokenizer, AutoModelForCausalLM, set_seed
+from transformers import set_seed
 from hydra.utils import instantiate
 from dotenv import load_dotenv
 from omegaconf import DictConfig, OmegaConf
 import logging
-from src.evals import metrics
 
 
-@hydra.main(
-    version_base=None,
-    config_path="config/eval_config",
-    config_name="default"
-)
+@hydra.main(version_base=None, config_path="config/eval_config", config_name="default")
 def main(cfg: DictConfig):
     load_dotenv()
 
@@ -39,7 +32,7 @@ def main(cfg: DictConfig):
         entity=cfg.logger.entity,
         name=cfg.experiment_name,
         config=OmegaConf.to_container(cfg, resolve=True),
-        mode=cfg.logger.wandb_mode  # NOTE: disabled by default
+        mode=cfg.logger.wandb_mode,  # NOTE: disabled by default
     )
 
     # run all selected evals
@@ -48,5 +41,5 @@ def main(cfg: DictConfig):
         eval_fn(cfg)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
