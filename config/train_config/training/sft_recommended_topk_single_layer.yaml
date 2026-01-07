@@ -1,0 +1,10 @@
+defaults:
+  - sft_recommended_base
+  - experiment/topk_single_layer_r16_k8@sft_experiment
+
+dump_trained_model: True
+dump_path: "models/sft_topk_single_layer/${training.model.model_name}"
+
+sft:
+  save_steps: 500
+  max_steps: 6000
