@@ -486,6 +486,7 @@ def run_sft(cfg):
         train_dataset = IterableDataset.from_generator(train_gen)
         eval_dataset = IterableDataset.from_generator(eval_gen)
         logging.info("Using legacy streaming datasets")
+    count_trainables(model, "after dataset setup")
 
     model_str = f"{cfg.training.model.name}_{cfg.training.model.version}_{cfg.training.model.size}"
     use_topk = getattr(cfg.training.sft_experiment.lora, "use_topk", False)
@@ -526,6 +527,14 @@ def run_sft(cfg):
         weight_decay=cfg.training.sft.weight_decay,
         push_to_hub=cfg.training.sft.push_to_hub,
         do_eval=cfg.training.sft.do_eval,
+        accelerator_config={
+            # Disable batch dispatching to avoid shape mismatches with streaming/variable-length batches.
+            "dispatch_batches": False,
+        },
+        # Use non-reentrant gradient checkpointing to avoid DDP "marked ready twice" errors.
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        # Avoid unused parameter scanning in DDP for LoRA.
+        # ddp_find_unused_parameters=False,
     )
 
     # Prepare regularization config for enhanced trainer
@@ -583,11 +592,13 @@ def run_sft(cfg):
 
     from torch.optim import AdamW
 
+    count_trainables(model, "before optimizer setup")
     lora_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = AdamW(
         lora_params, lr=cfg.training.sft.lr, weight_decay=cfg.training.sft.weight_decay
     )
 
+    count_trainables(model, "after optimizer setup")
     trainer = EnhancedSFTTrainer(
         model=model,
         args=training_args,
@@ -601,15 +612,22 @@ def run_sft(cfg):
         # reg_mode="off",  # Temporarily disable regularization to debug TopK issues
         optimizers=(optimizer, None),
     )
+    count_trainables(model, "after trainer setup")
 
     ft_model = trainer.model
-    ft_model.print_trainable_parameters()
+    # ft_model.print_trainable_parameters()
     print("Model inside trainer")
+    count_trainables(trainer.model, "inside trainer")
     count_params(ft_model)
 
     # Some launchers flip flags during init; enforce again just before training:
     if use_topk:
         enable_topk_lora_grads(trainer.model)
+    else:
+        for name, param in trainer.model.named_parameters():
+            if "lora_" in name.lower():
+                param.requires_grad_(True)
+
     trainables = count_trainables(trainer.model, "right before train()")
     assert trainables > 0, "No trainable params in dense/TopK LoRA path."
 
@@ -781,8 +799,9 @@ def run_sft(cfg):
     from transformers import TrainerCallback
 
     class ABProbe(TrainerCallback):
-        def __init__(self, every=10):
+        def __init__(self, every=10, disabled=False):
             self.every = every
+            self.disabled = disabled
             self.prev = {}
 
         def _targets(self, model):
@@ -812,11 +831,18 @@ def run_sft(cfg):
                         logs[f"update_norm/{name}"] = float(
                             (p.detach().cpu() - self.prev[name]).norm()
                         )
+            # Skip wandb logging if disabled or wandb not initialized (e.g., wandb_disabled config).
+            if self.disabled or getattr(wandb, "run", None) is None:
+                print(logs)
+                return
+
             wandb.log(logs, step=state.global_step)
             print(logs)
 
     # add it
-    trainer.add_callback(ABProbe(every=10))
+    trainer.add_callback(
+        ABProbe(every=10, disabled=cfg.logger.wandb_mode == "disabled")
+    )
     print("REG MODE:", trainer.reg_mode)
 
     # ------------------------------- Training ------------------------------

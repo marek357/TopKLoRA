@@ -1,10 +1,12 @@
 size: "recommended_dense_full"
 lora:
   r: 16
+  k: 16
   bias: 'none'
   alpha: 32
   dropout: 0.05
   use_topk: false
+  layer: dense_full
   target_modules:
     - o_proj
     - v_proj
