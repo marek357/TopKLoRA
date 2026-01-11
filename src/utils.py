@@ -1451,11 +1451,14 @@ def _make_cache_key(
     pack_sequences: bool,
 ) -> str:
     """Create a deterministic cache key based on dataset parameters."""
+    # Sort dataset_weights for consistency
+    sorted_weights = sorted((dataset_weights or {}).items())
+    
     key_dict = {
         "tokenizer_name": tokenizer_name,
         "max_length": max_length,
         "datasets_to_use": sorted(datasets_to_use),  # Sort for consistency
-        "dataset_weights": dataset_weights or {},
+        "dataset_weights": sorted_weights,  # Sorted for consistency
         "mix_strategy": mix_strategy,
         "mix_seed": mix_seed,
         "eval_holdout_ratio": eval_holdout_ratio,
