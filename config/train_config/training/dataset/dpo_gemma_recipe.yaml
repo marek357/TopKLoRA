@@ -10,8 +10,7 @@ datasets:
     weight: 0.70
     huggingface_dataset_id: "argilla/ultrafeedback-binarized-preferences-cleaned"
     train_split: train
-    # Using train split with eval_size -> loader will carve a held-out eval set.
-    eval_split: train
+    eval_split: test
     prompt_field: prompt
     chosen_field: chosen
     rejected_field: rejected
@@ -22,8 +21,7 @@ datasets:
     weight: 0.15
     huggingface_dataset_id: "PKU-Alignment/PKU-SafeRLHF"
     train_split: train
-    # Using train split with eval_size -> loader will carve a held-out eval set.
-    eval_split: train
+    eval_split: test
     prompt_field: prompt
     response_a_field: response_0
     response_b_field: response_1
@@ -35,8 +33,7 @@ datasets:
     weight: 0.10
     huggingface_dataset_id: "PKU-Alignment/BeaverTails"
     train_split: train
-    # Using train split with eval_size -> loader will carve a held-out eval set.
-    eval_split: train
+    eval_split: test
     prompt_field: prompt
     response_a_field: response_0
     response_b_field: response_1

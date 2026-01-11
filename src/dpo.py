@@ -866,6 +866,7 @@ def _load_single_dpo_dataset(
         max_prompt_length=dpo_args.max_prompt_length,
         max_completion_length=dpo_args.max_completion_length,
     )
+    eval_size = _get_cfg_value(spec, "eval_size")
     if train_split == eval_split:
         test_size = eval_size or 0.01
         if isinstance(test_size, int):
@@ -874,7 +875,6 @@ def _load_single_dpo_dataset(
         train_dataset = split["train"]
         eval_dataset = split["test"]
     train_size = _get_cfg_value(spec, "train_size")
-    eval_size = _get_cfg_value(spec, "eval_size")
     if train_size:
         train_dataset = train_dataset.select(range(min(train_size, len(train_dataset))))
     if eval_size:
