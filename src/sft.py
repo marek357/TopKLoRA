@@ -471,7 +471,7 @@ def run_sft(cfg):
         dataset = dataset.map(
             preprocess_to_messages, remove_columns=dataset.column_names
         )
-        if eval_holdout_ratio and eval_holdout_ratio > 0:
+        if eval_holdout_ratio is not None and eval_holdout_ratio > 0:
             split = dataset.train_test_split(
                 test_size=eval_holdout_ratio, seed=seed, shuffle=True
             )
