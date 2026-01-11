@@ -1803,7 +1803,9 @@ def _to_messages_with_fallback(ex: Mapping[str, Any]) -> Dict[str, Any]:
     raw_msgs = ex.get("messages") or ex.get("conversations") or []
     if raw_msgs:
         normalized = normalize_chat_messages(raw_msgs)
-        return {"messages": normalized}
+        # If normalization yields no valid messages, fall back to instruction-style fields
+        if normalized:
+            return {"messages": normalized}
     instr = (ex.get("instruction") or ex.get("prompt") or "").strip()
     ctx_text = (ex.get("input") or ex.get("context") or "").strip()
     output = ex.get("response") or ex.get("output") or ex.get("completion") or ""
