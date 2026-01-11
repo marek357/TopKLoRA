@@ -1394,7 +1394,9 @@ def normalize_chat_messages(raw_messages: Sequence[Dict[str, Any]]) -> List[Mess
     for msg in raw_messages:
         if not isinstance(msg, dict):
             continue
-        role = msg.get("role") or msg.get("from")
+        role = msg.get("role")
+        if role is None:
+            role = msg.get("from")
         if role in ("human", "user", "prompter", "Human"):
             role = "user"
         elif role in ("assistant", "gpt", "bot", "Assistant"):
