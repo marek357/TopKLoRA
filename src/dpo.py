@@ -831,11 +831,23 @@ def _load_single_dpo_dataset(
     train_split = _get_cfg_value(spec, "train_split", "train")
     eval_split = _get_cfg_value(spec, "eval_split", "test")
     prompt_field = _get_cfg_value(spec, "prompt_field", "prompt")
-    chosen_field = _get_cfg_value(spec, "chosen_field", "chosen")
-    rejected_field = _get_cfg_value(spec, "rejected_field", "rejected")
+    # Detect whether this dataset is configured in pairwise format
+    # (response_a/response_b/choice) or in simple chosen/rejected format.
     response_a_field = _get_cfg_value(spec, "response_a_field")
     response_b_field = _get_cfg_value(spec, "response_b_field")
     choice_field = _get_cfg_value(spec, "choice_field")
+    is_pairwise = response_a_field is not None or response_b_field is not None or choice_field is not None
+    if is_pairwise:
+        # In pairwise mode, do not inject default chosen/rejected field names.
+        # This allows _prepare_preference_dataset to correctly infer the format
+        # from the presence of pairwise fields.
+        chosen_field = _get_cfg_value(spec, "chosen_field")
+        rejected_field = _get_cfg_value(spec, "rejected_field")
+    else:
+        # In non-pairwise mode, fall back to the standard chosen/rejected
+        # column names if none are provided.
+        chosen_field = _get_cfg_value(spec, "chosen_field", "chosen")
+        rejected_field = _get_cfg_value(spec, "rejected_field", "rejected")
     choice_value_for_a = _get_cfg_value(spec, "choice_value_for_a", 0)
 
     train_dataset = _prepare_preference_dataset(
