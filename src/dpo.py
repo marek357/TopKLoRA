@@ -850,7 +850,25 @@ def _load_single_dpo_dataset(
     response_a_field = _get_cfg_value(spec, "response_a_field")
     response_b_field = _get_cfg_value(spec, "response_b_field")
     choice_field = _get_cfg_value(spec, "choice_field")
-    is_pairwise = response_a_field is not None or response_b_field is not None or choice_field is not None
+    any_pairwise = (
+        response_a_field is not None
+        or response_b_field is not None
+        or choice_field is not None
+    )
+    all_pairwise = (
+        response_a_field is not None
+        and response_b_field is not None
+        and choice_field is not None
+    )
+    if any_pairwise and not all_pairwise:
+        raise ValueError(
+            "Invalid DPO dataset configuration for pairwise format: "
+            "response_a_field, response_b_field, and choice_field must either "
+            "all be set or all be omitted. "
+            f"Got response_a_field={response_a_field!r}, "
+            f"response_b_field={response_b_field!r}, choice_field={choice_field!r}."
+        )
+    is_pairwise = all_pairwise
     if is_pairwise:
         # In pairwise mode, do not inject default chosen/rejected field names.
         # This allows _prepare_preference_dataset to correctly infer the format
