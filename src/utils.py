@@ -1453,7 +1453,6 @@ def _make_cache_key(
     """Create a deterministic cache key based on dataset parameters."""
     # Sort dataset_weights for consistency
     sorted_weights = sorted((dataset_weights or {}).items())
-    
     key_dict = {
         "tokenizer_name": tokenizer_name,
         "max_length": max_length,
