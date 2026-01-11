@@ -14,7 +14,7 @@ datasets_to_use:
 
 # Mixing strategy: concat (deterministic) or interleave (probabilistic sampling)
 mix_strategy: "interleave"
-# Approximate proportions (normalized at runtime)
+# Relative proportions (normalized at runtime)
 dataset_weights:
   oasst1: 0.35
   tulu_v2: 0.25

@@ -4,11 +4,13 @@ name: mix
 seed: 42
 
 datasets:
+  # Relative proportions (normalized at runtime)
   # Pool A: general preference
   - name: ultrafeedback
     weight: 0.70
     huggingface_dataset_id: "argilla/ultrafeedback-binarized-preferences-cleaned"
     train_split: train
+    # Using train split with eval_size -> loader will carve a held-out eval set.
     eval_split: train
     prompt_field: prompt
     chosen_field: chosen
@@ -20,6 +22,7 @@ datasets:
     weight: 0.15
     huggingface_dataset_id: "PKU-Alignment/PKU-SafeRLHF"
     train_split: train
+    # Using train split with eval_size -> loader will carve a held-out eval set.
     eval_split: train
     prompt_field: prompt
     response_a_field: response_0
@@ -32,6 +35,7 @@ datasets:
     weight: 0.10
     huggingface_dataset_id: "PKU-Alignment/BeaverTails"
     train_split: train
+    # Using train split with eval_size -> loader will carve a held-out eval set.
     eval_split: train
     prompt_field: prompt
     response_a_field: response_0
@@ -40,6 +44,7 @@ datasets:
     choice_value_for_a: 0
     eval_size: 500
 
+  # Special loader: hh-rlhf uses the custom preparation path in src/dpo.py
   - name: hh-rlhf
     weight: 0.05
     train_size: null

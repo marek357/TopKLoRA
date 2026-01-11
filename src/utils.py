@@ -1380,7 +1380,16 @@ def setup_tokenizer_for_chat(tokenizer):
 
 
 def normalize_chat_messages(raw_messages: Sequence[Dict[str, Any]]) -> List[Message]:
-    """Normalize a list of raw chat messages into Gemma-compatible roles."""
+    """Normalize raw chat messages into Gemma-compatible message dicts.
+
+    Supported role mappings:
+      - human/user/prompter/Human -> user
+      - assistant/gpt/bot/Assistant -> assistant
+
+    Messages with unrecognized roles or empty content are filtered out.
+    Input messages are expected to be dict-like with role/from + content/value/text.
+    Output format: [{"role": "user"|"assistant", "content": "<text>"}].
+    """
     normalized: List[Message] = []
     for msg in raw_messages:
         if not isinstance(msg, dict):
@@ -1401,9 +1410,19 @@ def normalize_chat_messages(raw_messages: Sequence[Dict[str, Any]]) -> List[Mess
 
 
 def build_instruction_messages(
-    instruction: str, response: str, *, context: str | None = None
+    instruction: str,
+    response: str,
+    *,
+    input_context: str | None = None,
+    **kwargs: Any,
 ) -> List[Message]:
-    """Build a basic user/assistant message pair from instruction-style fields."""
+    """Build a user/assistant message pair from instruction-style records.
+
+    The optional input_context (or legacy context kwarg) is treated as extra input
+    appended to the instruction with a double newline separator. If instruction
+    or response is empty, an empty list is returned.
+    """
+    context = input_context if input_context is not None else kwargs.get("context")
     prompt = instruction.strip() if instruction else ""
     if context:
         context = context.strip()
@@ -1757,9 +1776,9 @@ def load_alpaca(split: str = "train") -> HFDataset:
         instr = (ex.get("instruction") or "").strip()
         inp = (ex.get("input") or "").strip()
         output = (ex.get("output") or "").strip()
-        return {"messages": build_instruction_messages(instr, output, context=inp)}
+        return {"messages": build_instruction_messages(instr, output, input_context=inp)}
 
-    ds = ds.map(to_messages)
+    ds = ds.map(to_messages, num_proc=NUM_PROC)
     ds = ds.filter(lambda ex: len(ex.get("messages") or []) > 0)
     return ds.remove_columns([c for c in ds.column_names if c != "messages"])  # type: ignore
 
@@ -1772,30 +1791,27 @@ def load_tulu_v2(split: str = "train") -> HFDataset:
         normalized = normalize_chat_messages(raw_msgs)
         return {"messages": normalized}
 
-    ds = ds.map(to_messages)
+    ds = ds.map(to_messages, num_proc=NUM_PROC)
     ds = ds.filter(lambda ex: len(ex.get("messages") or []) > 0)
     return ds.remove_columns([c for c in ds.column_names if c != "messages"])  # type: ignore
+
+
+def _to_messages_with_fallback(ex: Mapping[str, Any]) -> Dict[str, Any]:
+    """Normalize a record to {"messages": [...]} with chat-first fallback."""
+    raw_msgs = ex.get("messages") or ex.get("conversations") or []
+    if raw_msgs:
+        normalized = normalize_chat_messages(raw_msgs)
+        return {"messages": normalized}
+    instr = (ex.get("instruction") or ex.get("prompt") or "").strip()
+    ctx_text = (ex.get("input") or ex.get("context") or "").strip()
+    output = ex.get("response") or ex.get("output") or ex.get("completion") or ""
+    return {"messages": build_instruction_messages(instr, output, input_context=ctx_text)}
 
 
 def load_infinity_instruct(split: str = "train") -> HFDataset:
     ds = load_dataset("BAAI/Infinity-Instruct", split=split)
 
-    def to_messages(ex):
-        raw_msgs = ex.get("messages") or ex.get("conversations") or []
-        if raw_msgs:
-            normalized = normalize_chat_messages(raw_msgs)
-            return {"messages": normalized}
-        instr = (ex.get("instruction") or ex.get("prompt") or "").strip()
-        context = (ex.get("input") or ex.get("context") or "").strip()
-        output = (
-            ex.get("response")
-            or ex.get("output")
-            or ex.get("completion")
-            or ""
-        )
-        return {"messages": build_instruction_messages(instr, output, context=context)}
-
-    ds = ds.map(to_messages)
+    ds = ds.map(_to_messages_with_fallback, num_proc=NUM_PROC)
     ds = ds.filter(lambda ex: len(ex.get("messages") or []) > 0)
     return ds.remove_columns([c for c in ds.column_names if c != "messages"])  # type: ignore
 
@@ -1803,22 +1819,7 @@ def load_infinity_instruct(split: str = "train") -> HFDataset:
 def load_h4_instruction(split: str = "train") -> HFDataset:
     ds = load_dataset("HuggingFaceH4/instruction-dataset", split=split)
 
-    def to_messages(ex):
-        raw_msgs = ex.get("messages") or ex.get("conversations") or []
-        if raw_msgs:
-            normalized = normalize_chat_messages(raw_msgs)
-            return {"messages": normalized}
-        instr = (ex.get("instruction") or ex.get("prompt") or "").strip()
-        context = (ex.get("input") or ex.get("context") or "").strip()
-        output = (
-            ex.get("response")
-            or ex.get("output")
-            or ex.get("completion")
-            or ""
-        )
-        return {"messages": build_instruction_messages(instr, output, context=context)}
-
-    ds = ds.map(to_messages)
+    ds = ds.map(_to_messages_with_fallback, num_proc=NUM_PROC)
     ds = ds.filter(lambda ex: len(ex.get("messages") or []) > 0)
     return ds.remove_columns([c for c in ds.column_names if c != "messages"])  # type: ignore
 
@@ -1827,17 +1828,58 @@ def _mix_datasets(
     pieces: List[HFDataset],
     names: List[str],
     *,
+    requested_datasets: Tuple[str, ...],
     mix_strategy: str,
     dataset_weights: Dict[str, float] | None,
     seed: int,
 ) -> HFDataset:
+    """Mix datasets using concatenation or probabilistic interleaving.
+
+    Args:
+        pieces: List of datasets already loaded for mixing.
+        names: Dataset name list matching pieces.
+        requested_datasets: Raw dataset names requested from config.
+        mix_strategy: "concat" or "interleave".
+        dataset_weights: Optional mapping of dataset weights.
+        seed: Seed for interleaving.
+
+    Returns:
+        Combined dataset (concatenated or interleaved).
+    """
     if not pieces:
-        raise ValueError("No datasets selected.")
-    if mix_strategy == "concat" or not dataset_weights:
+        available = (
+            "oasst1",
+            "dolly",
+            "ultrachat",
+            "tulu_v2",
+            "infinity_instruct",
+            "h4_instruction",
+            "alpaca",
+        )
+        raise ValueError(
+            "No datasets selected. "
+            f"Requested datasets: {requested_datasets}. "
+            f"Available datasets: {available}."
+        )
+    if mix_strategy == "concat":
         return concatenate_datasets(pieces)
-    weights = [dataset_weights.get(name, 1.0) for name in names]
-    total = sum(weights)
-    probabilities = [w / total for w in weights] if total > 0 else None
+    weights = (
+        [dataset_weights.get(name, 1.0) for name in names]
+        if dataset_weights
+        else None
+    )
+    probabilities = None
+    if weights is not None:
+        total = sum(weights)
+        if total <= 0 or all(w == 0 for w in weights):
+            logging.warning(
+                "Non-positive or all-zero dataset_weights detected for datasets %s; "
+                "falling back to equal mixing probabilities.",
+                names,
+            )
+            probabilities = [1.0 / len(weights)] * len(weights)
+        else:
+            probabilities = [w / total for w in weights]
     return interleave_datasets(
         pieces,
         probabilities=probabilities,
@@ -1881,6 +1923,7 @@ def build_sft_dataset(
     mixed = _mix_datasets(
         pieces,
         names,
+        requested_datasets=datasets_to_use,
         mix_strategy=mix_strategy,
         dataset_weights=dataset_weights,
         seed=mix_seed,

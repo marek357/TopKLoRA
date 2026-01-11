@@ -564,6 +564,11 @@ def _resolve_device_map_for_ddp() -> Optional[Dict[str, int]]:
 
 
 def _prompt_to_messages(prompt: Any) -> List[Dict[str, str]]:
+    """Convert prompt payloads into a normalized message list.
+
+    Supports None, str, dict, or list inputs. Strings are wrapped as a single
+    user message; dict/list inputs are normalized with normalize_chat_messages.
+    """
     if prompt is None:
         return []
     if isinstance(prompt, list):
@@ -581,6 +586,11 @@ def _prompt_to_messages(prompt: Any) -> List[Dict[str, str]]:
 def _response_to_messages(
     prompt_messages: List[Dict[str, str]], response: Any
 ) -> List[Dict[str, str]]:
+    """Convert response payloads into message lists, optionally prepending prompt.
+
+    If the response is already a list/dict of messages and begins with an assistant
+    role, the prompt_messages are prepended to preserve chat context.
+    """
     if response is None:
         return []
     if isinstance(response, list):
@@ -606,6 +616,7 @@ def _response_to_messages(
 
 
 def _is_valid_messages(messages: List[Dict[str, str]]) -> bool:
+    """Return True for non-empty message lists ending with an assistant reply."""
     return bool(messages) and messages[-1].get("role") == "assistant"
 
 
@@ -617,6 +628,7 @@ def _apply_pairwise_choice(
     choice_field: str,
     choice_value_for_a: Any = 0,
 ) -> Dict[str, Any]:
+    """Map pairwise preference fields into chosen/rejected responses."""
     resp_a = ex.get(response_a_field)
     resp_b = ex.get(response_b_field)
     choice = ex.get(choice_field)
@@ -641,6 +653,23 @@ def _prepare_preference_dataset(
     max_prompt_length: int | None = None,
     max_completion_length: int | None = None,
 ) -> HFDataset:
+    """Prepare a preference dataset for DPO.
+
+    Supports two formats:
+      1) prompt + chosen/rejected fields
+      2) prompt + response_a/response_b + choice_field
+
+    Returns a dataset with "chosen" and "rejected" message lists. Optional length
+    filtering is applied when tokenizer + length constraints are provided.
+    """
+    if not (
+        (chosen_field and rejected_field)
+        or (response_a_field and response_b_field and choice_field)
+    ):
+        raise ValueError(
+            "Preference dataset configuration must specify either chosen/rejected "
+            "fields or response_a/response_b with a choice_field."
+        )
     ds = load_dataset(dataset_id, split=split)
 
     def to_pairs(ex):
@@ -673,24 +702,30 @@ def _prepare_preference_dataset(
     )
 
     if tokenizer and max_prompt_length and max_completion_length:
-        def length_ok(ex):
-            chosen = ex["chosen"]
-            rejected = ex["rejected"]
-            prompt = chosen[:-1]
-            chosen_resp = chosen[-1]["content"]
-            rejected_resp = rejected[-1]["content"]
-            prompt_ids = tokenizer.apply_chat_template(
-                prompt, add_generation_prompt=True, tokenize=True
+        if not getattr(tokenizer, "chat_template", None):
+            logging.warning(
+                "Tokenizer has no chat template configured; skipping DPO length "
+                "filtering based on chat-formatted prompts."
             )
-            chosen_ids = tokenizer(chosen_resp, add_special_tokens=False)["input_ids"]
-            rejected_ids = tokenizer(rejected_resp, add_special_tokens=False)["input_ids"]
-            return (
-                len(prompt_ids) <= max_prompt_length
-                and len(chosen_ids) <= max_completion_length
-                and len(rejected_ids) <= max_completion_length
-            )
+        else:
+            def length_ok(ex):
+                chosen = ex["chosen"]
+                rejected = ex["rejected"]
+                prompt = chosen[:-1]
+                chosen_resp = chosen[-1]["content"]
+                rejected_resp = rejected[-1]["content"]
+                prompt_ids = tokenizer.apply_chat_template(
+                    prompt, add_generation_prompt=True, tokenize=True
+                )
+                chosen_ids = tokenizer(chosen_resp, add_special_tokens=False)["input_ids"]
+                rejected_ids = tokenizer(rejected_resp, add_special_tokens=False)["input_ids"]
+                return (
+                    len(prompt_ids) <= max_prompt_length
+                    and len(chosen_ids) <= max_completion_length
+                    and len(rejected_ids) <= max_completion_length
+                )
 
-        ds = ds.filter(length_ok)
+            ds = ds.filter(length_ok)
 
     return ds
 
@@ -701,6 +736,12 @@ def _mix_dpo_datasets(
     weights: Optional[List[float]] = None,
     seed: int = 42,
 ) -> HFDataset:
+    """Interleave multiple DPO datasets with optional weighting.
+
+    When weights are provided, they are normalized into sampling probabilities.
+    If weights are omitted, datasets are mixed equally. The "all_exhausted"
+    strategy continues until all datasets are exhausted. Seed controls shuffling.
+    """
     if not datasets:
         raise ValueError("No datasets provided for DPO mixing.")
     if not weights:
@@ -708,7 +749,14 @@ def _mix_dpo_datasets(
             datasets, seed=seed, stopping_strategy="all_exhausted"
         )
     total = sum(weights)
-    probabilities = [w / total for w in weights] if total > 0 else None
+    if total <= 0 or all(w == 0 for w in weights):
+        logging.warning(
+            "All provided DPO mixing weights are zero or sum to zero; "
+            "defaulting to equal mixing probabilities across datasets."
+        )
+        probabilities = [1.0 / len(datasets)] * len(datasets)
+    else:
+        probabilities = [w / total for w in weights]
     return interleave_datasets(
         datasets,
         probabilities=probabilities,
@@ -730,7 +778,22 @@ def _load_single_dpo_dataset(
     *,
     tokenizer,
     dpo_args,
+    seed: int = 42,
 ) -> Tuple[HFDataset, HFDataset]:
+    """Load one DPO dataset from a dataset spec.
+
+    Supports:
+      - Special loaders: hh-rlhf, civil_comments
+      - Generic HuggingFace datasets with prompt/chosen/rejected or
+        prompt/response_a/response_b/choice fields.
+
+    Config fields supported in spec:
+      name, huggingface_dataset_id, train_split, eval_split, prompt_field,
+      chosen_field, rejected_field, response_a_field, response_b_field,
+      choice_field, choice_value_for_a, train_size, eval_size.
+
+    Returns (train_dataset, eval_dataset), applying size limits when specified.
+    """
     name = _get_cfg_value(spec, "name")
     if name == "hh-rlhf":
         return prepare_hh_rlhf_datasets(
@@ -760,7 +823,11 @@ def _load_single_dpo_dataset(
 
     dataset_id = _get_cfg_value(spec, "huggingface_dataset_id")
     if not dataset_id:
-        raise ValueError(f"Missing huggingface_dataset_id for dataset {name}")
+        raise ValueError(
+            f"Missing huggingface_dataset_id for dataset '{name}'. "
+            "Please add 'huggingface_dataset_id: <dataset-path>' "
+            "to the dataset configuration in your DPO recipe file."
+        )
     train_split = _get_cfg_value(spec, "train_split", "train")
     eval_split = _get_cfg_value(spec, "eval_split", "test")
     prompt_field = _get_cfg_value(spec, "prompt_field", "prompt")
@@ -799,6 +866,13 @@ def _load_single_dpo_dataset(
         max_prompt_length=dpo_args.max_prompt_length,
         max_completion_length=dpo_args.max_completion_length,
     )
+    if train_split == eval_split:
+        test_size = eval_size or 0.01
+        if isinstance(test_size, int):
+            test_size = min(test_size, len(train_dataset))
+        split = train_dataset.train_test_split(test_size=test_size, seed=seed)
+        train_dataset = split["train"]
+        eval_dataset = split["test"]
     train_size = _get_cfg_value(spec, "train_size")
     eval_size = _get_cfg_value(spec, "eval_size")
     if train_size:
@@ -809,21 +883,34 @@ def _load_single_dpo_dataset(
 
 
 def load_dpo_datasets_from_cfg(cfg, tokenizer, dpo_args) -> Tuple[HFDataset, HFDataset]:
+    """Load DPO datasets from cfg.
+
+    If cfg.training.dpo_dataset.name != "mix", a single dataset is loaded.
+    If name == "mix", datasets are loaded from the "datasets" list and mixed
+    using their weights with deterministic interleaving.
+    """
     dpo_cfg = cfg.training.dpo_dataset
     name = _get_cfg_value(dpo_cfg, "name")
     if name != "mix":
-        return _load_single_dpo_dataset(dpo_cfg, tokenizer=tokenizer, dpo_args=dpo_args)
+        seed = int(_get_cfg_value(dpo_cfg, "seed", 42))
+        return _load_single_dpo_dataset(
+            dpo_cfg, tokenizer=tokenizer, dpo_args=dpo_args, seed=seed
+        )
 
     datasets_cfg = _get_cfg_value(dpo_cfg, "datasets", [])
     if not datasets_cfg:
-        raise ValueError("DPO mix requested but no datasets were provided.")
+        raise ValueError(
+            "DPO mix requested but no datasets were provided in "
+            "cfg.training.dpo_dataset.datasets. Please add at least one dataset "
+            "to the 'datasets' list in your configuration."
+        )
     seed = int(_get_cfg_value(dpo_cfg, "seed", 42))
     train_sets: List[HFDataset] = []
     eval_sets: List[HFDataset] = []
     weights: List[float] = []
     for spec in datasets_cfg:
         train_ds, eval_ds = _load_single_dpo_dataset(
-            spec, tokenizer=tokenizer, dpo_args=dpo_args
+            spec, tokenizer=tokenizer, dpo_args=dpo_args, seed=seed
         )
         train_sets.append(train_ds)
         eval_sets.append(eval_ds)
