@@ -356,7 +356,10 @@ def count_trainables(model, label=""):
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
     predictions = np.argmax(logits, axis=-1)
-    return {"accuracy": (predictions == labels).mean()}
+    valid_mask = labels != -100
+    if not np.any(valid_mask):
+        return {"accuracy": 0.0}
+    return {"accuracy": (predictions[valid_mask] == labels[valid_mask]).mean()}
 
 
 def count_params(m):
