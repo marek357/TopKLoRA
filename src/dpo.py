@@ -7,12 +7,12 @@ import re
 import subprocess
 import sys
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from datasets import load_dataset
+from datasets import Dataset as HFDataset, interleave_datasets, load_dataset
 from peft import (
     LoraConfig,
     get_peft_model,
@@ -47,6 +47,7 @@ from src.utils import (
     get_world_size,
     init_distributed,
     is_main_process,
+    normalize_chat_messages,
 )
 
 # Configure logging
@@ -560,6 +561,277 @@ def _resolve_device_map_for_ddp() -> Optional[Dict[str, int]]:
             f"Could not resolve per-process device_map, falling back to default: {e}"
         )
     return None
+
+
+def _prompt_to_messages(prompt: Any) -> List[Dict[str, str]]:
+    if prompt is None:
+        return []
+    if isinstance(prompt, list):
+        return normalize_chat_messages(prompt)
+    if isinstance(prompt, dict):
+        return normalize_chat_messages([prompt])
+    if isinstance(prompt, str):
+        prompt = prompt.strip()
+        if not prompt:
+            return []
+        return [{"role": "user", "content": prompt}]
+    return []
+
+
+def _response_to_messages(
+    prompt_messages: List[Dict[str, str]], response: Any
+) -> List[Dict[str, str]]:
+    if response is None:
+        return []
+    if isinstance(response, list):
+        normalized = normalize_chat_messages(response)
+        if not normalized:
+            return []
+        if normalized[0]["role"] == "assistant" and prompt_messages:
+            return prompt_messages + normalized
+        return normalized
+    if isinstance(response, dict):
+        normalized = normalize_chat_messages([response])
+        if not normalized:
+            return []
+        if normalized[0]["role"] == "assistant" and prompt_messages:
+            return prompt_messages + normalized
+        return normalized
+    if isinstance(response, str):
+        response = response.strip()
+        if not response:
+            return []
+        return prompt_messages + [{"role": "assistant", "content": response}]
+    return []
+
+
+def _is_valid_messages(messages: List[Dict[str, str]]) -> bool:
+    return bool(messages) and messages[-1].get("role") == "assistant"
+
+
+def _apply_pairwise_choice(
+    ex: Dict[str, Any],
+    *,
+    response_a_field: str,
+    response_b_field: str,
+    choice_field: str,
+    choice_value_for_a: Any = 0,
+) -> Dict[str, Any]:
+    resp_a = ex.get(response_a_field)
+    resp_b = ex.get(response_b_field)
+    choice = ex.get(choice_field)
+    choose_a = choice == choice_value_for_a
+    chosen = resp_a if choose_a else resp_b
+    rejected = resp_b if choose_a else resp_a
+    return {"chosen": chosen, "rejected": rejected}
+
+
+def _prepare_preference_dataset(
+    *,
+    dataset_id: str,
+    split: str,
+    tokenizer,
+    prompt_field: str | None = None,
+    chosen_field: str | None = None,
+    rejected_field: str | None = None,
+    response_a_field: str | None = None,
+    response_b_field: str | None = None,
+    choice_field: str | None = None,
+    choice_value_for_a: Any = 0,
+    max_prompt_length: int | None = None,
+    max_completion_length: int | None = None,
+) -> HFDataset:
+    ds = load_dataset(dataset_id, split=split)
+
+    def to_pairs(ex):
+        prompt = ex.get(prompt_field) if prompt_field else None
+        if chosen_field and rejected_field:
+            chosen = ex.get(chosen_field)
+            rejected = ex.get(rejected_field)
+        elif response_a_field and response_b_field and choice_field:
+            pair = _apply_pairwise_choice(
+                ex,
+                response_a_field=response_a_field,
+                response_b_field=response_b_field,
+                choice_field=choice_field,
+                choice_value_for_a=choice_value_for_a,
+            )
+            chosen = pair["chosen"]
+            rejected = pair["rejected"]
+        else:
+            return {"chosen": [], "rejected": []}
+
+        prompt_messages = _prompt_to_messages(prompt)
+        chosen_messages = _response_to_messages(prompt_messages, chosen)
+        rejected_messages = _response_to_messages(prompt_messages, rejected)
+        return {"chosen": chosen_messages, "rejected": rejected_messages}
+
+    ds = ds.map(to_pairs, remove_columns=ds.column_names)
+    ds = ds.filter(
+        lambda ex: _is_valid_messages(ex.get("chosen", []))
+        and _is_valid_messages(ex.get("rejected", []))
+    )
+
+    if tokenizer and max_prompt_length and max_completion_length:
+        def length_ok(ex):
+            chosen = ex["chosen"]
+            rejected = ex["rejected"]
+            prompt = chosen[:-1]
+            chosen_resp = chosen[-1]["content"]
+            rejected_resp = rejected[-1]["content"]
+            prompt_ids = tokenizer.apply_chat_template(
+                prompt, add_generation_prompt=True, tokenize=True
+            )
+            chosen_ids = tokenizer(chosen_resp, add_special_tokens=False)["input_ids"]
+            rejected_ids = tokenizer(rejected_resp, add_special_tokens=False)["input_ids"]
+            return (
+                len(prompt_ids) <= max_prompt_length
+                and len(chosen_ids) <= max_completion_length
+                and len(rejected_ids) <= max_completion_length
+            )
+
+        ds = ds.filter(length_ok)
+
+    return ds
+
+
+def _mix_dpo_datasets(
+    datasets: List[HFDataset],
+    *,
+    weights: Optional[List[float]] = None,
+    seed: int = 42,
+) -> HFDataset:
+    if not datasets:
+        raise ValueError("No datasets provided for DPO mixing.")
+    if not weights:
+        return interleave_datasets(
+            datasets, seed=seed, stopping_strategy="all_exhausted"
+        )
+    total = sum(weights)
+    probabilities = [w / total for w in weights] if total > 0 else None
+    return interleave_datasets(
+        datasets,
+        probabilities=probabilities,
+        seed=seed,
+        stopping_strategy="all_exhausted",
+    )
+
+
+def _get_cfg_value(cfg_obj: Any, key: str, default: Any = None) -> Any:
+    if cfg_obj is None:
+        return default
+    if isinstance(cfg_obj, dict):
+        return cfg_obj.get(key, default)
+    return getattr(cfg_obj, key, default)
+
+
+def _load_single_dpo_dataset(
+    spec: Any,
+    *,
+    tokenizer,
+    dpo_args,
+) -> Tuple[HFDataset, HFDataset]:
+    name = _get_cfg_value(spec, "name")
+    if name == "hh-rlhf":
+        return prepare_hh_rlhf_datasets(
+            max_length=dpo_args.max_prompt_length,
+            tokenizer=tokenizer,
+            max_prompt_length=dpo_args.max_prompt_length,
+            max_completion_length=dpo_args.max_completion_length,
+            train_size=_get_cfg_value(spec, "train_size"),
+            eval_size=_get_cfg_value(spec, "eval_size", 100),
+        )
+    if name == "civil_comments":
+        return prepare_civil_comments_datasets(
+            tokenizer=tokenizer,
+            max_prompt_length=_get_cfg_value(
+                spec, "max_prompt_length", dpo_args.max_prompt_length
+            ),
+            max_completion_length=_get_cfg_value(
+                spec, "max_completion_length", dpo_args.max_completion_length
+            ),
+            train_size=_get_cfg_value(spec, "train_size"),
+            eval_size=_get_cfg_value(spec, "eval_size", 100),
+            label_field=_get_cfg_value(spec, "label_field", "toxicity"),
+            threshold=float(_get_cfg_value(spec, "threshold", 0.5)),
+            approval_token=_get_cfg_value(spec, "approval_token", "APPROVE"),
+            rejection_token=_get_cfg_value(spec, "rejection_token", "REJECT"),
+        )
+
+    dataset_id = _get_cfg_value(spec, "huggingface_dataset_id")
+    if not dataset_id:
+        raise ValueError(f"Missing huggingface_dataset_id for dataset {name}")
+    train_split = _get_cfg_value(spec, "train_split", "train")
+    eval_split = _get_cfg_value(spec, "eval_split", "test")
+    prompt_field = _get_cfg_value(spec, "prompt_field", "prompt")
+    chosen_field = _get_cfg_value(spec, "chosen_field", "chosen")
+    rejected_field = _get_cfg_value(spec, "rejected_field", "rejected")
+    response_a_field = _get_cfg_value(spec, "response_a_field")
+    response_b_field = _get_cfg_value(spec, "response_b_field")
+    choice_field = _get_cfg_value(spec, "choice_field")
+    choice_value_for_a = _get_cfg_value(spec, "choice_value_for_a", 0)
+
+    train_dataset = _prepare_preference_dataset(
+        dataset_id=dataset_id,
+        split=train_split,
+        tokenizer=tokenizer,
+        prompt_field=prompt_field,
+        chosen_field=chosen_field,
+        rejected_field=rejected_field,
+        response_a_field=response_a_field,
+        response_b_field=response_b_field,
+        choice_field=choice_field,
+        choice_value_for_a=choice_value_for_a,
+        max_prompt_length=dpo_args.max_prompt_length,
+        max_completion_length=dpo_args.max_completion_length,
+    )
+    eval_dataset = _prepare_preference_dataset(
+        dataset_id=dataset_id,
+        split=eval_split,
+        tokenizer=tokenizer,
+        prompt_field=prompt_field,
+        chosen_field=chosen_field,
+        rejected_field=rejected_field,
+        response_a_field=response_a_field,
+        response_b_field=response_b_field,
+        choice_field=choice_field,
+        choice_value_for_a=choice_value_for_a,
+        max_prompt_length=dpo_args.max_prompt_length,
+        max_completion_length=dpo_args.max_completion_length,
+    )
+    train_size = _get_cfg_value(spec, "train_size")
+    eval_size = _get_cfg_value(spec, "eval_size")
+    if train_size:
+        train_dataset = train_dataset.select(range(min(train_size, len(train_dataset))))
+    if eval_size:
+        eval_dataset = eval_dataset.select(range(min(eval_size, len(eval_dataset))))
+    return train_dataset, eval_dataset
+
+
+def load_dpo_datasets_from_cfg(cfg, tokenizer, dpo_args) -> Tuple[HFDataset, HFDataset]:
+    dpo_cfg = cfg.training.dpo_dataset
+    name = _get_cfg_value(dpo_cfg, "name")
+    if name != "mix":
+        return _load_single_dpo_dataset(dpo_cfg, tokenizer=tokenizer, dpo_args=dpo_args)
+
+    datasets_cfg = _get_cfg_value(dpo_cfg, "datasets", [])
+    if not datasets_cfg:
+        raise ValueError("DPO mix requested but no datasets were provided.")
+    seed = int(_get_cfg_value(dpo_cfg, "seed", 42))
+    train_sets: List[HFDataset] = []
+    eval_sets: List[HFDataset] = []
+    weights: List[float] = []
+    for spec in datasets_cfg:
+        train_ds, eval_ds = _load_single_dpo_dataset(
+            spec, tokenizer=tokenizer, dpo_args=dpo_args
+        )
+        train_sets.append(train_ds)
+        eval_sets.append(eval_ds)
+        weights.append(float(_get_cfg_value(spec, "weight", 1.0)))
+
+    train_dataset = _mix_dpo_datasets(train_sets, weights=weights, seed=seed)
+    eval_dataset = _mix_dpo_datasets(eval_sets, weights=weights, seed=seed)
+    return train_dataset, eval_dataset
 
 
 def prepare_hh_rlhf_datasets(
@@ -1265,34 +1537,9 @@ def run_dpo(cfg, quant_cfg):
         ref_model.resize_token_embeddings(len(tokenizer))
         logging.info("Added %d extra special tokens to ref model", len(new_tokens))
 
-    if cfg.training.dpo_dataset.name == "hh-rlhf":
-        train_dataset, eval_dataset = prepare_hh_rlhf_datasets(
-            max_length=dpo_args.max_prompt_length,
-            tokenizer=tokenizer,
-            max_prompt_length=dpo_args.max_prompt_length,
-            max_completion_length=dpo_args.max_completion_length,
-        )
-    elif cfg.training.dpo_dataset.name == "civil_comments":
-        train_dataset, eval_dataset = prepare_civil_comments_datasets(
-            tokenizer=tokenizer,
-            max_prompt_length=getattr(dpo_args, "max_prompt_length", 512),
-            max_completion_length=getattr(dpo_args, "max_completion_length", 16),
-            train_size=getattr(cfg.training.dpo_dataset, "train_size", None),
-            eval_size=getattr(cfg.training.dpo_dataset, "eval_size", 100),
-            label_field=getattr(cfg.training.dpo_dataset, "label_field", "toxicity"),
-            threshold=float(getattr(cfg.training.dpo_dataset, "threshold", 0.5)),
-            approval_token=getattr(
-                cfg.training.dpo_dataset, "approval_token", "APPROVE"
-            ),
-            rejection_token=getattr(
-                cfg.training.dpo_dataset, "rejection_token", "REJECT"
-            ),
-        )
-
-    else:
-        raise NotImplementedError(
-            f"Dataset {cfg.training.dpo_dataset.name} not implemented"
-        )
+    train_dataset, eval_dataset = load_dpo_datasets_from_cfg(
+        cfg, tokenizer=tokenizer, dpo_args=dpo_args
+    )
 
     # Configure LoRA
     target_modules = list(experiment_args.lora.target_modules)
