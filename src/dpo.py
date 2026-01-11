@@ -662,10 +662,24 @@ def _prepare_preference_dataset(
     Returns a dataset with "chosen" and "rejected" message lists. Optional length
     filtering is applied when tokenizer + length constraints are provided.
     """
-    if not (
-        (chosen_field and rejected_field)
-        or (response_a_field and response_b_field and choice_field)
-    ):
+    # Validate fields are explicitly set (not None) and non-empty
+    # Using 'is not None' makes intent clear: distinguish unset (None) from empty ("")
+    has_chosen_rejected = (
+        chosen_field is not None
+        and rejected_field is not None
+        and chosen_field  # Ensure non-empty
+        and rejected_field  # Ensure non-empty
+    )
+    has_response_abc = (
+        response_a_field is not None
+        and response_b_field is not None
+        and choice_field is not None
+        and response_a_field  # Ensure non-empty
+        and response_b_field  # Ensure non-empty
+        and choice_field  # Ensure non-empty
+    )
+    
+    if not (has_chosen_rejected or has_response_abc):
         raise ValueError(
             "Preference dataset configuration must specify either chosen/rejected "
             "fields or response_a/response_b with a choice_field."
