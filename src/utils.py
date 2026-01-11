@@ -3,8 +3,13 @@ import json
 import subprocess
 import sys
 from transformers import PreTrainedTokenizerBase
-from datasets import Dataset as HFDataset, concatenate_datasets, load_dataset
-from typing import List, Dict, Tuple
+from datasets import (
+    Dataset as HFDataset,
+    concatenate_datasets,
+    interleave_datasets,
+    load_dataset,
+)
+from typing import List, Dict, Tuple, Sequence
 import heapq
 from peft import PeftModel
 from openai import OpenAI
@@ -1374,10 +1379,52 @@ def setup_tokenizer_for_chat(tokenizer):
     return tokenizer
 
 
+def normalize_chat_messages(raw_messages: Sequence[Dict[str, Any]]) -> List[Message]:
+    """Normalize a list of raw chat messages into Gemma-compatible roles."""
+    normalized: List[Message] = []
+    for msg in raw_messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role") or msg.get("from")
+        if role in ("human", "user", "prompter", "Human"):
+            role = "user"
+        elif role in ("assistant", "gpt", "bot", "Assistant"):
+            role = "assistant"
+        if role not in ("user", "assistant"):
+            continue
+        content = msg.get("content") or msg.get("value") or msg.get("text") or ""
+        content = content.strip()
+        if not content:
+            continue
+        normalized.append({"role": role, "content": content})
+    return normalized
+
+
+def build_instruction_messages(
+    instruction: str, response: str, *, context: str | None = None
+) -> List[Message]:
+    """Build a basic user/assistant message pair from instruction-style fields."""
+    prompt = instruction.strip() if instruction else ""
+    if context:
+        context = context.strip()
+        if context:
+            prompt = f"{prompt}\n\n{context}" if prompt else context
+    response = response.strip() if response else ""
+    if not prompt or not response:
+        return []
+    return [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": response},
+    ]
+
+
 def _make_cache_key(
     tokenizer_name: str,
     max_length: int,
     datasets_to_use: Tuple[str, ...],
+    dataset_weights: Optional[Dict[str, float]],
+    mix_strategy: str,
+    mix_seed: int,
     eval_holdout_ratio: float,
     seed: int,
     pack_sequences: bool,
@@ -1387,6 +1434,9 @@ def _make_cache_key(
         "tokenizer_name": tokenizer_name,
         "max_length": max_length,
         "datasets_to_use": sorted(datasets_to_use),  # Sort for consistency
+        "dataset_weights": dataset_weights or {},
+        "mix_strategy": mix_strategy,
+        "mix_seed": mix_seed,
         "eval_holdout_ratio": eval_holdout_ratio,
         "seed": seed,
         "pack_sequences": pack_sequences,
@@ -1700,21 +1750,141 @@ def load_oasst1(split: str = "train") -> HFDataset:
     return HFDataset.from_list(conversations)
 
 
+def load_alpaca(split: str = "train") -> HFDataset:
+    ds = load_dataset("tatsu-lab/alpaca", split=split)
+
+    def to_messages(ex):
+        instr = (ex.get("instruction") or "").strip()
+        inp = (ex.get("input") or "").strip()
+        output = (ex.get("output") or "").strip()
+        return {"messages": build_instruction_messages(instr, output, context=inp)}
+
+    ds = ds.map(to_messages)
+    ds = ds.filter(lambda ex: len(ex.get("messages") or []) > 0)
+    return ds.remove_columns([c for c in ds.column_names if c != "messages"])  # type: ignore
+
+
+def load_tulu_v2(split: str = "train") -> HFDataset:
+    ds = load_dataset("allenai/tulu-v2-sft-mixture", split=split)
+
+    def to_messages(ex):
+        raw_msgs = ex.get("messages") or ex.get("conversations") or []
+        normalized = normalize_chat_messages(raw_msgs)
+        return {"messages": normalized}
+
+    ds = ds.map(to_messages)
+    ds = ds.filter(lambda ex: len(ex.get("messages") or []) > 0)
+    return ds.remove_columns([c for c in ds.column_names if c != "messages"])  # type: ignore
+
+
+def load_infinity_instruct(split: str = "train") -> HFDataset:
+    ds = load_dataset("BAAI/Infinity-Instruct", split=split)
+
+    def to_messages(ex):
+        raw_msgs = ex.get("messages") or ex.get("conversations") or []
+        if raw_msgs:
+            normalized = normalize_chat_messages(raw_msgs)
+            return {"messages": normalized}
+        instr = (ex.get("instruction") or ex.get("prompt") or "").strip()
+        context = (ex.get("input") or ex.get("context") or "").strip()
+        output = (
+            ex.get("response")
+            or ex.get("output")
+            or ex.get("completion")
+            or ""
+        )
+        return {"messages": build_instruction_messages(instr, output, context=context)}
+
+    ds = ds.map(to_messages)
+    ds = ds.filter(lambda ex: len(ex.get("messages") or []) > 0)
+    return ds.remove_columns([c for c in ds.column_names if c != "messages"])  # type: ignore
+
+
+def load_h4_instruction(split: str = "train") -> HFDataset:
+    ds = load_dataset("HuggingFaceH4/instruction-dataset", split=split)
+
+    def to_messages(ex):
+        raw_msgs = ex.get("messages") or ex.get("conversations") or []
+        if raw_msgs:
+            normalized = normalize_chat_messages(raw_msgs)
+            return {"messages": normalized}
+        instr = (ex.get("instruction") or ex.get("prompt") or "").strip()
+        context = (ex.get("input") or ex.get("context") or "").strip()
+        output = (
+            ex.get("response")
+            or ex.get("output")
+            or ex.get("completion")
+            or ""
+        )
+        return {"messages": build_instruction_messages(instr, output, context=context)}
+
+    ds = ds.map(to_messages)
+    ds = ds.filter(lambda ex: len(ex.get("messages") or []) > 0)
+    return ds.remove_columns([c for c in ds.column_names if c != "messages"])  # type: ignore
+
+
+def _mix_datasets(
+    pieces: List[HFDataset],
+    names: List[str],
+    *,
+    mix_strategy: str,
+    dataset_weights: Dict[str, float] | None,
+    seed: int,
+) -> HFDataset:
+    if not pieces:
+        raise ValueError("No datasets selected.")
+    if mix_strategy == "concat" or not dataset_weights:
+        return concatenate_datasets(pieces)
+    weights = [dataset_weights.get(name, 1.0) for name in names]
+    total = sum(weights)
+    probabilities = [w / total for w in weights] if total > 0 else None
+    return interleave_datasets(
+        pieces,
+        probabilities=probabilities,
+        seed=seed,
+        stopping_strategy="all_exhausted",
+    )
+
+
 def build_sft_dataset(
     tokenizer: PreTrainedTokenizerBase,
     max_length: int = 8192,
     datasets_to_use: Tuple[str, ...] = ("oasst1", "dolly", "ultrachat"),
+    dataset_weights: Optional[Dict[str, float]] = None,
+    mix_strategy: str = "concat",
+    mix_seed: int = 42,
 ) -> HFDataset:
-    pieces = []
+    pieces: List[HFDataset] = []
+    names: List[str] = []
     if "oasst1" in datasets_to_use:
         pieces.append(load_oasst1("train"))
+        names.append("oasst1")
     if "dolly" in datasets_to_use:
         pieces.append(load_dolly("train"))
+        names.append("dolly")
     if "ultrachat" in datasets_to_use:
         pieces.append(load_ultrachat("train_sft"))
-    if not pieces:
-        raise ValueError("No datasets selected.")
-    mixed = concatenate_datasets(pieces)
+        names.append("ultrachat")
+    if "tulu_v2" in datasets_to_use:
+        pieces.append(load_tulu_v2("train"))
+        names.append("tulu_v2")
+    if "infinity_instruct" in datasets_to_use:
+        pieces.append(load_infinity_instruct("train"))
+        names.append("infinity_instruct")
+    if "h4_instruction" in datasets_to_use:
+        pieces.append(load_h4_instruction("train"))
+        names.append("h4_instruction")
+    if "alpaca" in datasets_to_use:
+        pieces.append(load_alpaca("train"))
+        names.append("alpaca")
+
+    mixed = _mix_datasets(
+        pieces,
+        names,
+        mix_strategy=mix_strategy,
+        dataset_weights=dataset_weights,
+        seed=mix_seed,
+    )
 
     # Filter out empty conversations
     def is_valid(ex):
@@ -1798,6 +1968,9 @@ def build_sft_datasets(
     tokenizer: PreTrainedTokenizerBase,
     max_length: int = 8192,
     datasets_to_use: Tuple[str, ...] = ("oasst1", "dolly", "ultrachat"),
+    dataset_weights: Optional[Dict[str, float]] = None,
+    mix_strategy: str = "concat",
+    mix_seed: int = 42,
     eval_holdout_ratio: float = 0.01,
     seed: int = 42,
     pack_sequences: bool = True,
@@ -1811,6 +1984,9 @@ def build_sft_datasets(
         tokenizer: Tokenizer to use for encoding
         max_length: Maximum sequence length
         datasets_to_use: Tuple of dataset names to include
+        dataset_weights: Optional mapping of dataset names to mix weights
+        mix_strategy: concat or interleave
+        mix_seed: Seed for interleaving
         eval_holdout_ratio: Fraction of data to use for evaluation
         seed: Random seed for train/eval split
         pack_sequences: Whether to pack sequences together
@@ -1826,6 +2002,9 @@ def build_sft_datasets(
         tokenizer_name=tokenizer_name,
         max_length=max_length,
         datasets_to_use=datasets_to_use,
+        dataset_weights=dataset_weights,
+        mix_strategy=mix_strategy,
+        mix_seed=mix_seed,
         eval_holdout_ratio=eval_holdout_ratio,
         seed=seed,
         pack_sequences=pack_sequences,
@@ -1848,7 +2027,12 @@ def build_sft_datasets(
     # Build datasets from scratch
     print("🔨 Building datasets from scratch (this may take a while)...")
     full = build_sft_dataset(
-        tokenizer, max_length=max_length, datasets_to_use=datasets_to_use
+        tokenizer,
+        max_length=max_length,
+        datasets_to_use=datasets_to_use,
+        dataset_weights=dataset_weights,
+        mix_strategy=mix_strategy,
+        mix_seed=mix_seed,
     )
     split = full.train_test_split(test_size=eval_holdout_ratio, seed=seed)
     train_ds, eval_ds = split["train"], split["test"]

@@ -1,0 +1,46 @@
+# DPO mix for Gemma-2-2B: general preference + safety preference
+
+name: mix
+seed: 42
+
+datasets:
+  # Pool A: general preference
+  - name: ultrafeedback
+    weight: 0.70
+    huggingface_dataset_id: "argilla/ultrafeedback-binarized-preferences-cleaned"
+    train_split: train
+    eval_split: train
+    prompt_field: prompt
+    chosen_field: chosen
+    rejected_field: rejected
+    eval_size: 1000
+
+  # Pool B: safety-focused preference
+  - name: pku_safe_rlhf
+    weight: 0.15
+    huggingface_dataset_id: "PKU-Alignment/PKU-SafeRLHF"
+    train_split: train
+    eval_split: train
+    prompt_field: prompt
+    response_a_field: response_0
+    response_b_field: response_1
+    choice_field: better_response_id
+    choice_value_for_a: 0
+    eval_size: 500
+
+  - name: beavertails
+    weight: 0.10
+    huggingface_dataset_id: "PKU-Alignment/BeaverTails"
+    train_split: train
+    eval_split: train
+    prompt_field: prompt
+    response_a_field: response_0
+    response_b_field: response_1
+    choice_field: better_response_id
+    choice_value_for_a: 0
+    eval_size: 500
+
+  - name: hh-rlhf
+    weight: 0.05
+    train_size: null
+    eval_size: 200

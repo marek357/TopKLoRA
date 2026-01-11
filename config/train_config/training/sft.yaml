@@ -5,7 +5,7 @@ defaults:
   - experiment/lora_gemma_interp_small@sft_experiment
   # - experiment/sanity_check@dpo_experiment
   - experiment/lora_gemma_interp_small@dpo_experiment
-  - dataset/alpaca-train@sft_dataset
+  - dataset/sft_gemma_recipe@sft_dataset
   - dataset/hh-rlhf@dpo_dataset
   - adapter: gemma_2_2b
   - quantization: 4bit

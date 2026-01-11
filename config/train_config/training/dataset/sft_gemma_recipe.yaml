@@ -1,0 +1,47 @@
+# SFT mix for Gemma-2-2B instruction tuning
+# Combines human chat + curated instruction sets + small synthetic fraction
+
+use_enhanced_datasets: true
+
+# Dataset selection - available: "oasst1", "tulu_v2", "infinity_instruct",
+# "h4_instruction", "alpaca", plus legacy "dolly" and "ultrachat"
+datasets_to_use:
+  - "oasst1"
+  - "tulu_v2"
+  - "infinity_instruct"
+  - "h4_instruction"
+  - "alpaca"
+
+# Mixing strategy: concat (deterministic) or interleave (probabilistic sampling)
+mix_strategy: "interleave"
+# Approximate proportions (normalized at runtime)
+dataset_weights:
+  oasst1: 0.35
+  tulu_v2: 0.25
+  infinity_instruct: 0.20
+  h4_instruction: 0.10
+  alpaca: 0.10
+mix_seed: 42
+
+# Sequence length for the enhanced system
+max_length: 2048
+
+# Evaluation holdout ratio (fraction of data for eval)
+eval_holdout_ratio: 0.02
+
+# Random seed for reproducible train/eval splits
+seed: 42
+
+# Whether to pack multiple conversations into single sequences
+pack_sequences: true
+
+# Whether to use filesystem caching for faster subsequent runs
+use_cache: true
+
+# Whether to enable streaming mode (reduces VRAM usage)
+streaming: true
+
+# Legacy fields (ignored when use_enhanced_datasets: true)
+name: "sft_gemma_recipe"
+huggingface_dataset_id: "unused"
+split: "unused"
