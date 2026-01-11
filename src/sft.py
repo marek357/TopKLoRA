@@ -607,6 +607,7 @@ def run_sft(cfg):
         processing_class=tokenizer,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
+        compute_metrics=compute_metrics,
         peft_config=None,
         callbacks=[MemoryClearCallback()],
         reg_cfg=reg_cfg,
