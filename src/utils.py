@@ -1833,18 +1833,20 @@ def _mix_datasets(
     dataset_weights: Dict[str, float] | None,
     seed: int,
 ) -> HFDataset:
-    """Mix datasets using concatenation or probabilistic interleaving.
+    """Mix datasets using concatenation or weighted interleaving with deterministic sampling.
 
     Args:
         pieces: List of datasets already loaded for mixing.
         names: Dataset name list matching pieces.
         requested_datasets: Raw dataset names requested from config.
         mix_strategy: "concat" or "interleave".
-        dataset_weights: Optional mapping of dataset weights.
-        seed: Seed for interleaving.
+        dataset_weights: Optional mapping from dataset name to a non-negative weight
+            used to derive mixing probabilities for interleaving. If None, datasets
+            are interleaved with equal probability.
+        seed: Random seed controlling the (reproducible) interleaving order.
 
     Returns:
-        Combined dataset (concatenated or interleaved).
+        Combined dataset (concatenated or deterministically interleaved).
     """
     if not pieces:
         available = (
