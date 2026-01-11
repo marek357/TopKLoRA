@@ -896,28 +896,31 @@ def _load_single_dpo_dataset(
         max_prompt_length=dpo_args.max_prompt_length,
         max_completion_length=dpo_args.max_completion_length,
     )
-    eval_dataset = _prepare_preference_dataset(
-        dataset_id=dataset_id,
-        split=eval_split,
-        tokenizer=tokenizer,
-        prompt_field=prompt_field,
-        chosen_field=chosen_field,
-        rejected_field=rejected_field,
-        response_a_field=response_a_field,
-        response_b_field=response_b_field,
-        choice_field=choice_field,
-        choice_value_for_a=choice_value_for_a,
-        max_prompt_length=dpo_args.max_prompt_length,
-        max_completion_length=dpo_args.max_completion_length,
-    )
     eval_size = _get_cfg_value(spec, "eval_size")
     if train_split == eval_split:
+        # Split from train_dataset when train and eval use same split
         test_size = eval_size or 0.01
         if isinstance(test_size, int):
             test_size = min(test_size, len(train_dataset))
         split = train_dataset.train_test_split(test_size=test_size, seed=seed)
         train_dataset = split["train"]
         eval_dataset = split["test"]
+    else:
+        # Load eval_dataset separately only when using different split
+        eval_dataset = _prepare_preference_dataset(
+            dataset_id=dataset_id,
+            split=eval_split,
+            tokenizer=tokenizer,
+            prompt_field=prompt_field,
+            chosen_field=chosen_field,
+            rejected_field=rejected_field,
+            response_a_field=response_a_field,
+            response_b_field=response_b_field,
+            choice_field=choice_field,
+            choice_value_for_a=choice_value_for_a,
+            max_prompt_length=dpo_args.max_prompt_length,
+            max_completion_length=dpo_args.max_completion_length,
+        )
     train_size = _get_cfg_value(spec, "train_size")
     if train_size:
         train_dataset = train_dataset.select(range(min(train_size, len(train_dataset))))
