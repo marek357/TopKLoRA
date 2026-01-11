@@ -5,7 +5,7 @@ from trl import (
 from peft import prepare_model_for_kbit_training
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from datasets import load_dataset
+from datasets import IterableDataset, load_dataset
 from peft import LoraConfig, TaskType, get_peft_model
 import time
 import os
@@ -22,25 +22,15 @@ from src.utils import (
     capture_env_snapshot,
     save_summary,
     maybe_update_wandb_config,
+    get_world_size,
+    init_distributed,
+    is_main_process,
 )
 import numpy as np
 import logging
 from peft import get_peft_model_state_dict
 import torch.nn.functional as F
 import wandb
-
-
-local_rank = int(os.environ.get("LOCAL_RANK", 0))
-if torch.cuda.is_available():
-    torch.cuda.set_device(local_rank)
-
-device = (
-    "cuda"
-    if torch.cuda.is_available()
-    else "mps"
-    if torch.mps.is_available()
-    else "cpu"
-)
 
 
 class EnhancedSFTTrainer(SFTTrainer):
@@ -377,6 +367,16 @@ def count_params(m):
 
 
 def run_sft(cfg):
+    local_rank = init_distributed()
+    world_size = get_world_size()
+    device = (
+        "cuda"
+        if torch.cuda.is_available()
+        else "mps"
+        if torch.mps.is_available()
+        else "cpu"
+    )
+
     tokenizer = AutoTokenizer.from_pretrained(cfg.training.model.model_name, fast=False)
 
     quant_cfg = build_quant_config(cfg.training.quantization)
@@ -481,17 +481,22 @@ def run_sft(cfg):
                 if idx % 10 == 0:
                     yield ex
 
-        from datasets import IterableDataset
-
         train_dataset = IterableDataset.from_generator(train_gen)
         eval_dataset = IterableDataset.from_generator(eval_gen)
         logging.info("Using legacy streaming datasets")
     count_trainables(model, "after dataset setup")
 
+    if world_size > 1 and isinstance(train_dataset, IterableDataset):
+        train_dataset = train_dataset.shard(num_shards=world_size, index=local_rank)
+        if eval_dataset is not None and isinstance(eval_dataset, IterableDataset):
+            eval_dataset = eval_dataset.shard(num_shards=world_size, index=local_rank)
+
     model_str = f"{cfg.training.model.name}_{cfg.training.model.version}_{cfg.training.model.size}"
     use_topk = getattr(cfg.training.sft_experiment.lora, "use_topk", False)
     output_suffix = "_sparse_sft" if use_topk else "_dense_sft"
     base_output_dir = f"experiments/{model_str}{output_suffix}"
+    ddp_backend = "nccl" if world_size > 1 and device == "cuda" else None
+    ddp_find_unused = False if world_size > 1 else None
     training_args = SFTConfig(
         packing=cfg.training.sft.packing,
         # changes the tokenizers eos token to eot and the google gemma-2b-it doesn't have that will default to the list [...] in the tokenizer bos and end of turn
@@ -527,14 +532,8 @@ def run_sft(cfg):
         weight_decay=cfg.training.sft.weight_decay,
         push_to_hub=cfg.training.sft.push_to_hub,
         do_eval=cfg.training.sft.do_eval,
-        accelerator_config={
-            # Disable batch dispatching to avoid shape mismatches with streaming/variable-length batches.
-            "dispatch_batches": False,
-        },
-        # Use non-reentrant gradient checkpointing to avoid DDP "marked ready twice" errors.
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        # Avoid unused parameter scanning in DDP for LoRA.
-        # ddp_find_unused_parameters=False,
+        ddp_backend=ddp_backend,
+        ddp_find_unused_parameters=ddp_find_unused,
     )
 
     # Prepare regularization config for enhanced trainer
@@ -755,9 +754,10 @@ def run_sft(cfg):
                 }
             )
 
-    save_hparams(base_output_dir, hparams)
-    save_cfg_yaml(base_output_dir, cfg)
-    capture_env_snapshot(base_output_dir)
+    if is_main_process():
+        save_hparams(base_output_dir, hparams)
+        save_cfg_yaml(base_output_dir, cfg)
+        capture_env_snapshot(base_output_dir)
 
     # Human-readable summary
     try:
@@ -774,14 +774,16 @@ def run_sft(cfg):
             f"sft: lr={cfg.training.sft.lr}, steps={cfg.training.sft.max_steps}, bs={cfg.training.sft.batch_size_train}x{cfg.training.sft.gradient_accumulation_steps}"
         )
 
-        save_summary(base_output_dir, summary)
+        if is_main_process():
+            save_summary(base_output_dir, summary)
     except Exception as e:
         logging.warning(f"Failed to build summary README.txt: {e}")
 
     run_name = getattr(cfg, "experiment_name", None) or os.path.basename(
         base_output_dir
     )
-    maybe_update_wandb_config(cfg.logger, hparams, run_name)
+    if is_main_process():
+        maybe_update_wandb_config(cfg.logger, hparams, run_name)
 
     logging.info(f"📊 Enhanced logging setup complete. Output dir: {base_output_dir}")
 
@@ -821,6 +823,8 @@ def run_sft(cfg):
         def on_step_end(self, args, state, control, model=None, **kw):
             if (state.global_step % self.every) != 0 or model is None:
                 return
+            if not state.is_world_process_zero:
+                return
             logs = {}
             for name, p in self._targets(model):
                 g = p.grad
@@ -854,38 +858,41 @@ def run_sft(cfg):
     # ------------------------------- Saving -------------------------------
     # Use the structured output directory for consistency
     final_path = os.path.join(base_output_dir, "final_adapter")
-    trainer.save_model(final_path)
-    tokenizer.save_pretrained(final_path)
+    if trainer.is_world_process_zero():
+        trainer.save_model(final_path)
+        tokenizer.save_pretrained(final_path)
 
-    # Also save to legacy path for compatibility
-    legacy_path = (
-        f"adapters/sft/{cfg.training.sft_experiment.lora.r}-{cfg.training.sft_experiment.lora.alpha}-"
-        f"{cfg.training.sft_experiment.lora.dropout}/"
-        f"{getattr(cfg.training.sft_dataset, 'name', 'enhanced_dataset')}/"
-        f"{'-'.join(cfg.training.sft_experiment.lora.target_modules)}"
-    )
-    trainer.model.save_pretrained(final_path)
-    tokenizer.save_pretrained(final_path)
+        # Also save to legacy path for compatibility
+        legacy_path = (
+            f"adapters/sft/{cfg.training.sft_experiment.lora.r}-{cfg.training.sft_experiment.lora.alpha}-"
+            f"{cfg.training.sft_experiment.lora.dropout}/"
+            f"{getattr(cfg.training.sft_dataset, 'name', 'enhanced_dataset')}/"
+            f"{'-'.join(cfg.training.sft_experiment.lora.target_modules)}"
+        )
 
-    adapter_state_dict = get_peft_model_state_dict(
-        model, state_dict=model.state_dict(), adapter_name="default"
-    )
-    torch.save(adapter_state_dict, f"{final_path}/adapter_model.bin")
-    # or use safetensors
-    from safetensors.torch import save_file
+        adapter_state_dict = get_peft_model_state_dict(
+            model, state_dict=model.state_dict(), adapter_name="default"
+        )
+        torch.save(adapter_state_dict, f"{final_path}/adapter_model.bin")
+        # or use safetensors
+        from safetensors.torch import save_file
 
-    save_file(adapter_state_dict, f"{final_path}/adapter_model.safetensors")
+        save_file(adapter_state_dict, f"{final_path}/adapter_model.safetensors")
 
-    logging.info("✅ Adapter saved to: %s", final_path)
-    logging.info("📂 Legacy path: %s", legacy_path)
+        logging.info("✅ Adapter saved to: %s", final_path)
+        logging.info("📂 Legacy path: %s", legacy_path)
 
-    from safetensors.torch import load_file
+        from safetensors.torch import load_file
 
-    saved = load_file(f"{final_path}/adapter_model.safetensors")
-    print("Saved keys sample:")
-    for key in list(saved.keys())[:5]:
-        print(f"  {key}")
+        saved = load_file(f"{final_path}/adapter_model.safetensors")
+        print("Saved keys sample:")
+        for key in list(saved.keys())[:5]:
+            print(f"  {key}")
 
-    wandb.finish()
+        # Only finish the Weights & Biases run if WandB logging is enabled.
+        logger_cfg = getattr(cfg, "logger", None)
+        wandb_mode = getattr(logger_cfg, "wandb_mode", None) if logger_cfg is not None else None
+        if wandb_mode != "disabled":
+            wandb.finish()
 
     return trainer.model
