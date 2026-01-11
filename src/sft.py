@@ -460,30 +460,36 @@ def run_sft(cfg):
             cfg.training.sft_dataset.datasets_to_use,
         )
     else:
-        # Use legacy streaming approach
-        def preprocessed_stream():
-            stream = load_dataset(
-                cfg.training.sft_dataset.huggingface_dataset_id,
-                split=cfg.training.sft_dataset.split,
-                streaming=True,
+        # Use deterministic, finite dataset split for legacy datasets
+        seed = getattr(cfg.training.sft_dataset, "seed", 42)
+        eval_holdout_ratio = getattr(cfg.training.sft_dataset, "eval_holdout_ratio", 0.1)
+        dataset = load_dataset(
+            cfg.training.sft_dataset.huggingface_dataset_id,
+            split=cfg.training.sft_dataset.split,
+            streaming=False,
+        )
+        dataset = dataset.map(
+            preprocess_to_messages, remove_columns=dataset.column_names
+        )
+        if eval_holdout_ratio is not None and eval_holdout_ratio > 0:
+            split = dataset.train_test_split(
+                test_size=eval_holdout_ratio, seed=seed, shuffle=True
             )
-            for ex in stream:
-                msg = preprocess_to_messages(ex)
-                yield msg
-
-        def train_gen():
-            for idx, ex in enumerate(preprocessed_stream()):
-                if idx % 10 != 0:
-                    yield ex
-
-        def eval_gen():
-            for idx, ex in enumerate(preprocessed_stream()):
-                if idx % 10 == 0:
-                    yield ex
-
-        train_dataset = IterableDataset.from_generator(train_gen)
-        eval_dataset = IterableDataset.from_generator(eval_gen)
-        logging.info("Using legacy streaming datasets")
+            train_dataset = split["train"]
+            eval_dataset = split["test"]
+            logging.info(
+                "Using legacy datasets with deterministic split (seed=%s, eval_holdout_ratio=%s)",
+                seed,
+                eval_holdout_ratio,
+            )
+        else:
+            train_dataset = dataset
+            eval_dataset = None
+            logging.info(
+                "Using legacy datasets without eval split (seed=%s, eval_holdout_ratio=%s)",
+                seed,
+                eval_holdout_ratio,
+            )
     count_trainables(model, "after dataset setup")
 
     if world_size > 1 and isinstance(train_dataset, IterableDataset):
