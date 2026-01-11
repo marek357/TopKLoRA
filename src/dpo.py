@@ -678,7 +678,6 @@ def _prepare_preference_dataset(
         and response_b_field  # Ensure non-empty
         and choice_field  # Ensure non-empty
     )
-    
     if not (has_chosen_rejected or has_response_abc):
         raise ValueError(
             "Preference dataset configuration must specify either chosen/rejected "
