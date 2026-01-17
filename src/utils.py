@@ -1879,7 +1879,7 @@ def _mix_datasets(
     probabilities = None
     if weights is not None:
         total = sum(weights)
-        if total <= 0 or all(w == 0 for w in weights):
+        if total <= 0 or any(w < 0 for w in weights):
             logging.warning(
                 "Non-positive or all-zero dataset_weights detected for datasets %s; "
                 "falling back to equal mixing probabilities.",
