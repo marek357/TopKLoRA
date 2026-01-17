@@ -20,7 +20,6 @@ latents:                       # Latent statistics collection settings.
   activation_epsilon: 1e-6     # Threshold for counting a latent as active.
   quantiles: [0.5, 0.9, 0.99]  # Quantiles to record per latent.
   quantile_samples: 2000       # Reservoir size for quantile estimation.
-  aggregate: max               # Per-prompt aggregation (max or mean).
   max_length: 2048             # Token limit when collecting stats.
 
 intervention:                  # Calibration of intervention strength.
@@ -34,9 +33,6 @@ intervention:                  # Calibration of intervention strength.
 generation:            # Text generation settings for evidence.
   baseline_samples: 3  # Baseline completions per prompt.
   max_new_tokens: 128  # Max tokens to generate.
-  do_sample: true      # Whether to sample (vs greedy).
-  temperature: 0.7     # Sampling temperature.
-  top_p: 0.95          # Nucleus sampling parameter.
 
 # evidence packs
 # train_per_latent is used for both train/eval unless overridden

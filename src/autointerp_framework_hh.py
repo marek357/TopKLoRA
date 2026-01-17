@@ -219,7 +219,6 @@ def _collect_latent_stats(
     lat_cfg = cfg.evals.causal_autointerp_framework.latents
     epsilon = float(getattr(lat_cfg, "activation_epsilon", 1e-6))
     quantile_samples = int(getattr(lat_cfg, "quantile_samples", 2000))
-    aggregate = getattr(lat_cfg, "aggregate", "max")
 
     sums = np.zeros(len(latent_index), dtype=np.float64)
     sums_sq = np.zeros(len(latent_index), dtype=np.float64)
@@ -268,10 +267,10 @@ def _collect_latent_stats(
             z_eff = z * mask
             active_mask = mask.any(dim=0)
 
-            if aggregate == "mean":
-                agg = z_eff.mean(dim=0)
-            else:
-                agg = z_eff.abs().max(dim=0).values
+            z_relu = F.relu(z_eff)
+
+            # aggregate using max over tokens
+            agg = z_relu.max(dim=0).values
 
             adapter_offset = adapter_offsets.get(name)
             if adapter_offset is None:
@@ -481,9 +480,7 @@ def _generate_text(
     rendered = _render_prompt(tokenizer, prompt)
     gen_kwargs = dict(
         max_new_tokens=int(getattr(gen_cfg, "max_new_tokens", 128)),
-        do_sample=bool(getattr(gen_cfg, "do_sample", True)),
-        temperature=float(getattr(gen_cfg, "temperature", 0.7)),
-        top_p=float(getattr(gen_cfg, "top_p", 0.95)),
+        do_sample=False,
         eos_token_id=getattr(model.generation_config, "eos_token_id", None),
     )
 
