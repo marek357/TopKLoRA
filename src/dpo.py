@@ -764,7 +764,7 @@ def _mix_dpo_datasets(
     total = sum(weights)
     if total <= 0 or all(w == 0 for w in weights):
         logging.warning(
-            "All provided DPO mixing weights are zero or sum to zero; "
+            "All provided DPO mixing weights are zero, sum to zero or there exists a negative weight; "
             "defaulting to equal mixing probabilities across datasets."
         )
         probabilities = [1.0 / len(datasets)] * len(datasets)
