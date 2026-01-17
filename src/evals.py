@@ -31,11 +31,13 @@ from src.utils import (
     configure_eos_eot,
     ensure_chat_template_and_special_tokens,
     format_adapter_suffix,
+    generate_completions_from_prompts,
     preprocess_to_perspective_message,
     wrap_topk_lora_modules,
     write_json,
     wikitext_detokenizer,
 )
+from src.autointerp_framework_hh import run_autointerp_framework
 
 device = (
     "cuda"
@@ -91,57 +93,6 @@ def init_model_tokenizer_fixed(model_cfg):
             print(f"{name}: B max = {b_max:.6f};  A max = {a_max:.6f}")
 
     return model, tokenizer, wrapped_modules
-
-
-def generate_completions_from_prompts(
-    model,
-    tokenizer,
-    prompts,
-    *,
-    device: str,
-    max_length=None,
-    truncation: bool = True,
-    gen_kwargs=None,
-    end_of_turn_id=None,
-):
-    """Tokenize prompts, generate, and return decoded completions."""
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    pad_id = tokenizer.pad_token_id
-
-    enc = tokenizer(
-        prompts,
-        return_tensors="pt",
-        padding=True,
-        truncation=truncation,
-        max_length=max_length,
-    ).to(device)
-
-    # ── Autoregressive generation
-    with torch.no_grad():
-        generated = model.generate(**enc, **(gen_kwargs or {}))
-
-    # ── Extract only the newly generated continuation
-    # Precompute prompt lengths for the batch (excluding pad tokens)
-    prompt_lengths = (enc["input_ids"] != pad_id).sum(dim=1)
-    completions = []
-    for i, output_ids in enumerate(generated):
-        if end_of_turn_id is not None:
-            # Locate the first END‑OF‑TURN token in the *generated* sequence
-            eot_positions = (output_ids == end_of_turn_id).nonzero(as_tuple=True)[0]
-            if len(eot_positions) > 0:
-                # after the EOT
-                completion_ids = output_ids[eot_positions[0].item() + 1 :]
-            else:
-                # Fallback: trim the prompt length, using precomputed length
-                completion_ids = output_ids[prompt_lengths[i].item() :]
-        else:
-            completion_ids = output_ids[prompt_lengths[i].item() :]
-        completions.append(
-            tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
-        )
-
-    return completions
 
 
 def load_base_model_for_eval(cfg):
@@ -306,6 +257,15 @@ def causal_auto_interp():
         return
 
     return eval_causal_auto_interp
+
+
+def causal_autointerp_framework():
+    def eval_causal_autointerp_framework(cfg):
+        model, tokenizer, wrapped_modules = init_model_tokenizer_fixed(cfg.model)
+        run_autointerp_framework(cfg, model, tokenizer, wrapped_modules)
+        return
+
+    return eval_causal_autointerp_framework
 
 
 def toxicity():

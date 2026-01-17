@@ -1,0 +1,89 @@
+name: causal-autointerp-framework  # Eval name for logging/selection.
+output_dir: eval_outputs/causal_autointerp_framework  # Output folder for all artifacts.
+
+dataset:                       # Prompt source configuration (HH-RLHF).
+  name: Anthropic/hh-rlhf      # Hugging Face dataset ID.
+  buckets:                     # Subsets to sample prompts from.
+    - bucket: harmless         # Label assigned to prompts from this subset.
+      data_dir: harmless-base  # HH-RLHF subset directory.
+      split: train             # Split to draw prompts from.
+      max_prompts: 200         # Cap on prompts pulled from this bucket.
+    - bucket: helpful          # Label assigned to prompts from this subset.
+      data_dir: helpful-base   # HH-RLHF subset directory.
+      split: train             # Split to draw prompts from.
+      max_prompts: 200         # Cap on prompts pulled from this bucket.
+  split:                       # Analysis/eval split for prompts.
+    seed: 42                 
+    analysis_frac: 0.8         # Fraction used for analysis; remainder is eval.
+
+latents:                       # Latent statistics collection settings.
+  activation_epsilon: 1e-6     # Threshold for counting a latent as active.
+  quantiles: [0.5, 0.9, 0.99]  # Quantiles to record per latent.
+  quantile_samples: 2000       # Reservoir size for quantile estimation.
+  aggregate: max               # Per-prompt aggregation (max or mean).
+  max_length: 2048             # Token limit when collecting stats.
+
+intervention:                  # Calibration of intervention strength.
+  kl_targets: [0.005, 0.01]    # Target KLs for matching intervention strength.
+  calibration_prompts: 16      # Number of prompts used in calibration.
+  window_tokens: 32            # Token window for KL measurement.
+  amp_min: 0.5                 # Minimum steering alpha for search.
+  amp_max: 8.0                 # Maximum steering alpha for search.
+  amp_search_steps: 8          # Binary search steps for alpha.
+
+generation:            # Text generation settings for evidence.
+  baseline_samples: 3  # Baseline completions per prompt.
+  max_new_tokens: 128  # Max tokens to generate.
+  do_sample: true      # Whether to sample (vs greedy).
+  temperature: 0.7     # Sampling temperature.
+  top_p: 0.95          # Nucleus sampling parameter.
+
+# evidence packs
+# train_per_latent is used for both train/eval unless overridden
+# target_kl picks the calibration entry to use
+# top_context_ratio chooses how many prompts from top activations
+
+evidence:               # Evidence pack construction settings.
+  train_per_latent: 10  # Prompts per latent for training evidence.
+  eval_per_latent: 10   # Prompts per latent for eval evidence.
+  target_kl: 0.01       # Which calibration KL to use for steering.
+  window_tokens: 64     # Window metadata for interventions.
+
+llm:  # Explainer/verifier model settings.
+  explainer:
+    enabled: true                   # Enable hypothesis generation.
+    provider: openai                # LLM backend provider.
+    model: gpt-4o                   # Explainer model ID.
+    temperature: 0.2                # Explainer sampling temperature.
+    max_tokens: 512                 # Explainer output token cap.
+    evidence_per_latent: 8          # Evidence packs per latent for hypotheses.
+    include_antipredictions: true   # Request anti-predictions in hypotheses.
+    effects_menu:                   # Allowed effect labels for structured output.
+      - refusal_more_likely
+      - safety_disclaimer_more_likely
+      - direct_answer_less_likely
+      - hedging_more_likely
+      - verbosity_increases
+      - toxicity_reduced
+      - instruction_following_improves
+      - polite_tone_more_likely
+      - uncertainty_more_likely
+  verifier:
+    enabled: true          # Enable hypothesis verification.
+    provider: openai       # LLM backend provider.
+    model: gpt-4o          # Verifier model ID.
+    temperature: 0.0       # Verifier sampling temperature.
+    max_tokens: 256        # Verifier output token cap.
+
+stages:                 # Pipeline stage toggles.
+  prompts: true         # Build prompt records.
+  latent_stats: true    # Collect latent activation stats.
+  calibration: true     # Calibrate interventions to target KL.
+  evidence_train: true  # Generate training evidence packs.
+  hypothesis: true      # Generate hypotheses via explainer.
+  evidence_eval: true   # Generate eval evidence packs.
+  verification: true    # Run blind + hypothesis verification.
+  summary: true         # Aggregate summary metrics.
+
+build_eval_function:                               # Hydra entry point for eval.
+  _target_: src.evals.causal_autointerp_framework  # Callable that runs the pipeline.
