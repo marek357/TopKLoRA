@@ -407,6 +407,12 @@ def run_sft(cfg):
     if device == "mps":
         model.to(device)
 
+    # Gradient checkpointing requires disabling KV cache; set it explicitly to avoid HF warnings.
+    if cfg.training.sft.gradient_checkpointing:
+        model.config.use_cache = False
+        if getattr(model, "generation_config", None) is not None:
+            model.generation_config.use_cache = False
+
     print("Model loaded")
     count_params(model)
 
@@ -447,6 +453,16 @@ def run_sft(cfg):
         sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         from src.utils import build_sft_datasets
 
+        # Disable streaming for distributed training - IterableDataset doesn't work
+        # well with accelerate's dispatch_batches and causes size mismatch errors
+        use_streaming = cfg.training.sft_dataset.streaming
+        if world_size > 1 and use_streaming:
+            logging.info(
+                "Disabling streaming for distributed training (world_size=%d)",
+                world_size,
+            )
+            use_streaming = False
+
         train_dataset, eval_dataset = build_sft_datasets(
             datasets_to_use=cfg.training.sft_dataset.datasets_to_use,
             tokenizer=tokenizer,
@@ -458,7 +474,7 @@ def run_sft(cfg):
             seed=cfg.training.sft_dataset.seed,
             pack_sequences=cfg.training.sft_dataset.pack_sequences,
             use_cache=cfg.training.sft_dataset.use_cache,
-            streaming=cfg.training.sft_dataset.streaming,
+            streaming=use_streaming,
         )
         logging.info(
             "Using enhanced datasets with %d datasets: %s",
@@ -468,7 +484,9 @@ def run_sft(cfg):
     else:
         # Use deterministic, finite dataset split for legacy datasets
         seed = getattr(cfg.training.sft_dataset, "seed", 42)
-        eval_holdout_ratio = getattr(cfg.training.sft_dataset, "eval_holdout_ratio", 0.1)
+        eval_holdout_ratio = getattr(
+            cfg.training.sft_dataset, "eval_holdout_ratio", 0.1
+        )
         dataset = load_dataset(
             cfg.training.sft_dataset.huggingface_dataset_id,
             split=cfg.training.sft_dataset.split,
@@ -498,10 +516,34 @@ def run_sft(cfg):
             )
     count_trainables(model, "after dataset setup")
 
-    if world_size > 1 and isinstance(train_dataset, IterableDataset):
-        train_dataset = train_dataset.shard(num_shards=world_size, index=local_rank)
-        if eval_dataset is not None and isinstance(eval_dataset, IterableDataset):
-            eval_dataset = eval_dataset.shard(num_shards=world_size, index=local_rank)
+    if eval_dataset is not None and hasattr(eval_dataset, "__len__"):
+        MAX_EVAL_SAMPLES = 7500
+        if len(eval_dataset) > MAX_EVAL_SAMPLES:
+            logging.info(
+                f"Capping eval dataset from {len(eval_dataset)} to {MAX_EVAL_SAMPLES} samples for faster eval"
+            )
+            eval_dataset = eval_dataset.select(range(MAX_EVAL_SAMPLES))
+
+    # Handle sharding for distributed training
+    # Note: IterableDataset doesn't support .shard() - use skip/take pattern instead
+    if world_size > 1:
+        from datasets import Dataset as HFDataset
+
+        if isinstance(train_dataset, HFDataset):
+            train_dataset = train_dataset.shard(num_shards=world_size, index=local_rank)
+        elif isinstance(train_dataset, IterableDataset):
+            # For IterableDataset, sharding is typically handled by the DataLoader
+            # or we can use the distributed sampler approach via SFTTrainer
+            logging.info(
+                "IterableDataset detected - sharding will be handled by trainer/dataloader"
+            )
+
+        if eval_dataset is not None:
+            if isinstance(eval_dataset, HFDataset):
+                eval_dataset = eval_dataset.shard(
+                    num_shards=world_size, index=local_rank
+                )
+            # Don't shard eval IterableDataset - keep full eval on each rank
 
     model_str = f"{cfg.training.model.name}_{cfg.training.model.version}_{cfg.training.model.size}"
     use_topk = getattr(cfg.training.sft_experiment.lora, "use_topk", False)
@@ -540,12 +582,17 @@ def run_sft(cfg):
         logging_dir=f"{base_output_dir}/logs",
         max_steps=cfg.training.sft.max_steps,
         report_to=cfg.logger.report_to,
-        per_device_eval_batch_size=cfg.training.sft.batch_size_eval,
+        # Keep eval tiny to allow logits for metrics without OOM
+        per_device_eval_batch_size=1,
         weight_decay=cfg.training.sft.weight_decay,
         push_to_hub=cfg.training.sft.push_to_hub,
         do_eval=cfg.training.sft.do_eval,
         ddp_backend=ddp_backend,
         ddp_find_unused_parameters=ddp_find_unused,
+        # Disable logits gathering to avoid eval OOM / slowdowns
+        prediction_loss_only=True,
+        # Keep eval accumulation minimal to limit memory
+        eval_accumulation_steps=1,
     )
 
     # Prepare regularization config for enhanced trainer
@@ -590,6 +637,11 @@ def run_sft(cfg):
             ),
             is_topk_experiment=cfg.training.sft_experiment.lora.get(
                 "top_k_experiment", False
+            ),
+            k_warmup_frac=getattr(
+                cfg.training.sft_experiment.lora,
+                "k_warmup_frac",
+                getattr(cfg.training.sft_experiment.lora, "k_warmup_fraction", 0.2),
             ),
             set_train=True,
         )
@@ -904,7 +956,9 @@ def run_sft(cfg):
 
         # Only finish the Weights & Biases run if WandB logging is enabled.
         logger_cfg = getattr(cfg, "logger", None)
-        wandb_mode = getattr(logger_cfg, "wandb_mode", None) if logger_cfg is not None else None
+        wandb_mode = (
+            getattr(logger_cfg, "wandb_mode", None) if logger_cfg is not None else None
+        )
         if wandb_mode != "disabled":
             wandb.finish()
 

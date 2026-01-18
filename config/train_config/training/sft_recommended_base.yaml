@@ -14,21 +14,21 @@ sft:
   completion_only_loss: True
   max_seq_length: 2048
   num_epochs: 1
-  batch_size_train: 4
-  gradient_accumulation_steps: 32
+  batch_size_train: 2
+  gradient_accumulation_steps: 16
   gradient_checkpointing: True
   optim: "adamw_torch"
-  lr: 1e-4
+  lr: 5e-4
   warmup_ratio: 0.05
-  bf16: False
-  fp16: True
+  bf16: True
+  fp16: False
   max_grad_norm: 0.3
   save_strategy: "steps"
   save_total_limit: 3
-  eval_steps: 500
+  eval_steps: 100
   eval_strategy: "steps"
   batch_size_eval: 4
-  weight_decay: 0.01
+  weight_decay: 0.02
   push_to_hub: False
   do_eval: True
 

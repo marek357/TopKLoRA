@@ -721,6 +721,7 @@ def _prepare_preference_dataset(
                 "filtering based on chat-formatted prompts."
             )
         else:
+
             def length_ok(ex):
                 chosen = ex["chosen"]
                 rejected = ex["rejected"]
@@ -730,8 +731,12 @@ def _prepare_preference_dataset(
                 prompt_ids = tokenizer.apply_chat_template(
                     prompt, add_generation_prompt=True, tokenize=True
                 )
-                chosen_ids = tokenizer(chosen_resp, add_special_tokens=False)["input_ids"]
-                rejected_ids = tokenizer(rejected_resp, add_special_tokens=False)["input_ids"]
+                chosen_ids = tokenizer(chosen_resp, add_special_tokens=False)[
+                    "input_ids"
+                ]
+                rejected_ids = tokenizer(rejected_resp, add_special_tokens=False)[
+                    "input_ids"
+                ]
                 return (
                     len(prompt_ids) <= max_prompt_length
                     and len(chosen_ids) <= max_completion_length
@@ -1296,6 +1301,9 @@ def _collect_hparams(
         ),
         "temperature_schedule": getattr(lora, "temperature_schedule", "linear"),
         "k_schedule": getattr(lora, "k_schedule", "constant"),
+        "k_warmup_frac": float(
+            getattr(lora, "k_warmup_frac", getattr(lora, "k_warmup_fraction", 0.2))
+        ),
         "target_modules": list(target_modules),
         "alpha": float(getattr(lora, "alpha", getattr(lora, "lora_alpha", 16))),
         "dropout": float(getattr(lora, "dropout", 0.05)),
@@ -1595,14 +1603,23 @@ def run_dpo(cfg, quant_cfg):
     _device_map = _resolve_device_map_for_ddp() if device == "cuda" else None
     torch_dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
-    attn_impl = "sdpa" if device == "cuda" else "eager"
+    base_model_id = str(
+        getattr(cfg.training.base_sft_merged_model, "model_name", None)
+        or cfg.training.base_sft_merged_model.checkpoint_dir
+    )
+    is_gemma = "gemma" in base_model_id.lower()
+    attn_impl = "eager" if is_gemma else ("sdpa" if device == "cuda" else "eager")
+    if is_gemma:
+        logging.info(
+            "Gemma detected; forcing attn_implementation='eager' as recommended"
+        )
     policy_model = AutoModelForCausalLM.from_pretrained(
         cfg.training.base_sft_merged_model.checkpoint_dir,
         torch_dtype=torch_dtype,
         device_map=_device_map,  # per-process placement; avoid auto-sharding under DDP
         trust_remote_code=True,
         quantization_config=quant_cfg,
-        attn_implementation=attn_impl,  # lower memory than eager when available
+        attn_implementation=attn_impl,  # prefer eager for Gemma; sdpa on CUDA otherwise
     )
     if quant_cfg is not None:
         policy_model = prepare_model_for_kbit_training(policy_model)
@@ -1711,6 +1728,11 @@ def run_dpo(cfg, quant_cfg):
         k_final=experiment_args.lora.k_final,
         temperature_final=getattr(experiment_args.lora, "temperature_final", None),
         is_topk_experiment=experiment_args.lora.get("top_k_experiment", False),
+        k_warmup_frac=getattr(
+            experiment_args.lora,
+            "k_warmup_frac",
+            getattr(experiment_args.lora, "k_warmup_fraction", 0.2),
+        ),
         set_train=True,
     )
     logging.info(f"✅ Injected TopK STE wrappers in {replaced} layers")
@@ -1748,7 +1770,9 @@ def run_dpo(cfg, quant_cfg):
                 try:
                     os.remove(latest_link)
                 except Exception as e:
-                    logging.warning(f"Could not remove existing 'latest' link '{latest_link}': {e}")
+                    logging.warning(
+                        f"Could not remove existing 'latest' link '{latest_link}': {e}"
+                    )
             os.symlink(output_dir, latest_link)
         except Exception as e:
             logging.warning(f"Could not create 'latest' symlink: {e}")
@@ -1766,7 +1790,8 @@ def run_dpo(cfg, quant_cfg):
         )
         summary.append(
             f"lora_topk: r={experiment_args.lora.r}, k={experiment_args.lora.k}, k_final={getattr(experiment_args.lora, 'k_final', experiment_args.lora.k)}, "
-            f"alpha={getattr(experiment_args.lora, 'alpha', getattr(experiment_args.lora, 'lora_alpha', 16))}, temp={getattr(experiment_args.lora, 'temperature', 1.0)}"
+            f"alpha={getattr(experiment_args.lora, 'alpha', getattr(experiment_args.lora, 'lora_alpha', 16))}, temp={getattr(experiment_args.lora, 'temperature', 1.0)}, "
+            f"k_warmup_frac={getattr(experiment_args.lora, 'k_warmup_frac', getattr(experiment_args.lora, 'k_warmup_fraction', 0.2))}"
         )
         summary.append(
             f"dpo: beta={dpo_args.beta}, lr={dpo_args.learning_rate}, steps={dpo_args.max_steps}, bs={dpo_args.per_device_train_batch_size}x{dpo_args.gradient_accumulation_steps}"

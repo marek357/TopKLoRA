@@ -8,8 +8,11 @@ from datasets import (
     concatenate_datasets,
     interleave_datasets,
     load_dataset,
+    Features,
+    Sequence,
+    Value,
 )
-from typing import List, Dict, Tuple, Sequence
+from typing import List, Dict, Tuple, Sequence as TypingSequence
 import heapq
 from peft import PeftModel
 from openai import OpenAI
@@ -220,6 +223,55 @@ def configure_eos_eot(tokenizer, model):
     return eot_token, eot_token_id
 
 
+def resolve_target_modules(lora_cfg) -> List[str]:
+    """
+    Resolve target_modules from either explicit list or module_type shorthand.
+    
+    Supports two modes:
+    1. Explicit: lora_cfg.target_modules = ["layers.18.mlp.gate_proj", ...]
+    2. Shorthand: lora_cfg.module_type = "mlp" or "mlp_attn"
+    
+    The shorthand uses lora_cfg.layer to determine which layer to target.
+    
+    Args:
+        lora_cfg: OmegaConf config with either target_modules or module_type + layer
+        
+    Returns:
+        List of target module names
+    """
+    # If explicit target_modules provided, use them
+    if hasattr(lora_cfg, 'target_modules') and lora_cfg.target_modules is not None:
+        return list(lora_cfg.target_modules)
+    
+    # Otherwise, generate from module_type and layer
+    module_type = getattr(lora_cfg, 'module_type', 'mlp')
+    layer = getattr(lora_cfg, 'layer', 18)
+    
+    # MLP modules
+    mlp_modules = [
+        f"layers.{layer}.mlp.gate_proj",
+        f"layers.{layer}.mlp.up_proj",
+        f"layers.{layer}.mlp.down_proj",
+    ]
+    
+    # Attention modules
+    attn_modules = [
+        f"layers.{layer}.self_attn.q_proj",
+        f"layers.{layer}.self_attn.k_proj",
+        f"layers.{layer}.self_attn.v_proj",
+        f"layers.{layer}.self_attn.o_proj",
+    ]
+    
+    if module_type == "mlp":
+        return mlp_modules
+    elif module_type == "mlp_attn":
+        return attn_modules + mlp_modules
+    elif module_type == "attn":
+        return attn_modules
+    else:
+        raise ValueError(f"Unknown module_type: {module_type}. Expected 'mlp', 'attn', or 'mlp_attn'")
+
+
 def wrap_topk_lora_modules(
     model,
     *,
@@ -234,6 +286,7 @@ def wrap_topk_lora_modules(
     hard_eval: bool = True,
     relu_latents: bool = True,
     alpha_over_r: bool = True,
+    k_warmup_frac: float = 0.2,
 ):
     """Wrap PEFT LoRA layers with TopKLoRALinearSTE and return (count, mapping)."""
     targets = []
@@ -264,6 +317,7 @@ def wrap_topk_lora_modules(
             alpha_over_r=alpha_over_r,
             temperature_final=temperature_final,
             is_topk_experiment=is_topk_experiment,
+            k_warmup_frac=k_warmup_frac,
         )
         try:
             target_device = next(peft_layer.parameters()).device
@@ -1379,7 +1433,10 @@ def setup_tokenizer_for_chat(tokenizer):
     return tokenizer
 
 
-def normalize_chat_messages(raw_messages: Sequence[Dict[str, Any]]) -> List[Message]:
+def normalize_chat_messages(
+    raw_messages: TypingSequence[Dict[str, Any]],
+) -> List[Message]:
+    raw_messages: TypingSequence[Dict[str, Any]]
     """Normalize raw chat messages into Gemma-compatible message dicts.
 
     Supported role mappings:
@@ -1449,8 +1506,15 @@ def _make_cache_key(
     eval_holdout_ratio: float,
     seed: int,
     pack_sequences: bool,
+    include_packing: bool = True,
 ) -> str:
-    """Create a deterministic cache key based on dataset parameters."""
+    """Create a deterministic cache key based on dataset parameters.
+
+    Args:
+        include_packing: If False, excludes pack_sequences from the key.
+            This is used for the pre-packing cache to avoid re-tokenizing
+            when only packing parameters change.
+    """
     # Sort dataset_weights for consistency
     sorted_weights = sorted((dataset_weights or {}).items())
     key_dict = {
@@ -1462,41 +1526,51 @@ def _make_cache_key(
         "mix_seed": mix_seed,
         "eval_holdout_ratio": eval_holdout_ratio,
         "seed": seed,
-        "pack_sequences": pack_sequences,
         "version": "v1",  # Increment this if data processing changes
     }
+    # Only include packing in key if requested (for final packed cache)
+    if include_packing:
+        key_dict["pack_sequences"] = pack_sequences
     key_str = json.dumps(key_dict, sort_keys=True)
     return hashlib.md5(key_str.encode()).hexdigest()
 
 
 def _get_cache_path(cache_key: str) -> str:
     """Get the cache file path for a given cache key."""
-    cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "topk_lora_datasets")
+    cache_dir = os.path.join("/scratch/network/ssd/marek/cache", "topk_lora_datasets")
     os.makedirs(cache_dir, exist_ok=True)
     return os.path.join(cache_dir, f"sft_datasets_{cache_key}.pkl")
 
 
+def _cache_exists(cache_path: str) -> bool:
+    """Check whether any cache artifact exists for the given base path.
+
+    Accepts either the pickle file itself or the disk directories that we
+    create when disk_only=True (or after loading/saving). This prevents
+    re-building when only the disk cache is present.
+    """
+    if os.path.exists(cache_path):
+        return True
+    train_cache_dir = cache_path.replace(".pkl", "_train_dir")
+    eval_cache_dir = cache_path.replace(".pkl", "_eval_dir")
+    return os.path.exists(train_cache_dir) and os.path.exists(eval_cache_dir)
+
+
 def _save_datasets_to_cache(
-    train_ds: HFDataset, eval_ds: HFDataset, cache_path: str
+    train_ds: HFDataset,
+    eval_ds: HFDataset,
+    cache_path: str,
+    *,
+    disk_only: bool = False,
 ) -> None:
-    """Save datasets to cache file efficiently with disk-based format for streaming."""
-    print(f"💾 Saving datasets to cache: {cache_path}")
+    """Save datasets to cache with optional disk-only mode.
 
-    # Save in multiple formats for flexibility
-    cache_data = {
-        "train": {
-            "data": train_ds.to_list(),
-            "features": train_ds.features,
-        },
-        "eval": {
-            "data": eval_ds.to_list(),
-            "features": eval_ds.features,
-        },
-    }
-
-    # Save pickle format (legacy compatibility)
-    with open(cache_path, "wb") as f:
-        pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    disk_only=True avoids materializing the dataset with `.to_list()`, which is
+    very slow and memory hungry for large pre-packing caches. In disk-only mode
+    we only persist `save_to_disk` directories, which are what we load first
+    anyway.
+    """
+    print(f"💾 Saving datasets to cache: {cache_path} (disk_only={disk_only})")
 
     # Save disk format for efficient streaming
     train_cache_dir = cache_path.replace(".pkl", "_train_dir")
@@ -1505,9 +1579,26 @@ def _save_datasets_to_cache(
     try:
         train_ds.save_to_disk(train_cache_dir)
         eval_ds.save_to_disk(eval_cache_dir)
-        print("💾 Also saved disk format for efficient streaming")
+        print("💾 Saved disk format for efficient streaming")
     except Exception as e:
         print(f"⚠️ Failed to save disk format: {e}")
+
+    if not disk_only:
+        # Save in multiple formats for flexibility (legacy pickle + features)
+        cache_data = {
+            "train": {
+                "data": train_ds.to_list(),
+                "features": train_ds.features,
+            },
+            "eval": {
+                "data": eval_ds.to_list(),
+                "features": eval_ds.features,
+            },
+        }
+
+        with open(cache_path, "wb") as f:
+            pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print("💾 Also saved pickle format for legacy compatibility")
 
     print(
         f"✅ Datasets cached successfully ({len(train_ds)} train, {len(eval_ds)} eval)"
@@ -1780,7 +1871,9 @@ def load_alpaca(split: str = "train") -> HFDataset:
         instr = (ex.get("instruction") or "").strip()
         inp = (ex.get("input") or "").strip()
         output = (ex.get("output") or "").strip()
-        return {"messages": build_instruction_messages(instr, output, input_context=inp)}
+        return {
+            "messages": build_instruction_messages(instr, output, input_context=inp)
+        }
 
     ds = ds.map(to_messages, num_proc=NUM_PROC)
     ds = ds.filter(lambda ex: len(ex.get("messages") or []) > 0)
@@ -1811,11 +1904,13 @@ def _to_messages_with_fallback(ex: Mapping[str, Any]) -> Dict[str, Any]:
     instr = (ex.get("instruction") or ex.get("prompt") or "").strip()
     ctx_text = (ex.get("input") or ex.get("context") or "").strip()
     output = ex.get("response") or ex.get("output") or ex.get("completion") or ""
-    return {"messages": build_instruction_messages(instr, output, input_context=ctx_text)}
+    return {
+        "messages": build_instruction_messages(instr, output, input_context=ctx_text)
+    }
 
 
 def load_infinity_instruct(split: str = "train") -> HFDataset:
-    ds = load_dataset("BAAI/Infinity-Instruct", split=split)
+    ds = load_dataset("BAAI/Infinity-Instruct", "7M_core", split=split)
 
     ds = ds.map(_to_messages_with_fallback, num_proc=NUM_PROC)
     ds = ds.filter(lambda ex: len(ex.get("messages") or []) > 0)
@@ -1872,9 +1967,7 @@ def _mix_datasets(
     if mix_strategy == "concat":
         return concatenate_datasets(pieces)
     weights = (
-        [dataset_weights.get(name, 1.0) for name in names]
-        if dataset_weights
-        else None
+        [dataset_weights.get(name, 1.0) for name in names] if dataset_weights else None
     )
     probabilities = None
     if weights is not None:
@@ -1896,6 +1989,55 @@ def _mix_datasets(
     )
 
 
+def _messages_to_row_format(msgs) -> List[Dict[str, str]]:
+    """Convert messages from columnar format to row format if needed.
+
+    Columnar: {"role": ["user", "assistant"], "content": ["...", "..."]}
+    Row: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+    """
+    if not msgs:
+        return []
+
+    # Already row format (list of dicts)
+    if isinstance(msgs, list):
+        return [
+            {"role": str(m.get("role") or ""), "content": str(m.get("content") or "")}
+            for m in msgs
+            if isinstance(m, dict)
+        ]
+
+    # Columnar format (dict of lists)
+    if isinstance(msgs, dict):
+        roles = msgs.get("role", [])
+        contents = msgs.get("content", [])
+        return [{"role": str(r), "content": str(c)} for r, c in zip(roles, contents)]
+
+    return []
+
+
+def _standardize_messages_schema(ds: HFDataset) -> HFDataset:
+    """Force a consistent struct field order for `messages` to avoid Arrow concat errors.
+
+    We convert to python list, rebuild each message dict in a guaranteed
+    role→content order, then recreate the dataset WITHOUT explicit Sequence features
+    to avoid columnar format issues.
+    """
+    if "messages" not in ds.column_names:
+        return ds
+
+    # Materialize to list so we can rebuild with consistent format
+    rows = ds.to_list()
+    fixed_rows = []
+    for row in rows:
+        msgs = row.get("messages") or []
+        # Convert to row format and ensure consistent key order
+        fixed_msgs = _messages_to_row_format(msgs)
+        fixed_rows.append({"messages": fixed_msgs})
+
+    # Don't use Sequence features - let HF infer schema to avoid columnar format
+    return HFDataset.from_list(fixed_rows)
+
+
 def build_sft_dataset(
     tokenizer: PreTrainedTokenizerBase,
     max_length: int = 8192,
@@ -1907,25 +2049,25 @@ def build_sft_dataset(
     pieces: List[HFDataset] = []
     names: List[str] = []
     if "oasst1" in datasets_to_use:
-        pieces.append(load_oasst1("train"))
+        pieces.append(_standardize_messages_schema(load_oasst1("train")))
         names.append("oasst1")
     if "dolly" in datasets_to_use:
-        pieces.append(load_dolly("train"))
+        pieces.append(_standardize_messages_schema(load_dolly("train")))
         names.append("dolly")
     if "ultrachat" in datasets_to_use:
-        pieces.append(load_ultrachat("train_sft"))
+        pieces.append(_standardize_messages_schema(load_ultrachat("train_sft")))
         names.append("ultrachat")
     if "tulu_v2" in datasets_to_use:
-        pieces.append(load_tulu_v2("train"))
+        pieces.append(_standardize_messages_schema(load_tulu_v2("train")))
         names.append("tulu_v2")
     if "infinity_instruct" in datasets_to_use:
-        pieces.append(load_infinity_instruct("train"))
+        pieces.append(_standardize_messages_schema(load_infinity_instruct("train")))
         names.append("infinity_instruct")
     if "h4_instruction" in datasets_to_use:
-        pieces.append(load_h4_instruction("train"))
+        pieces.append(_standardize_messages_schema(load_h4_instruction("train")))
         names.append("h4_instruction")
     if "alpaca" in datasets_to_use:
-        pieces.append(load_alpaca("train"))
+        pieces.append(_standardize_messages_schema(load_alpaca("train")))
         names.append("alpaca")
 
     mixed = _mix_datasets(
@@ -1939,33 +2081,59 @@ def build_sft_dataset(
 
     # Filter out empty conversations
     def is_valid(ex):
-        messages = ex.get("messages", [])
+        raw_msgs = ex.get("messages", [])
+        if not raw_msgs:
+            return False
+        # Convert from columnar to row format if needed
+        messages = _messages_to_row_format(raw_msgs)
         if not messages:
             return False
-        # Must have at least one assistant message
-        has_assistant = any(
-            m.get("role") == "assistant"
-            for m in messages
-            if m.get("content", "").strip()
-        )
+        # Must have at least one assistant message with content
+        has_assistant = False
+        for m in messages:
+            role = m.get("role", "")
+            content = m.get("content", "")
+            if role == "assistant" and content and content.strip():
+                has_assistant = True
+                break
         return has_assistant
 
+    pre_filter_len = len(mixed)
     mixed = mixed.filter(is_valid)
+    post_filter_len = len(mixed)
+    print(
+        f"📊 Filter: {pre_filter_len} -> {post_filter_len} examples ({post_filter_len / max(pre_filter_len, 1) * 100:.1f}% kept)"
+    )
+
+    if post_filter_len == 0:
+        raise ValueError(
+            f"All {pre_filter_len} examples were filtered out! "
+            "Check that your datasets have properly formatted messages with assistant responses."
+        )
 
     def tokenize_example(ex):
-        messages: List[Message] = ex["messages"]
+        raw_msgs = ex["messages"]
+        # Convert from columnar to row format if needed
+        messages: List[Message] = _messages_to_row_format(raw_msgs)
         return _encode_with_assistant_mask(tokenizer, messages, max_length)
+
+    # Use fewer workers and batching to reduce memory usage on large datasets
+    # For 6M+ examples, even 8 workers can OOM - use 4
+    num_workers = min(32, NUM_PROC) if len(mixed) > 1_000_000 else min(32, NUM_PROC)
+    print(f"🔄 Tokenizing {len(mixed)} examples with {num_workers} workers...")
 
     tokenized = mixed.map(
         tokenize_example,
         remove_columns=[c for c in mixed.column_names if c != "messages"],
-        num_proc=NUM_PROC,
+        num_proc=num_workers,
+        desc="Tokenizing",
     )
 
     # Filter out sequences that became empty after tokenization
+    print("🔄 Filtering empty sequences...")
     tokenized = tokenized.filter(
         lambda ex: len(ex["input_ids"]) > 0,
-        num_proc=NUM_PROC,
+        num_proc=num_workers,
     )
     return tokenized
 
@@ -1978,6 +2146,10 @@ def pack_tokenized_dataset(
     eos_token_id: int,
 ) -> HFDataset:
     """Pack multiple tokenized examples into <=max_length sequences. Insert EOS between examples and set its label to -100."""
+
+    # Stream over the dataset to avoid materializing all examples at once
+    all_examples = tqdm(tokenized, total=len(tokenized), desc="Packing")
+
     buffers = {"input_ids": [], "labels": [], "attention_mask": []}
     packed = []
 
@@ -1989,10 +2161,15 @@ def pack_tokenized_dataset(
             buffers[k].clear()
 
     cur_len = 0
-    for ex in tokenized:
-        ids = list(ex["input_ids"])
-        labs = list(ex["labels"])
-        attn = list(ex["attention_mask"])
+    for ex in tqdm(all_examples, desc="Packing"):
+        ids = ex["input_ids"]
+        labs = ex["labels"]
+        attn = ex["attention_mask"]
+
+        # Skip empty sequences
+        if not ids:
+            continue
+
         need = len(ids) + (1 if cur_len > 0 else 0)
         if cur_len + need > max_length:
             flush()
@@ -2012,6 +2189,8 @@ def pack_tokenized_dataset(
             flush()
             cur_len = 0
     flush()
+
+    print(f"   Packed into {len(packed)} sequences")
     return HFDataset.from_list(packed)
 
 
@@ -2047,9 +2226,21 @@ def build_sft_datasets(
     Returns:
         Tuple of (train_dataset, eval_dataset)
     """
+    # Optional override: set TOPK_SFT_SAVE_PICKLE=1 to also write pickle caches.
+    save_pickle_cache = os.environ.get("TOPK_SFT_SAVE_PICKLE", "0") not in (
+        "0",
+        "false",
+        "False",
+        "",
+    )
+
     # Create cache key based on all parameters that affect the output
     tokenizer_name = getattr(tokenizer, "name_or_path", "unknown_tokenizer")
-    cache_key = _make_cache_key(
+
+    # Create TWO cache keys:
+    # 1. Pre-packing cache (tokenized but not packed) - excludes pack_sequences from key
+    # 2. Final cache (packed if requested) - includes pack_sequences in key
+    unpacked_cache_key = _make_cache_key(
         tokenizer_name=tokenizer_name,
         max_length=max_length,
         datasets_to_use=datasets_to_use,
@@ -2059,47 +2250,129 @@ def build_sft_datasets(
         eval_holdout_ratio=eval_holdout_ratio,
         seed=seed,
         pack_sequences=pack_sequences,
+        include_packing=False,  # Exclude packing from key for tokenized cache
     )
-
-    cache_path = _get_cache_path(cache_key)
-
-    # Try to load from cache first
-    if use_cache and os.path.exists(cache_path):
-        try:
-            return _load_datasets_from_cache(cache_path, streaming=streaming)
-        except Exception as e:
-            print(f"⚠️ Failed to load from cache ({e}), rebuilding datasets...")
-            # Remove corrupted cache file
-            # try:
-            #     os.remove(cache_path)
-            # except:
-            #     pass
-
-    # Build datasets from scratch
-    print("🔨 Building datasets from scratch (this may take a while)...")
-    full = build_sft_dataset(
-        tokenizer,
+    final_cache_key = _make_cache_key(
+        tokenizer_name=tokenizer_name,
         max_length=max_length,
         datasets_to_use=datasets_to_use,
         dataset_weights=dataset_weights,
         mix_strategy=mix_strategy,
         mix_seed=mix_seed,
+        eval_holdout_ratio=eval_holdout_ratio,
+        seed=seed,
+        pack_sequences=pack_sequences,
+        include_packing=True,  # Include packing for final cache
     )
-    split = full.train_test_split(test_size=eval_holdout_ratio, seed=seed)
-    train_ds, eval_ds = split["train"], split["test"]
 
-    # Safety check: ensure eval dataset is not empty
-    if len(eval_ds) == 0:
-        print("⚠️ Evaluation dataset is empty, adjusting holdout ratio...")
-        # Use a minimum of 10 examples for evaluation or 1% of data, whichever is larger
-        min_eval_size = max(10, int(len(full) * 0.01))
-        adjusted_ratio = min(min_eval_size / len(full), 0.1)  # Cap at 10%
-        split = full.train_test_split(test_size=adjusted_ratio, seed=seed)
-        train_ds, eval_ds = split["train"], split["test"]
-        print(
-            f"📊 Adjusted eval dataset size: {len(eval_ds)} examples ({adjusted_ratio:.3f} ratio)"
+    unpacked_cache_path = _get_cache_path(f"tokenized_{unpacked_cache_key}")
+    final_cache_path = _get_cache_path(f"final_{final_cache_key}")
+
+    # In distributed training, only rank 0 should build the dataset
+    # Other ranks wait for cache to be ready
+    global_rank = get_global_rank()
+    world_size = get_world_size()
+
+    if global_rank == 0:
+        print(f"📁 Tokenized (pre-packing) cache path: {unpacked_cache_path}")
+        print(f"📁 Final cache path: {final_cache_path}")
+
+    # Try to load from final (packed) cache first
+    if use_cache and _cache_exists(final_cache_path):
+        try:
+            if global_rank == 0:
+                print("✅ Found final cached dataset, loading...")
+            return _load_datasets_from_cache(final_cache_path, streaming=streaming)
+        except Exception as e:
+            if global_rank == 0:
+                print(
+                    f"⚠️ Failed to load from final cache ({e}), checking pre-packing cache..."
+                )
+
+    # In distributed training, only rank 0 builds the dataset, others wait
+    if world_size > 1 and global_rank != 0:
+        # Wait for rank 0 to build and cache the dataset
+        print(f"[Rank {global_rank}] Waiting for rank 0 to build dataset...")
+        import time
+
+        max_wait = 7200 * 5  # 10 hours max wait
+        waited = 0
+        while not _cache_exists(final_cache_path) and waited < max_wait:
+            time.sleep(30)
+            waited += 30
+        if _cache_exists(final_cache_path):
+            print(f"[Rank {global_rank}] Cache ready, loading...")
+            return _load_datasets_from_cache(final_cache_path, streaming=streaming)
+        else:
+            raise RuntimeError(
+                f"[Rank {global_rank}] Timeout waiting for dataset cache"
+            )
+
+    # Try to load from pre-packing cache (tokenized but not packed)
+    train_ds = None
+    eval_ds = None
+
+    if use_cache and _cache_exists(unpacked_cache_path):
+        try:
+            print("✅ Found tokenized (pre-packing) cache, loading...")
+            train_ds, eval_ds = _load_datasets_from_cache(
+                unpacked_cache_path, streaming=False
+            )
+            print(
+                f"📊 Loaded from pre-packing cache: {len(train_ds)} train, {len(eval_ds)} eval"
+            )
+        except Exception as e:
+            print(
+                f"⚠️ Failed to load from pre-packing cache ({e}), building from scratch..."
+            )
+            train_ds = None
+            eval_ds = None
+
+    # Build datasets from scratch if not loaded from cache
+    if train_ds is None or eval_ds is None:
+        print("🔨 Building datasets from scratch (this may take a while)...")
+        full = build_sft_dataset(
+            tokenizer,
+            max_length=max_length,
+            datasets_to_use=datasets_to_use,
+            dataset_weights=dataset_weights,
+            mix_strategy=mix_strategy,
+            mix_seed=mix_seed,
         )
+        split = full.train_test_split(test_size=eval_holdout_ratio, seed=seed)
+        train_ds, eval_ds = split["train"], split["test"]
 
+        # Safety check: ensure we have data
+        full_len = len(full)
+        if full_len == 0:
+            raise ValueError(
+                "Dataset is empty after tokenization! Check dataset loading and filtering."
+            )
+
+        # Safety check: ensure eval dataset is not empty
+        if len(eval_ds) == 0:
+            print("⚠️ Evaluation dataset is empty, adjusting holdout ratio...")
+            # Use a minimum of 10 examples for evaluation or 1% of data, whichever is larger
+            min_eval_size = max(10, int(full_len * 0.01))
+            adjusted_ratio = min(min_eval_size / full_len, 0.1)  # Cap at 10%
+            split = full.train_test_split(test_size=adjusted_ratio, seed=seed)
+            train_ds, eval_ds = split["train"], split["test"]
+            print(
+                f"📊 Adjusted eval dataset size: {len(eval_ds)} examples ({adjusted_ratio:.3f} ratio)"
+            )
+
+        # Save tokenized (pre-packing) cache
+        if use_cache:
+            try:
+                print("💾 Saving tokenized (pre-packing) cache...")
+                _save_datasets_to_cache(
+                    train_ds, eval_ds, unpacked_cache_path, disk_only=True
+                )
+                print("✅ Pre-packing cache saved successfully")
+            except Exception as e:
+                print(f"⚠️ Failed to save pre-packing cache ({e}), continuing...")
+
+    # Apply packing if requested
     if pack_sequences:
         pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
         eos_id = tokenizer.eos_token_id or pad_id
@@ -2112,12 +2385,21 @@ def build_sft_datasets(
             eval_ds, max_length=max_length, pad_token_id=pad_id, eos_token_id=eos_id
         )
 
-    # Save to cache for future use
+    # Save final (packed) cache
     if use_cache:
         try:
-            _save_datasets_to_cache(train_ds, eval_ds, cache_path)
+            print(
+                f"💾 Saving final cache... (pickle={'on' if save_pickle_cache else 'off'})"
+            )
+            _save_datasets_to_cache(
+                train_ds,
+                eval_ds,
+                final_cache_path,
+                disk_only=not save_pickle_cache,
+            )
+            print("✅ Final cache saved successfully")
         except Exception as e:
-            print(f"⚠️ Failed to save to cache ({e}), continuing without caching...")
+            print(f"⚠️ Failed to save final cache ({e}), continuing without caching...")
 
     # Convert to streaming if requested (only for training dataset)
     if streaming:
