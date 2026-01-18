@@ -17,22 +17,17 @@ dataset:                       # Prompt source configuration (HH-RLHF).
     analysis_frac: 0.8         # Fraction used for analysis; remainder is eval.
 
 latents:                       # Latent statistics collection settings.
-  activation_epsilon: 1e-6     # Threshold for counting a latent as active.
   quantiles: [0.5, 0.9, 0.99]  # Quantiles to record per latent.
-  quantile_samples: 2000       # Reservoir size for quantile estimation.
   max_length: 2048             # Token limit when collecting stats.
 
-intervention:                  # Calibration of intervention strength.
-  kl_targets: [0.005, 0.01]    # Target KLs for matching intervention strength.
-  calibration_prompts: 16      # Number of prompts used in calibration.
-  window_tokens: 32            # Token window for KL measurement.
-  amp_min: 0.5                 # Minimum steering alpha for search.
-  amp_max: 8.0                 # Maximum steering alpha for search.
-  amp_search_steps: 8          # Binary search steps for alpha.
-
 generation:            # Text generation settings for evidence.
-  baseline_samples: 3  # Baseline completions per prompt.
   max_new_tokens: 128  # Max tokens to generate.
+  do_sample_train: false  # Disable sampling for training evidence.
+  do_sample_eval: true    # Enable sampling for eval evidence.
+  temperature_train: 1.0  # Sampling temperature for training (if enabled).
+  top_p_train: 0.9        # Nucleus sampling p for training (if enabled).
+  temperature_eval: 1.0   # Sampling temperature for eval (if enabled).
+  top_p_eval: 0.9         # Nucleus sampling p for eval (if enabled).
 
 # evidence packs
 # train_per_latent is used for both train/eval unless overridden
@@ -40,9 +35,10 @@ generation:            # Text generation settings for evidence.
 # top_context_ratio chooses how many prompts from top activations
 
 evidence:               # Evidence pack construction settings.
-  train_per_latent: 10  # Prompts per latent for training evidence.
-  eval_per_latent: 10   # Prompts per latent for eval evidence.
-  target_kl: 0.01       # Which calibration KL to use for steering.
+  train_per_latent: 3   # Prompts per latent for training evidence.
+  eval_per_latent: 3    # Prompts per latent for eval evidence.
+  intervention_type: zero_ablate  # steer_with_alpha or zero_ablate
+  alpha: 0.5            # Fixed steering alpha (calibration removed).
   window_tokens: 64     # Window metadata for interventions.
 
 llm:  # Explainer/verifier model settings.
@@ -72,12 +68,11 @@ llm:  # Explainer/verifier model settings.
     max_tokens: 256        # Verifier output token cap.
 
 stages:                 # Pipeline stage toggles.
-  prompts: true         # Build prompt records.
-  latent_stats: true    # Collect latent activation stats.
-  calibration: true     # Calibrate interventions to target KL.
+  prompts: false         # Build prompt records.
+  latent_stats: false    # Collect latent activation stats.
   evidence_train: true  # Generate training evidence packs.
-  hypothesis: true      # Generate hypotheses via explainer.
   evidence_eval: true   # Generate eval evidence packs.
+  hypothesis: true      # Generate hypotheses via explainer.
   verification: true    # Run blind + hypothesis verification.
   summary: true         # Aggregate summary metrics.
 

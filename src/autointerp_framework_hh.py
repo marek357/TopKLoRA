@@ -12,6 +12,7 @@ import logging
 import os
 import random
 import hashlib
+import heapq
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -23,7 +24,7 @@ from tqdm import tqdm
 
 from src.models import TopKLoRALinearSTE, _hard_topk_mask
 from src.steering import FeatureSteeringContext, list_available_adapters
-from src.utils import generate_completions_from_prompts, hh_string_to_messages
+from src.utils import hh_string_to_messages, generate_completions_from_prompts
 
 
 logger = logging.getLogger(__name__)
@@ -192,7 +193,7 @@ def _collect_latent_stats(
     prompts: List[Dict[str, Any]],
     modules: Dict[str, TopKLoRALinearSTE],
     latent_index: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Compute per-latent activation statistics across analysis prompts.
 
     Args:
@@ -204,8 +205,9 @@ def _collect_latent_stats(
         latent_index: Global latent index entries (latent_id, adapter_name, feature_idx).
 
     Returns:
-        List of per-latent stats dictionaries with keys:
-        latent_id, mu, sigma, p_active, quantiles, notes, adapter_name, feature_idx.
+        A tuple of (latent_stats, top_prompts) where:
+        - latent_stats: per-latent stats dictionaries
+        - top_prompts: per-latent top prompt lists (prompt_id, score)
 
     Notes:
         For TopK layers, stats are computed on the *gated* activations using the
@@ -217,31 +219,25 @@ def _collect_latent_stats(
     """
     device = next(model.parameters()).device
     lat_cfg = cfg.evals.causal_autointerp_framework.latents
-    epsilon = float(getattr(lat_cfg, "activation_epsilon", 1e-6))
     quantile_samples = int(getattr(lat_cfg, "quantile_samples", 2000))
+    top_prompt_count = int(getattr(lat_cfg, "top_prompt_count", 100))
 
     sums = np.zeros(len(latent_index), dtype=np.float64)
     sums_sq = np.zeros(len(latent_index), dtype=np.float64)
     counts = np.zeros(len(latent_index), dtype=np.int64)
     active_counts = np.zeros(len(latent_index), dtype=np.int64)
     samples: List[List[float]] = [[] for _ in range(len(latent_index))]
+    top_prompts: List[List[Tuple[float, str]]] = [[] for _ in range(len(latent_index))]
 
     adapter_offsets = {}
     for entry in latent_index:
         if entry["feature_idx"] == 0:
             adapter_offsets[entry["adapter_name"]] = entry["latent_id"]
 
-    def push_sample(latent_id: int, value: float) -> None:
-        lst = samples[latent_id]
-        if len(lst) < quantile_samples:
-            lst.append(value)
-        else:
-            idx = random.randint(0, len(lst) - 1)
-            lst[idx] = value
-
     model.eval()
     for rec in tqdm(prompts, desc="Collecting latent stats"):
         prompt_text = rec["prompt"]
+        prompt_id = rec.get("prompt_id", "")
         rendered = _render_prompt(tokenizer, prompt_text)
         enc = tokenizer(
             rendered,
@@ -252,40 +248,50 @@ def _collect_latent_stats(
         ).to(device)
         with torch.no_grad():
             _ = model(**enc)
-
         for name, module in modules.items():
             if module._last_z is None:
                 continue
-            z = module._last_z.detach()
+            z = module._last_z.detach().cpu()
             if z.ndim == 3:
                 z = z[0]
             if z.ndim != 2:
                 continue
-
             k_now = int(module._current_k())
             mask = _hard_topk_mask(z, k_now)
             z_eff = z * mask
             active_mask = mask.any(dim=0)
-
             z_relu = F.relu(z_eff)
 
             # aggregate using max over tokens
             agg = z_relu.max(dim=0).values
-
             adapter_offset = adapter_offsets.get(name)
             if adapter_offset is None:
                 continue
-            for feature_idx in range(module.r):
-                latent_id = adapter_offset + feature_idx
-                val = float(agg[feature_idx].item())
-                sums[latent_id] += val
-                sums_sq[latent_id] += val * val
-                counts[latent_id] += 1
-                if bool(active_mask[feature_idx].item()):
-                    active_counts[latent_id] += 1
-                push_sample(latent_id, val)
+            start = adapter_offset
+            end = adapter_offset + module.r
+
+            agg_cpu = agg.numpy()
+            active_cpu = active_mask.numpy().astype(np.int64)
+            sums[start:end] += agg_cpu
+            sums_sq[start:end] += agg_cpu * agg_cpu
+            counts[start:end] += 1
+            active_counts[start:end] += active_cpu
+
+            if quantile_samples > 0:
+                for feature_idx, val in enumerate(agg_cpu):
+                    samples[start + feature_idx].append(float(val))
+            if top_prompt_count > 0 and prompt_id:
+                for feature_idx, val in enumerate(agg_cpu):
+                    latent_id = start + feature_idx
+                    heap = top_prompts[latent_id]
+                    score = float(val)
+                    if len(heap) < top_prompt_count:
+                        heapq.heappush(heap, (score, prompt_id))
+                    elif score > heap[0][0]:
+                        heapq.heapreplace(heap, (score, prompt_id))
 
     latent_stats: List[Dict[str, Any]] = []
+    top_prompt_records: List[Dict[str, Any]] = []
     for entry in latent_index:
         latent_id = entry["latent_id"]
         mean = sums[latent_id] / max(counts[latent_id], 1)
@@ -309,7 +315,25 @@ def _collect_latent_stats(
                 "feature_idx": entry["feature_idx"],
             }
         )
-    return latent_stats
+        if top_prompt_count > 0:
+            heap = top_prompts[latent_id]
+            top_sorted = sorted(heap, key=lambda x: x[0], reverse=True)
+            top_prompt_records.append(
+                {
+                    "latent_id": latent_id,
+                    "adapter_name": entry["adapter_name"],
+                    "feature_idx": entry["feature_idx"],
+                    "prompts": [
+                        {
+                            "prompt_id": pid,
+                            "score": float(score),
+                            "activation": float(score),
+                        }
+                        for score, pid in top_sorted
+                    ],
+                }
+            )
+    return latent_stats, top_prompt_records
 
 
 def _build_feature_dict(
@@ -365,7 +389,6 @@ def _calibrate_interventions(
     cfg,
     model,
     tokenizer,
-    latent_index: Dict[int, Dict[str, Any]],
     latent_entries: List[Dict[str, Any]],
     prompts: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
@@ -375,7 +398,6 @@ def _calibrate_interventions(
         cfg: Hydra config with `intervention` settings.
         model: Loaded model for forward passes.
         tokenizer: Tokenizer for prompt encoding.
-        latent_index: Mapping from latent_id to latent metadata.
         latent_entries: Ordered list of latent entries to calibrate.
         prompts: Calibration prompt records.
 
@@ -397,14 +419,13 @@ def _calibrate_interventions(
     kl_targets = list(getattr(calib_cfg, "kl_targets", [0.01]))
     window_tokens = int(getattr(calib_cfg, "window_tokens", 32))
     amp_min = float(getattr(calib_cfg, "amp_min", 0.5))
-    amp_max = float(getattr(calib_cfg, "amp_max", 8.0))
-    amp_steps = int(getattr(calib_cfg, "amp_search_steps", 8))
+    static_alpha = float(getattr(calib_cfg, "static_alpha", amp_min))
     n_prompts = int(getattr(calib_cfg, "calibration_prompts", 16))
 
     calib_prompts = prompts[: min(n_prompts, len(prompts))]
     records: List[Dict[str, Any]] = []
 
-    for entry in latent_entries:
+    for entry in tqdm(latent_entries, desc="Calibrating interventions"):
         latent_id = entry["latent_id"]
         for target_kl in kl_targets:
             effect = "disable"
@@ -431,36 +452,26 @@ def _calibrate_interventions(
             )
 
             effect = "enable"
-            low, high = amp_min, amp_max
-            best_amp = high
-            best_kl = 0.0
-            for _ in range(amp_steps):
-                mid = (low + high) / 2.0
-                feature_dict = _build_feature_dict(entry, effect)
-                kl_vals = [
-                    _kl_for_prompt(
-                        model,
-                        tokenizer,
-                        p["prompt"],
-                        {"feature_dict": feature_dict, "effect": effect},
-                        window_tokens,
-                        amplification=mid,
-                    )
-                    for p in calib_prompts
-                ]
-                observed = float(sum(kl_vals) / len(kl_vals)) if kl_vals else 0.0
-                best_amp, best_kl = mid, observed
-                if observed < target_kl:
-                    low = mid
-                else:
-                    high = mid
+            feature_dict = _build_feature_dict(entry, effect)
+            kl_vals = [
+                _kl_for_prompt(
+                    model,
+                    tokenizer,
+                    p["prompt"],
+                    {"feature_dict": feature_dict, "effect": effect},
+                    window_tokens,
+                    amplification=static_alpha,
+                )
+                for p in calib_prompts
+            ]
+            observed = float(sum(kl_vals) / len(kl_vals)) if kl_vals else 0.0
             records.append(
                 {
                     "latent_id": latent_id,
                     "intervention_type": "steer_with_alpha",
                     "target_kl": float(target_kl),
-                    "alpha": float(best_amp),
-                    "observed_kl": float(best_kl),
+                    "alpha": float(static_alpha),
+                    "observed_kl": float(observed),
                 }
             )
 
@@ -510,15 +521,61 @@ def _generate_text(
     return tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
 
 
+def _generate_completions_from_prompts_modified(
+    model,
+    tokenizer,
+    prompts,
+    *,
+    device: str,
+    max_length=None,
+    truncation: bool = True,
+    gen_kwargs=None,
+    end_of_turn_id=None,
+):
+    """Tokenize prompts, generate, and return decoded completions."""
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    enc = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=truncation,
+        max_length=max_length,
+    ).to(device)
+
+    with torch.no_grad():
+        generated = model.generate(**enc, **(gen_kwargs or {}))
+
+    completions = []
+    for i, output_ids in enumerate(generated):
+        if end_of_turn_id is not None:
+            eot_positions = (output_ids == end_of_turn_id).nonzero(as_tuple=True)[0]
+            if len(eot_positions) > 0:
+                completion_ids = output_ids[eot_positions[0].item() + 5 :]
+            else:
+                raise NotImplementedError
+        else:
+            raise NotImplementedError
+        completions.append(
+            tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
+        )
+
+    return completions
+
+
 def _build_evidence_packs(
     cfg,
     model,
     tokenizer,
     prompts: List[Dict[str, Any]],
-    latent_index: Dict[int, Dict[str, Any]],
     latent_entries: List[Dict[str, Any]],
-    calibration: List[Dict[str, Any]],
     per_latent: int,
+    do_sample: bool,
+    top_prompt_map: Dict[int, List[str]] = None,
+    sample_top_prompts: bool = False,
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Create evidence packs containing baseline and steered samples.
 
@@ -527,77 +584,115 @@ def _build_evidence_packs(
         model: Loaded model for text generation.
         tokenizer: Tokenizer for prompt rendering/decoding.
         prompts: Prompt records to sample from.
-        latent_index: Mapping from latent_id to latent metadata.
         latent_entries: Ordered list of latent entries to process.
-        calibration: Calibration records used to select amplitudes.
         per_latent: Number of prompts to sample per latent.
+        do_sample: Whether to enable sampling during generation.
+        top_prompt_map: Mapping of latent_id -> ordered prompt_ids.
+        sample_top_prompts: Whether to sample prompts from top_prompt_map.
+        temperature: Optional sampling temperature (used when do_sample is true).
+        top_p: Optional nucleus sampling value (used when do_sample is true).
 
     Returns:
         List of evidence pack dictionaries with baseline and steered samples.
-
-    Notes:
-        Evidence packs use the calibrated `steer_with_alpha` intervention by default.
-        The `zero_ablate` variant is used only during calibration.
 
     Raises:
         RuntimeError: If generation fails or model forward fails.
     """
     ev_cfg = cfg.evals.causal_autointerp_framework.evidence
     gen_cfg = cfg.evals.causal_autointerp_framework.generation
-    target_kl = float(getattr(ev_cfg, "target_kl", 0.01))
-    baseline_samples = int(getattr(gen_cfg, "baseline_samples", 3))
-    calib_map = {}
-    for rec in calibration:
-        if (
-            rec["target_kl"] == target_kl
-            and rec["intervention_type"] == "steer_with_alpha"
-        ):
-            calib_map[rec["latent_id"]] = rec
+    intervention_type = getattr(ev_cfg, "intervention_type", "steer_with_alpha")
+    amplification = float(getattr(ev_cfg, "alpha", 1.0))
+    device = next(model.parameters()).device
+    gen_kwargs = dict(
+        max_new_tokens=int(getattr(gen_cfg, "max_new_tokens", 128)),
+        do_sample=bool(do_sample),
+        eos_token_id=getattr(model.generation_config, "eos_token_id", None),
+    )
+    if bool(do_sample) and temperature is not None:
+        gen_kwargs["temperature"] = float(temperature)
+    if bool(do_sample) and top_p is not None:
+        gen_kwargs["top_p"] = float(top_p)
 
     rng = random.Random(cfg.seed)
     evidence_records: List[Dict[str, Any]] = []
+    prompt_by_id = {rec["prompt_id"]: rec for rec in prompts if rec.get("prompt_id")}
 
-    for entry in latent_entries:
+    # TODO: Remove for full run
+    for entry in latent_entries[:1]:
         latent_id = entry["latent_id"]
-        if len(prompts) >= per_latent:
-            selected = rng.sample(prompts, k=per_latent)
+
+        top_ids = [pid for pid in top_prompt_map[latent_id]]
+
+        if sample_top_prompts:
+            selected_ids = rng.sample(top_ids, k=per_latent)
+        elif top_prompt_map:
+            selected_ids = top_ids[:per_latent]
+
+        selected = [prompt_by_id[pid] for pid in selected_ids]
+
+        if intervention_type == "zero_ablate":
+            feature_dict = _build_feature_dict(entry, "disable")
         else:
-            selected = prompts
-
-        calib = calib_map.get(latent_id)
-        if not calib:
-            continue
-
-        feature_dict = _build_feature_dict(entry, "enable")
-        amplification = float(calib["alpha"])
-
-        for prompt_rec in selected:
-            prompt = prompt_rec["prompt"]
-            baseline = [
-                _generate_text(model, tokenizer, prompt, gen_cfg)
-                for _ in range(baseline_samples)
-            ]
-            steered = _generate_text(
+            feature_dict = _build_feature_dict(entry, "enable")
+        rendered_prompts = [
+            _render_prompt(tokenizer, rec["prompt"]) for rec in selected
+        ]
+        print(rendered_prompts)
+        baseline_count = int(getattr(gen_cfg, "baseline_samples", 3))
+        baseline_lists = [[] for _ in selected]
+        for _ in tqdm(range(baseline_count)):
+            batch = _generate_completions_from_prompts_modified(
                 model,
                 tokenizer,
-                prompt,
-                gen_cfg,
-                intervention={"feature_dict": feature_dict},
-                amplification=amplification,
+                rendered_prompts,
+                max_length=int(getattr(gen_cfg, "max_length", 2048)),
+                device=str(device),
+                gen_kwargs=gen_kwargs,
+                end_of_turn_id=107,  # TODO: hardcoded, modify
+            )
+            for i, text in enumerate(batch):
+                baseline_lists[i].append(text)
+
+        enc = tokenizer(
+            rendered_prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=int(getattr(gen_cfg, "max_length", 2048)),
+        ).to(device)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        with FeatureSteeringContext(
+            model,
+            feature_dict,
+            verbose=False,
+            amplification=amplification,
+        ):
+            with torch.no_grad():
+                out = model.generate(**enc, **gen_kwargs)
+        input_lengths = enc["attention_mask"].sum(dim=1).tolist()
+        steered_samples = []
+        for seq, in_len in zip(out, input_lengths):
+            steered_samples.append(
+                tokenizer.decode(seq[in_len:], skip_special_tokens=True).strip()
             )
 
+        for prompt_rec, baseline, steered in zip(
+            selected, baseline_lists, steered_samples
+        ):
             evidence_records.append(
                 {
                     "latent_id": latent_id,
                     "prompt_id": prompt_rec["prompt_id"],
-                    "prompt": prompt,
+                    "prompt": prompt_rec["prompt"],
                     "baseline_samples": baseline,
                     "steered_sample": steered,
                     "control_samples": {},
                     "intervention_meta": {
-                        "type": "steer_with_alpha",
-                        "alpha": amplification,
-                        "target_kl": target_kl,
+                        "type": intervention_type,
+                        "alpha": None
+                        if intervention_type == "zero_ablate"
+                        else amplification,
                         "window": {
                             "t_start": 0,
                             "t_end": int(getattr(ev_cfg, "window_tokens", 64)),
@@ -887,8 +982,9 @@ def run_autointerp_framework(cfg, model, tokenizer, wrapped_modules) -> None:
     prompts_path = os.path.join(output_dir, "prompts.jsonl")
     latent_index_path = os.path.join(output_dir, "latent_index.json")
     latent_stats_path = os.path.join(output_dir, "latent_stats.jsonl")
-    # Paths for downstream stages (calibration/evidence/hypothesis/verification)
-    # are defined inside their respective stage blocks when enabled.
+    top_prompts_path = os.path.join(output_dir, "top_prompts.jsonl")
+    evidence_train_path = os.path.join(output_dir, "evidence_train.jsonl")
+    evidence_eval_path = os.path.join(output_dir, "evidence_eval.jsonl")
 
     if eval_cfg.stages.prompts:
         analysis_prompts, eval_prompts = _build_prompt_records(cfg)
@@ -904,52 +1000,56 @@ def run_autointerp_framework(cfg, model, tokenizer, wrapped_modules) -> None:
     with open(latent_index_path, "w", encoding="utf-8") as f:
         json.dump(latent_index, f, indent=2)
     if eval_cfg.stages.latent_stats:
-        latent_stats = _collect_latent_stats(
+        latent_stats, top_prompts = _collect_latent_stats(
             cfg, model, tokenizer, analysis_prompts, modules, latent_index
         )
 
         _write_jsonl(latent_stats_path, latent_stats)
+        _write_jsonl(top_prompts_path, top_prompts)
+    else:
+        top_prompts = _read_jsonl(top_prompts_path)
+
+    top_prompt_map = None
+    if top_prompts:
+        top_prompt_map = {
+            rec["latent_id"]: [p["prompt_id"] for p in rec.get("prompts", [])]
+            for rec in top_prompts
+            if "latent_id" in rec
+        }
+
+    if eval_cfg.stages.evidence_train:
+        evidence_train = _build_evidence_packs(
+            cfg,
+            model,
+            tokenizer,
+            analysis_prompts,
+            latent_index,
+            per_latent=int(getattr(eval_cfg.evidence, "train_per_latent", 10)),
+            do_sample=bool(getattr(eval_cfg.generation, "do_sample_train", False)),
+            temperature=getattr(eval_cfg.generation, "temperature_train", None),
+            top_p=getattr(eval_cfg.generation, "top_p_train", None),
+            top_prompt_map=top_prompt_map,
+            sample_top_prompts=False,
+        )
+        _write_jsonl(evidence_train_path, evidence_train)
+
+    if eval_cfg.stages.evidence_eval:
+        evidence_eval = _build_evidence_packs(
+            cfg,
+            model,
+            tokenizer,
+            eval_prompts,
+            latent_index,
+            per_latent=int(getattr(eval_cfg.evidence, "eval_per_latent", 10)),
+            do_sample=bool(getattr(eval_cfg.generation, "do_sample_eval", True)),
+            temperature=getattr(eval_cfg.generation, "temperature_eval", None),
+            top_p=getattr(eval_cfg.generation, "top_p_eval", None),
+            top_prompt_map=top_prompt_map,
+            sample_top_prompts=True,
+        )
+        _write_jsonl(evidence_eval_path, evidence_eval)
 
     # TODO: Checked until here and works.
-
-    # if eval_cfg.stages.calibration:
-    #     calibration = _calibrate_interventions(
-    #         cfg,
-    #         model,
-    #         tokenizer,
-    #         latent_index_map,
-    #         latent_index,
-    #         analysis_prompts,
-    #     )
-    #     _write_jsonl(calibration_path, calibration)
-    # else:
-    #     calibration = _read_jsonl(calibration_path)
-
-    # if eval_cfg.stages.evidence_train:
-    #     evidence_train = _build_evidence_packs(
-    #         cfg,
-    #         model,
-    #         tokenizer,
-    #         analysis_prompts,
-    #         latent_index_map,
-    #         latent_index,
-    #         calibration,
-    #         per_latent=int(getattr(eval_cfg.evidence, "train_per_latent", 10)),
-    #     )
-    #     _write_jsonl(evidence_train_path, evidence_train)
-
-    # if eval_cfg.stages.evidence_eval:
-    #     evidence_eval = _build_evidence_packs(
-    #         cfg,
-    #         model,
-    #         tokenizer,
-    #         eval_prompts,
-    #         latent_index_map,
-    #         latent_index,
-    #         calibration,
-    #         per_latent=int(getattr(eval_cfg.evidence, "eval_per_latent", 10)),
-    #     )
-    #     _write_jsonl(evidence_eval_path, evidence_eval)
 
     # if eval_cfg.stages.hypothesis:
     #     evidence_train = _read_jsonl(evidence_train_path)
