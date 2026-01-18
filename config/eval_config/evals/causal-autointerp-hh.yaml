@@ -30,7 +30,7 @@ evidence: # Evidence pack construction settings.
   explainer:
     per_latent: 10 # Prompts per latent for training evidence.
     intervention_type: steer_with_alpha # steer_with_alpha or zero_ablate
-    alpha: 10 # Fixed steering alpha (calibration removed).
+    alpha: 100 # Fixed steering alpha (calibration removed).
     baseline_samples: 1
     generation: # Text generation settings for evidence.
       max_new_tokens: 64 # Max tokens to generate.
