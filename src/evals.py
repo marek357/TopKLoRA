@@ -92,6 +92,20 @@ def init_model_tokenizer_fixed(model_cfg):
             assert a_max != 0, f"lora_A weights in {name} are all zero!"
             print(f"{name}: B max = {b_max:.6f};  A max = {a_max:.6f}")
 
+    # Ensure chat template and special tokens are set. Technically we assume that
+    # all topklora-tuned models will have it, but it is good to have a check, as
+    # it doesn't cost us anything.
+    ensure_chat_template_and_special_tokens(
+        tokenizer,
+        model,
+        model_cfg.model_it_name,
+    )
+    eot_token, eot_token_id = configure_eos_eot(tokenizer, model)
+
+    # Log the configuration
+    print(f"EOT token: '{eot_token}' (ID: {eot_token_id})")
+    print(f"EOS token ID(s): {model.generation_config.eos_token_id}")
+
     return model, tokenizer, wrapped_modules
 
 
@@ -261,8 +275,8 @@ def causal_auto_interp():
 
 def causal_autointerp_framework():
     def eval_causal_autointerp_framework(cfg):
-        model, tokenizer, wrapped_modules = init_model_tokenizer_fixed(cfg.model)
-        run_autointerp_framework(cfg, model, tokenizer, wrapped_modules)
+        model, tokenizer, _ = init_model_tokenizer_fixed(cfg.model)
+        run_autointerp_framework(cfg, model, tokenizer)
         return
 
     return eval_causal_autointerp_framework
