@@ -1,3 +1,21 @@
 {
-    "python.analysis.autoImportCompletions": false
+  "python.analysis.autoImportCompletions": false,
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "charliermarsh.ruff",
+  "ruff.path": [
+    "/homes/55/marek/miniconda3/envs/klora/bin/ruff"
+  ],
+  "ruff.nativeServer": "on",
+  "ruff.importStrategy": "fromEnvironment",
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff"
+  },
+  "[jsonc]": {
+    "editor.defaultFormatter": "vscode.json-language-features"
+  },
+  "files.watcherExclude": {
+    "**/.git/objects/**": true,
+    "**/.git/subtree-cache/**": true,
+    "**/node_modules/*/**": true
+  }
 }

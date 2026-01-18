@@ -2,7 +2,7 @@ name: toxicity
 dataset_name: "allenai/real-toxicity-prompts"
 split: "train"
 end_of_turn_id: 107
-eval_base_model: False
+eval_base_model: True
 dump_generated: True
 dump_analysis: True
 dump_path: eval_outputs/${model.name}_${model.version}_${model.size}_${model.type}/${model.k}_${model.r}/${evals.toxicity.dataset_name}
