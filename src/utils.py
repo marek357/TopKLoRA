@@ -1780,7 +1780,9 @@ def load_alpaca(split: str = "train") -> HFDataset:
         instr = (ex.get("instruction") or "").strip()
         inp = (ex.get("input") or "").strip()
         output = (ex.get("output") or "").strip()
-        return {"messages": build_instruction_messages(instr, output, input_context=inp)}
+        return {
+            "messages": build_instruction_messages(instr, output, input_context=inp)
+        }
 
     ds = ds.map(to_messages, num_proc=NUM_PROC)
     ds = ds.filter(lambda ex: len(ex.get("messages") or []) > 0)
@@ -1811,7 +1813,9 @@ def _to_messages_with_fallback(ex: Mapping[str, Any]) -> Dict[str, Any]:
     instr = (ex.get("instruction") or ex.get("prompt") or "").strip()
     ctx_text = (ex.get("input") or ex.get("context") or "").strip()
     output = ex.get("response") or ex.get("output") or ex.get("completion") or ""
-    return {"messages": build_instruction_messages(instr, output, input_context=ctx_text)}
+    return {
+        "messages": build_instruction_messages(instr, output, input_context=ctx_text)
+    }
 
 
 def load_infinity_instruct(split: str = "train") -> HFDataset:
@@ -1872,9 +1876,7 @@ def _mix_datasets(
     if mix_strategy == "concat":
         return concatenate_datasets(pieces)
     weights = (
-        [dataset_weights.get(name, 1.0) for name in names]
-        if dataset_weights
-        else None
+        [dataset_weights.get(name, 1.0) for name in names] if dataset_weights else None
     )
     probabilities = None
     if weights is not None:
@@ -2226,12 +2228,11 @@ def generate_completions_from_prompts(
     max_length=None,
     truncation: bool = True,
     gen_kwargs=None,
-    end_of_turn_id=None,
+    end_of_turn_id=None,  # Unused (deprecated)
 ):
     """Tokenize prompts, generate, and return decoded completions."""
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    pad_id = tokenizer.pad_token_id
 
     enc = tokenizer(
         prompts,
@@ -2244,17 +2245,11 @@ def generate_completions_from_prompts(
     with torch.no_grad():
         generated = model.generate(**enc, **(gen_kwargs or {}))
 
-    prompt_lengths = (enc["input_ids"] != pad_id).sum(dim=1)
+    prompt_length = enc["input_ids"].shape[1]
+
     completions = []
-    for i, output_ids in enumerate(generated):
-        if end_of_turn_id is not None:
-            eot_positions = (output_ids == end_of_turn_id).nonzero(as_tuple=True)[0]
-            if len(eot_positions) > 0:
-                completion_ids = output_ids[eot_positions[0].item() + 1 :]
-            else:
-                completion_ids = output_ids[prompt_lengths[i].item() :]
-        else:
-            completion_ids = output_ids[prompt_lengths[i].item() :]
+    for output_ids in generated:
+        completion_ids = output_ids[prompt_length:]
         completions.append(
             tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
         )
