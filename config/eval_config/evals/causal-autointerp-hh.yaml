@@ -1,56 +1,64 @@
-name: causal-autointerp-framework  # Eval name for logging/selection.
-output_dir: eval_outputs/causal_autointerp_framework  # Output folder for all artifacts.
+name: causal-autointerp-framework # Eval name for logging/selection.
+# output_dir: eval_outputs/causal_autointerp_framework_mlp # Output folder for all artifacts.
+output_dir: eval_outputs/causal_autointerp_framework_attn # Output folder for all artifacts.
 
-dataset:                       # Prompt source configuration (HH-RLHF).
-  name: Anthropic/hh-rlhf      # Hugging Face dataset ID.
-  buckets:                     # Subsets to sample prompts from.
-    - bucket: harmless         # Label assigned to prompts from this subset.
-      data_dir: harmless-base  # HH-RLHF subset directory.
-      split: train             # Split to draw prompts from.
-      max_prompts: 200         # Cap on prompts pulled from this bucket.
-    - bucket: helpful          # Label assigned to prompts from this subset.
-      data_dir: helpful-base   # HH-RLHF subset directory.
-      split: train             # Split to draw prompts from.
-      max_prompts: 200         # Cap on prompts pulled from this bucket.
-  split:                       # Analysis/eval split for prompts.
-    seed: 42                 
-    analysis_frac: 0.8         # Fraction used for analysis; remainder is eval.
+dataset: # Prompt source configuration (HH-RLHF).
+  name: Anthropic/hh-rlhf # Hugging Face dataset ID.
+  buckets: # Subsets to sample prompts from.
+    - bucket: harmless # Label assigned to prompts from this subset.
+      data_dir: harmless-base # HH-RLHF subset directory.
+      split: train # Split to draw prompts from.
+      max_prompts: 200 # Cap on prompts pulled from this bucket.
+    - bucket: helpful # Label assigned to prompts from this subset.
+      data_dir: helpful-base # HH-RLHF subset directory.
+      split: train # Split to draw prompts from.
+      max_prompts: 200 # Cap on prompts pulled from this bucket.
+  split: # Analysis/eval split for prompts.
+    seed: 42
+    analysis_frac: 0.8 # Fraction used for analysis; remainder is eval.
 
-latents:                       # Latent statistics collection settings.
-  quantiles: [0.5, 0.9, 0.99]  # Quantiles to record per latent.
-  max_length: 2048             # Token limit when collecting stats.
-
-generation:            # Text generation settings for evidence.
-  max_new_tokens: 128  # Max tokens to generate.
-  do_sample_train: false  # Disable sampling for training evidence.
-  do_sample_eval: true    # Enable sampling for eval evidence.
-  temperature_train: 1.0  # Sampling temperature for training (if enabled).
-  top_p_train: 0.9        # Nucleus sampling p for training (if enabled).
-  temperature_eval: 1.0   # Sampling temperature for eval (if enabled).
-  top_p_eval: 0.9         # Nucleus sampling p for eval (if enabled).
+latents: # Latent statistics collection settings.
+  quantiles: [0.5, 0.9, 0.99] # Quantiles to record per latent.
+  max_length: 2048 # Token limit when collecting stats.
 
 # evidence packs
 # train_per_latent is used for both train/eval unless overridden
 # target_kl picks the calibration entry to use
 # top_context_ratio chooses how many prompts from top activations
 
-evidence:               # Evidence pack construction settings.
-  train_per_latent: 3   # Prompts per latent for training evidence.
-  eval_per_latent: 3    # Prompts per latent for eval evidence.
-  intervention_type: zero_ablate  # steer_with_alpha or zero_ablate
-  alpha: 0.5            # Fixed steering alpha (calibration removed).
-  window_tokens: 64     # Window metadata for interventions.
-
-llm:  # Explainer/verifier model settings.
+evidence: # Evidence pack construction settings.
   explainer:
-    enabled: true                   # Enable hypothesis generation.
-    provider: openai                # LLM backend provider.
-    model: gpt-4o                   # Explainer model ID.
-    temperature: 0.2                # Explainer sampling temperature.
-    max_tokens: 512                 # Explainer output token cap.
-    evidence_per_latent: 8          # Evidence packs per latent for hypotheses.
-    include_antipredictions: true   # Request anti-predictions in hypotheses.
-    effects_menu:                   # Allowed effect labels for structured output.
+    per_latent: 10 # Prompts per latent for training evidence.
+    intervention_type: steer_with_alpha # steer_with_alpha or zero_ablate
+    alpha: 10 # Fixed steering alpha (calibration removed).
+    baseline_samples: 1
+    generation: # Text generation settings for evidence.
+      max_new_tokens: 64 # Max tokens to generate.
+      do_sample: false # Disable sampling for training evidence.
+      # temperature: 1.0  # Sampling temperature for training (if enabled).
+      # top_p: 0.9        # Nucleus sampling p for training (if enabled).
+
+  verifier:
+    per_latent: 10 # Prompts per latent for eval evidence.
+    intervention_type: zero_ablate # steer_with_alpha or zero_ablate
+    # alpha: 1 # Fixed steering alpha (calibration removed).
+    baseline_samples: 3
+    generation: # Text generation settings for evidence.
+      max_new_tokens: 64 # Max tokens to generate.
+      do_sample: true # Enable sampling for eval evidence.
+      temperature: 1.0 # Sampling temperature for eval (if enabled).
+      top_p: 0.9 # Nucleus sampling p for eval (if enabled).
+
+llm: # Explainer/verifier model settings.
+  explainer:
+    enabled: true # Enable hypothesis generation.
+    provider: openai # LLM backend provider.
+    model: gpt-4o # Explainer model ID.
+    temperature: 0.2 # Explainer sampling temperature.
+    max_tokens: 512 # Explainer output token cap.
+    evidence_per_latent: 8 # Evidence packs per latent for hypotheses.
+    include_antipredictions: true # Request anti-predictions in hypotheses.
+    effects_menu: # Allowed effect labels for structured output.
       - refusal_more_likely
       - safety_disclaimer_more_likely
       - direct_answer_less_likely
@@ -61,20 +69,20 @@ llm:  # Explainer/verifier model settings.
       - polite_tone_more_likely
       - uncertainty_more_likely
   verifier:
-    enabled: true          # Enable hypothesis verification.
-    provider: openai       # LLM backend provider.
-    model: gpt-4o          # Verifier model ID.
-    temperature: 0.0       # Verifier sampling temperature.
-    max_tokens: 256        # Verifier output token cap.
+    enabled: true # Enable hypothesis verification.
+    provider: openai # LLM backend provider.
+    model: gpt-4o # Verifier model ID.
+    temperature: 0.0 # Verifier sampling temperature.
+    max_tokens: 256 # Verifier output token cap.
 
-stages:                 # Pipeline stage toggles.
-  prompts: false         # Build prompt records.
-  latent_stats: false    # Collect latent activation stats.
-  evidence_train: true  # Generate training evidence packs.
-  evidence_eval: true   # Generate eval evidence packs.
-  hypothesis: true      # Generate hypotheses via explainer.
-  verification: true    # Run blind + hypothesis verification.
-  summary: true         # Aggregate summary metrics.
+stages: # Pipeline stage toggles.
+  prompts: false # Build prompt records.
+  latent_stats: false # Collect latent activation stats.
+  evidence_explainer: true # Generate training evidence packs.
+  evidence_verifier: true # Generate eval evidence packs.
+  hypothesis: true # Generate hypotheses via explainer.
+  verification: true # Run blind + hypothesis verification.
+  summary: true # Aggregate summary metrics.
 
-build_eval_function:                               # Hydra entry point for eval.
-  _target_: src.evals.causal_autointerp_framework  # Callable that runs the pipeline.
+build_eval_function: # Hydra entry point for eval.
+  _target_: src.evals.causal_autointerp_framework # Callable that runs the pipeline.
