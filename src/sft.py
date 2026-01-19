@@ -25,6 +25,7 @@ from src.utils import (
     get_world_size,
     init_distributed,
     is_main_process,
+    resolve_target_modules,
 )
 import numpy as np
 import logging
@@ -416,6 +417,10 @@ def run_sft(cfg):
     print("Model loaded")
     count_params(model)
 
+    # Resolve target_modules from explicit list or module_type shorthand
+    target_modules = resolve_target_modules(cfg.training.sft_experiment.lora)
+    logging.info(f"Target modules: {target_modules}")
+
     peft_config = LoraConfig(
         r=cfg.training.sft_experiment.lora.r,
         lora_alpha=cfg.training.sft_experiment.lora.alpha,
@@ -423,7 +428,7 @@ def run_sft(cfg):
         # bias=cfg.training.sft_experiment.lora.bias, # getting NotImplementedError when set (?)
         task_type=TaskType.CAUSAL_LM,
         inference_mode=False,
-        target_modules=list(cfg.training.sft_experiment.lora.target_modules),
+        target_modules=target_modules,
     )
 
     if quant_cfg is not None:
@@ -770,7 +775,7 @@ def run_sft(cfg):
             "r": cfg.training.sft_experiment.lora.r,
             "alpha": cfg.training.sft_experiment.lora.alpha,
             "dropout": cfg.training.sft_experiment.lora.dropout,
-            "target_modules": list(cfg.training.sft_experiment.lora.target_modules),
+            "target_modules": target_modules,
             "use_topk": getattr(cfg.training.sft_experiment.lora, "use_topk", False),
         },
     }
@@ -928,11 +933,12 @@ def run_sft(cfg):
         tokenizer.save_pretrained(final_path)
 
         # Also save to legacy path for compatibility
+        module_type = getattr(cfg.training.sft_experiment.lora, "module_type", "custom")
         legacy_path = (
             f"adapters/sft/{cfg.training.sft_experiment.lora.r}-{cfg.training.sft_experiment.lora.alpha}-"
             f"{cfg.training.sft_experiment.lora.dropout}/"
             f"{getattr(cfg.training.sft_dataset, 'name', 'enhanced_dataset')}/"
-            f"{'-'.join(cfg.training.sft_experiment.lora.target_modules)}"
+            f"{module_type}"
         )
 
         adapter_state_dict = get_peft_model_state_dict(

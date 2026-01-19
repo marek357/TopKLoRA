@@ -1,0 +1,37 @@
+# Hydra sweep configuration for TopK experiments
+# This enables grid search, random search, or Optuna-based hyperparameter optimization
+#
+# USAGE:
+# ------
+# Grid sweep (all combinations):
+#   python main.py -m --config-name=sweep_topk_grid
+#
+# With Optuna (install: pip install hydra-optuna-sweeper):
+#   python main.py -m --config-name=sweep_topk_optuna
+#
+# IMPORTANT: This will run (4 r values) x (5 k values) x (5 k_final values) x (2 module_types) = 200 experiments!
+# Consider filtering with grep, or running smaller subsets.
+
+defaults:
+  - train_config/default
+  - override train_config/training: sft_recommended_topk_sweep
+  - override hydra/sweeper: basic  # or 'optuna' if installed
+  - _self_
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      # Sweep over these parameters
+      training.sft_experiment.lora.r: 1024,2048,4096,8192
+      training.sft_experiment.lora.k: 64,128,256,512,1024
+      training.sft_experiment.lora.k_final: 4,8,16,32,64
+      training.sft_experiment.lora.module_type: mlp,mlp_attn
+
+  # Output directory pattern includes sweep params
+  sweep:
+    dir: outputs/sweeps/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: r${training.sft_experiment.lora.r}_k${training.sft_experiment.lora.k}_kf${training.sft_experiment.lora.k_final}_${training.sft_experiment.lora.module_type}
+
+# Dynamic experiment naming
+experiment_name: sweep_r${training.sft_experiment.lora.r}_k${training.sft_experiment.lora.k}_kf${training.sft_experiment.lora.k_final}

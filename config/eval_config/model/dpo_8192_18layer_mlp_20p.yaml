@@ -1,0 +1,13 @@
+defaults:
+  - quantization: 4bit
+  - _self_
+name: "gemma"
+version: 2.0
+size: "2B"
+type: dpo_model_18layer
+k: 64
+r: 8192
+base_model: "/scratch/network/ssd/marek/rebasedgridtrain/models/sft_base"
+model_it_name: "google/gemma-2-2b-it"
+adapter_checkpoint_dir: "/scratch/network/ssd/marek/rebasedgridtrain/models/dpo/google/gemma-2-2b/google-gemma-2-2b_topk_dpo_20260117_180550_e6205e0c/final_adapter" 
+train_steps: 5000

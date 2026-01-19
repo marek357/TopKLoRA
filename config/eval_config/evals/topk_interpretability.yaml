@@ -1,0 +1,22 @@
+name: topk_interpretability
+build_eval_function:
+  _target_: src.evals.topk_interpretability
+
+# Number of prompts to use for activation collection
+num_samples: 1000
+
+# Batch size for forward passes
+batch_size: 8
+
+# Max sequence length for tokenization
+max_length: 256
+
+# Threshold for considering a latent "dead" (fraction of samples it must be active in)
+dead_threshold: 0.01
+
+# Dataset for collecting activations
+dataset_name: allenai/real-toxicity-prompts
+dataset_split: train
+
+# Output directory for detailed results
+output_dir: eval_outputs/topk_interpretability

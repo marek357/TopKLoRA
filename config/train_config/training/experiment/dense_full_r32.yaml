@@ -1,0 +1,17 @@
+size: "recommended_dense_full"
+lora:
+  r: 32
+  k: 32
+  bias: 'none'
+  alpha: 32
+  dropout: 0.05
+  use_topk: false
+  layer: dense_full
+  target_modules:
+    - o_proj
+    - v_proj
+    - k_proj
+    - q_proj
+    - gate_proj
+    - up_proj
+    - down_proj

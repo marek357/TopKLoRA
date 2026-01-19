@@ -1,0 +1,34 @@
+size: "topk_single_layer_r8192_k1024_64_mlp_attn_overcomplete"
+lora:
+  r: 8192
+  bias: "none"
+  alpha: 16384
+  dropout: 0.0
+
+  top_k_experiment: True
+
+  k: 1024
+  k_final: 64
+  k_schedule: cubic
+
+  # k_warmup_frac: 0.05         # fraction of training used to reach k_final
+  # k_warmup_frac: 0.15         # fraction of training used to reach k_final
+  k_warmup_frac: 0.2         # fraction of training used to reach k_final
+
+  layer: 18                  # single layer adaptation
+
+  temperature: 0.1
+  temperature_final: 0.005
+  temperature_schedule: cubic
+
+  relu_latents: true
+
+  # *** attn + MLP in the same layer, for ablation ***
+  target_modules:
+    - layers.18.self_attn.q_proj
+    - layers.18.self_attn.k_proj
+    - layers.18.self_attn.v_proj
+    - layers.18.self_attn.o_proj
+    - layers.18.mlp.gate_proj
+    - layers.18.mlp.up_proj
+    - layers.18.mlp.down_proj

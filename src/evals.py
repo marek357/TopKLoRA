@@ -680,10 +680,26 @@ def monosemanticity():
             print(
                 f"Module: {module.__class__.__name__}, Max Cosine Similarity between LoRA B weights: {max_sim:.4f}, Min Cosine Similarity: {min_sim:.4f}"
             )
-            avg_cosine_sim = cos_for_max.max(dim=1)[0].mean().item()
+            avg_sim = cos_for_max[~diag_mask].mean().item()
             print(
-                f"Module: {module.__class__.__name__}, Avg Max Cosine Similarity between LoRA B weights: {avg_cosine_sim:.4f}"
+                f"Module: {module.__class__.__name__}, Average Cosine Similarity between LoRA B weights: {avg_sim:.4f}"
             )
+
+            median_sim = cos_for_max[~diag_mask].median().item()
+            print(
+                f"Module: {module.__class__.__name__}, Median Cosine Similarity between LoRA B weights: {median_sim:.4f}"
+            )
+
+            # histogram of cosine similarities
+            # terminal friendly histogram
+            hist_bins = torch.histc(cos_for_max[~diag_mask], bins=10, min=-1.0, max=1.0)
+            print(f"Histogram of Cosine Similarities (10 bins from -1 to 1):")
+            for i in range(len(hist_bins)):
+                bin_range_start = -1.0 + i * 0.2
+                bin_range_end = bin_range_start + 0.2
+                print(
+                    f"  Bin {i + 1} [{bin_range_start:.1f}, {bin_range_end:.1f}): {int(hist_bins[i].item())}"
+                )
 
     return eval_monosemanticity
 
