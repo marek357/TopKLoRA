@@ -443,7 +443,10 @@ def _build_evidence_packs(
     evidence_records: List[Dict[str, Any]] = []
     prompt_by_id = {rec["prompt_id"]: rec for rec in prompts if rec.get("prompt_id")}
 
-    for entry in latent_entries:
+    for entry in tqdm(
+        latent_entries,
+        desc=f"Building evidence packs. {getattr(ev_cfg, 'per_latent')} sets per latent",
+    ):
         latent_id = entry["latent_id"]
 
         top_ids = []
@@ -467,10 +470,11 @@ def _build_evidence_packs(
         rendered_prompts = [
             _render_prompt(tokenizer, rec["prompt"]) for rec in selected
         ]
-        logging.info(f"First three rendered prompts: {rendered_prompts[:3]}")
+
+        logging.debug(f"First three rendered prompts: {rendered_prompts[:3]}")
         baseline_count = int(getattr(ev_cfg, "baseline_samples"))
         baseline_lists = [[] for _ in selected]
-        for _ in tqdm(range(baseline_count)):
+        for _ in range(baseline_count):
             batch = generate_completions_from_prompts(
                 model,
                 tokenizer,
@@ -499,7 +503,7 @@ def _build_evidence_packs(
             verbose=False,
             amplification=amplification,
         ):
-            logging.info(f"feature_dict: {feature_dict}")
+            logging.debug(msg=f"feature_dict: {feature_dict}")
             with torch.no_grad():
                 out = model.generate(**enc, **gen_kwargs)
         input_lengths = enc["input_ids"].shape[1]
@@ -651,10 +655,10 @@ def run_autointerp_framework(cfg, model, tokenizer) -> None:
 
     # TODO: Checked until here and works.
 
-    if eval_cfg.stages.hypothesis:
+    if eval_cfg.stages.explainer:
         raise NotImplementedError
 
-    if eval_cfg.stages.verification:
+    if eval_cfg.stages.verifier:
         raise NotImplementedError
 
     if eval_cfg.stages.summary:

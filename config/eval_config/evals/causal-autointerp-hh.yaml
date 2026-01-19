@@ -1,6 +1,7 @@
 name: causal-autointerp-framework # Eval name for logging/selection.
 # output_dir: eval_outputs/causal_autointerp_framework_mlp # Output folder for all artifacts.
-output_dir: eval_outputs/causal_autointerp_framework_attn # Output folder for all artifacts.
+# output_dir: eval_outputs/causal_autointerp_framework_attn # Output folder for all artifacts.
+output_dir: eval_outputs/causal_autointerp_framework_${model.r}_${model.k}_attn # Output folder for all artifacts.
 
 dataset: # Prompt source configuration (HH-RLHF).
   name: Anthropic/hh-rlhf # Hugging Face dataset ID.
@@ -83,8 +84,8 @@ llm: # Explainer/verifier model settings.
     max_tokens: 256 # Verifier output token cap.
 
 stages: # Pipeline stage toggles.
-  prompts: false # Build prompt records.
-  latent_stats: false # Collect latent activation stats.
+  prompts: true # Build prompt records.
+  latent_stats: true # Collect latent activation stats.
   evidence_explainer: true # Generate training evidence packs.
   evidence_verifier: true # Generate eval evidence packs.
   hypothesis: true # Generate hypotheses via explainer.
