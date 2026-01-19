@@ -1438,7 +1438,6 @@ def setup_tokenizer_for_chat(tokenizer):
 def normalize_chat_messages(
     raw_messages: TypingSequence[Dict[str, Any]],
 ) -> List[Message]:
-    raw_messages: TypingSequence[Dict[str, Any]]
     """Normalize raw chat messages into Gemma-compatible message dicts.
 
     Supported role mappings:
