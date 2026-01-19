@@ -6,8 +6,8 @@ defaults:
   # - evals/topk-lora-autointerp@evals.topk_lora_autointerp
   # - evals/auto-interpret@evals.auto_interp
   # - evals/toxicity@evals.toxicity
-  # - evals/instruction_following@evals.instruction_following
-  - evals/monosemanticity@evals.monosemanticity
+  - evals/perplexity@evals.perplexity
+  # - evals/instruction-following@evals.instruction_following
   # - model: interp_dpo_gemma_large
   # - model: dpo_512_lg_start_sm_end
   # - model: dpo_512_sm_start_lg_end
@@ -40,4 +40,3 @@ defaults:
 seed: 42
 checkpoint_dir: adapter
 experiment_name: ${evals}_eval
-
