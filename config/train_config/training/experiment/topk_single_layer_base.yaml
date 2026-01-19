@@ -1,0 +1,51 @@
+# Base template for TopK single-layer experiments
+# Override r, k, k_final, and module_type via command line or multirun
+#
+# USAGE EXAMPLES:
+# ---------------
+# Single run with overrides:
+#   python main.py training=sft_recommended_topk_sweep \
+#       training.sft_experiment.lora.r=4096 \
+#       training.sft_experiment.lora.k=512 \
+#       training.sft_experiment.lora.k_final=32
+#
+# Multirun sweep (use -m flag):
+#   python main.py -m training=sft_recommended_topk_sweep \
+#       'training.sft_experiment.lora.r=1024,4096,8192' \
+#       'training.sft_experiment.lora.k=128,256,512' \
+#       'training.sft_experiment.lora.k_final=8,32,64' \
+#       'training.sft_experiment.lora.module_type=mlp,mlp_attn'
+
+# Size uses absolute paths for interpolation
+size: "topk_single_layer_r${.r}_k${.k}_${.k_final}_${.module_type}"
+
+lora:
+  # === SWEEP PARAMETERS (override these) ===
+  r: 4096
+  k: 512
+  k_final: 32
+  layer: 18
+  module_type: mlp  # or mlp_attn - handled by resolve_target_modules() in sft.py
+  
+  # === DERIVED PARAMETERS ===
+  bias: "none"
+  alpha: ${mult:2,${.r}}     # 2 * r, consistent with alpha_over_r
+  dropout: 0.0
+
+  # TopK experiment flag -> use TopKLoRALinearSTE
+  top_k_experiment: True
+
+  # Top-k schedule
+  k_schedule: cubic
+  k_warmup_frac: 0.2
+  
+  # Temperature schedule for soft gate
+  temperature: 0.1
+  temperature_final: 0.005
+  temperature_schedule: cubic
+
+  # Latent non-negativity (SAE-style)
+  relu_latents: true
+
+  # NOTE: target_modules is resolved dynamically by resolve_target_modules()
+  # based on module_type and layer. You can still override explicitly if needed.

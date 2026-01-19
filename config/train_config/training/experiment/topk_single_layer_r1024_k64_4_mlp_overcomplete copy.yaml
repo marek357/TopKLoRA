@@ -1,0 +1,35 @@
+size: "topk_single_layer_r8192_k1024_64_mlp_overcomplete"
+lora:
+  # capacity: overcomplete "SAE-like" dictionary on layer 18 MLP
+  r: 4096
+  bias: "none"
+  alpha: 8192              # 2 * r, consistent with alpha_over_r
+  dropout: 0.0
+
+  # TopK experiment flag -> use TopKLoRALinearSTE
+  top_k_experiment: True
+
+  # Top-k schedule: wide early, sparse late
+  # Exploration phase: k = 512 (12.5% of r)
+  # Final: k = 64 (0.78% of r)
+  k: 512
+  k_final: 32
+  k_schedule: cubic          # slow change early, faster near end
+  # k_warmup_frac: 0.05         # fraction of training used to reach k_final
+  # k_warmup_frac: 0.15         # fraction of training used to reach k_final
+  k_warmup_frac: 0.2         # fraction of training used to reach k_final
+
+  layer: 18                  # single layer adaptation
+  # Temperature schedule for soft gate
+  temperature: 0.1
+  temperature_final: 0.005
+  temperature_schedule: cubic
+
+  # Latent non-negativity (SAE-style). Consider ablation later.
+  relu_latents: true
+
+  # *** MLP-only in chosen "safety layer" ***
+  target_modules:
+    - layers.18.mlp.gate_proj
+    - layers.18.mlp.up_proj
+    - layers.18.mlp.down_proj
