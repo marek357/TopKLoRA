@@ -1,4 +1,5 @@
-name: instruction_following
-eval_base_model: True
+name: instruction-following
+eval_base_model: False
+batch_size: 8
 build_eval_function:
   _target_: src.evals.instruction_following
