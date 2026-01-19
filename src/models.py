@@ -98,7 +98,7 @@ class TopKLoRALinearSTE(nn.Module):
         self.scale = (
             (self.alpha / self.r)
             if alpha_over_r
-            else (self.alpha / max(self.k_init, 1))
+            else (self.alpha / max(self.k_final, 1))
         )
         self.layer_name = layer_name
         self.topk = TopKModule(k_final)
@@ -287,8 +287,8 @@ class TopKLoRALinearSTE(nn.Module):
         else:
             z = z_pre
 
-        # keep both: live for regs, detached for callbacks
-        # self._z_live = z                         # may carry graph
+        # keep both: live for regs (with graph), detached for callbacks
+        self._z_live = z  # carries graph for regularizers
         self._last_z = z.detach()  # safe for logging
 
         tau = self._tau()
@@ -308,8 +308,8 @@ class TopKLoRALinearSTE(nn.Module):
         # g = g_hard.detach() + g_soft - g_soft.detach()
         g = g_hard + g_soft - g_soft.detach()
 
-        # keep both: live for regs, detached for callbacks
-        # self._g_soft_live = g_soft               # may carry graph
+        # keep both: live for regs (with graph), detached for callbacks
+        self._g_soft_live = g_soft  # carries graph for usage regularizer
         self._last_g_soft = g_soft.detach()
 
         self._last_ghard_mean = g.mean().detach()

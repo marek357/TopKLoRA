@@ -214,3 +214,5 @@ layer_attribution_test/
 repofromgh/
 .vscode/settings.json
 test_model.py
+
+sweep_scripts/

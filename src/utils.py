@@ -226,34 +226,34 @@ def configure_eos_eot(tokenizer, model):
 def resolve_target_modules(lora_cfg) -> List[str]:
     """
     Resolve target_modules from either explicit list or module_type shorthand.
-    
+
     Supports two modes:
     1. Explicit: lora_cfg.target_modules = ["layers.18.mlp.gate_proj", ...]
     2. Shorthand: lora_cfg.module_type = "mlp" or "mlp_attn"
-    
+
     The shorthand uses lora_cfg.layer to determine which layer to target.
-    
+
     Args:
         lora_cfg: OmegaConf config with either target_modules or module_type + layer
-        
+
     Returns:
         List of target module names
     """
     # If explicit target_modules provided, use them
-    if hasattr(lora_cfg, 'target_modules') and lora_cfg.target_modules is not None:
+    if hasattr(lora_cfg, "target_modules") and lora_cfg.target_modules is not None:
         return list(lora_cfg.target_modules)
-    
+
     # Otherwise, generate from module_type and layer
-    module_type = getattr(lora_cfg, 'module_type', 'mlp')
-    layer = getattr(lora_cfg, 'layer', 18)
-    
+    module_type = getattr(lora_cfg, "module_type", "mlp")
+    layer = getattr(lora_cfg, "layer", 18)
+
     # MLP modules
     mlp_modules = [
         f"layers.{layer}.mlp.gate_proj",
         f"layers.{layer}.mlp.up_proj",
         f"layers.{layer}.mlp.down_proj",
     ]
-    
+
     # Attention modules
     attn_modules = [
         f"layers.{layer}.self_attn.q_proj",
@@ -261,7 +261,7 @@ def resolve_target_modules(lora_cfg) -> List[str]:
         f"layers.{layer}.self_attn.v_proj",
         f"layers.{layer}.self_attn.o_proj",
     ]
-    
+
     if module_type == "mlp":
         return mlp_modules
     elif module_type == "mlp_attn":
@@ -269,7 +269,9 @@ def resolve_target_modules(lora_cfg) -> List[str]:
     elif module_type == "attn":
         return attn_modules
     else:
-        raise ValueError(f"Unknown module_type: {module_type}. Expected 'mlp', 'attn', or 'mlp_attn'")
+        raise ValueError(
+            f"Unknown module_type: {module_type}. Expected 'mlp', 'attn', or 'mlp_attn'"
+        )
 
 
 def wrap_topk_lora_modules(

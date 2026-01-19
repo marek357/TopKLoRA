@@ -48,19 +48,13 @@ from src.utils import (
     init_distributed,
     is_main_process,
     normalize_chat_messages,
+    resolve_target_modules,
 )
 
 # Configure logging
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
 )
-
-L_DECORR = 1e-4  # decorrelate latents (small)
-L_MASS = 1e-3  # enforce soft mass ~= k
-L_ENTROPY = 0.0  # encourage sharp gates (set >0 if needed)
-L_ORTHO_A = 1e-4  # orthogonality strength on A (rows ~ latents)
-L_ORTHO_B = 1e-4  # orthogonality strength on B (columns ~ latents)
-ORTHO_EVERY = 4  # compute every step; set to 2/4 to reduce overhead
 
 
 class ActivationTrackingCallback(TrainerCallback):
@@ -195,18 +189,19 @@ class ActivationTrackingCallback(TrainerCallback):
 
 class EnhancedDPOTrainer(DPOTrainer):
     """
-    DPO trainer with conditional regularizers and DS-safe scheduling.
+    DPO trainer with monosemanticity-focused regularizers for interpretable TopK-LoRA.
+
+    Regularizers (designed for model diffing / interpretability):
+      - decorr: Minimize off-diagonal latent covariance → each latent = one concept
+      - usage_balance: Prevent dead latents by encouraging uniform usage across r
+      - ortho: Orthogonalize A/B weight directions (optional, for z_plus_ortho mode)
 
     reg_mode:
-      - "off"           : no regs (only base DPO loss)
-      - "z_only"        : decorrelation + mass + entropy (from live z)
-      - "z_plus_ortho"  : z_only + orthogonality on A (rows) and B (cols)
+      - "off"           : no regularizers (base DPO only)
+      - "z_only"        : decorrelation + usage balancing
+      - "z_plus_ortho"  : + orthogonality on A rows / B cols
 
-    reg_cfg keys (with defaults below):
-      L_DECORR, L_MASS, L_ENTROPY, L_ORTHO_A, L_ORTHO_B, ORTHO_EVERY,
-      sched_type("linear"/"quad"/"cubic"), sched_start, sched_end,
-      schedule_decorr, schedule_mass, schedule_ent, schedule_ortho,
-      log_every
+    Scheduling: All terms use cubic warmup (sched_start → sched_end) for stable training.
     """
 
     def __init__(
@@ -218,306 +213,200 @@ class EnhancedDPOTrainer(DPOTrainer):
     ):
         super().__init__(*args, **kwargs)
 
-        # which blocks to enable
         assert reg_mode in {"off", "z_only", "z_plus_ortho"}
         self.reg_mode = reg_mode
 
-        # defaults
+        # Defaults tuned for monosemanticity
         self.reg_cfg = {
-            "L_DECORR": 1e-4,
-            "L_MASS": 1e-3,
-            "L_ENTROPY": 0.0,
-            "L_ORTHO_A": 1e-4,
-            "L_ORTHO_B": 1e-4,
-            # compute orthogonality every n steps (0 disables)
-            "ORTHO_EVERY": 10,  # Reduced from 1 to improve performance
-            "DECORR_EVERY": 5,  # NEW: Only compute expensive decorrelation every N steps
-            "MASS_EVERY": 1,  # Mass is cheap, keep it every step
-            "sched_type": "cubic",  # "linear" | "quad" | "cubic"
-            "sched_start": 0.0,  # fraction of training (0..1)
-            "sched_end": 0.30,  # fraction of training (0..1)
-            "schedule_decorr": True,
-            "schedule_mass": True,
-            "schedule_ent": True,
-            "schedule_ortho": True,
+            # Core regularizers
+            "L_DECORR": 1e-4,  # decorrelation strength
+            "L_USAGE": 1e-4,  # usage balancing (prevents dead latents)
+            "L_ORTHO": 1e-4,  # orthogonality (only in z_plus_ortho mode)
+            # Step frequency (expensive ops run less often)
+            "DECORR_EVERY": 5,
+            "USAGE_EVERY": 2,
+            "ORTHO_EVERY": 10,
+            # Scheduling
+            "sched_type": "cubic",
+            "sched_start": 0.0,
+            "sched_end": 0.25,
+            # Logging
             "log_every": 50,
         }
         if reg_cfg:
             self.reg_cfg.update(reg_cfg)
 
-    # ---------- scheduling helpers ----------
-    def _sched_scalar(self, p: float) -> float:
-        s0 = float(self.reg_cfg["sched_start"])
-        s1 = float(self.reg_cfg["sched_end"])
+    # -------------------- Scheduling --------------------
+    def _sched_weight(self, progress: float) -> float:
+        """Cubic warmup from sched_start to sched_end."""
+        s0, s1 = self.reg_cfg["sched_start"], self.reg_cfg["sched_end"]
         if s1 <= s0:
-            return 1.0  # always on
-        if p <= s0:
-            t = 0.0
-        elif p >= s1:
-            t = 1.0
-        else:
-            t = (p - s0) / (s1 - s0)
-        ttype = self.reg_cfg["sched_type"]
-        if ttype == "linear":
+            return 1.0
+        t = max(0.0, min(1.0, (progress - s0) / (s1 - s0)))
+        stype = self.reg_cfg["sched_type"]
+        if stype == "linear":
             return t
-        if ttype == "cubic":
+        if stype == "cubic":
             return t**3
-        return t**2  # quad default
+        return t**2  # quad
 
-    # DS-safe: only build term if it will actually contribute
-    def _active(self, L: float, scheduled_flag: bool, w_sched: float) -> bool:
-        if L <= 0.0:
-            return False
-        if not scheduled_flag:
-            return True
-        return w_sched > 0.0
+    def _should_compute(self, coeff: float, every: int, step: int) -> bool:
+        """Check if a regularizer should run this step."""
+        return coeff > 0 and every > 0 and (step % every == 0)
 
+    # -------------------- Regularizer Helpers --------------------
+    def _compute_decorr(self, z: torch.Tensor) -> torch.Tensor:
+        """Off-diagonal covariance penalty → monosemantic latents."""
+        Z = z.reshape(-1, z.size(-1)).float()
+        Z = Z - Z.mean(dim=0, keepdim=True)
+        C = (Z.T @ Z) / (Z.size(0) + 1e-6)
+        off_diag = C - torch.diag(torch.diag(C))
+        return (off_diag**2).mean()
+
+    def _compute_usage_balance(self, g_soft: torch.Tensor) -> torch.Tensor:
+        """Encourage uniform latent usage → prevent dead latents."""
+        # Average gate activation per latent across batch
+        usage = g_soft.mean(dim=tuple(range(g_soft.dim() - 1)))  # [r]
+        # Penalize variance in usage (want all latents used equally)
+        return ((usage - usage.mean()) ** 2).mean()
+
+    def _compute_ortho(self, weight: torch.Tensor, dim: int) -> torch.Tensor:
+        """Orthogonality penalty on weight rows (dim=1) or cols (dim=0)."""
+        W = weight.float()
+        if dim == 1:  # rows
+            W_norm = F.normalize(W, p=2, dim=1)
+            G = W_norm @ W_norm.T
+        else:  # cols
+            W_norm = F.normalize(W, p=2, dim=0)
+            G = W_norm.T @ W_norm
+        off_diag = G - torch.diag(torch.diag(G))
+        return (off_diag**2).mean()
+
+    def _clear_caches(self, model):
+        """Clear live activation caches to prevent cross-step graph retention."""
+        for m in model.modules():
+            if isinstance(m, TopKLoRALinearSTE):
+                m._z_live = None
+                m._g_soft_live = None
+
+    def _log_gate_stats(self, model, step: int):
+        """Log gate statistics for first TopK layer found."""
+        for name, m in model.named_modules():
+            if isinstance(m, TopKLoRALinearSTE):
+                st = m.get_gate_stats()
+                if st:
+                    self.log(
+                        {
+                            f"{name}.k": st["k"],
+                            f"{name}.tau": st["tau"],
+                            f"{name}.frac_active": st.get("frac_active_vs_target", 0.0),
+                        }
+                    )
+                return
+
+    # -------------------- Main Loss --------------------
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # base DPO loss
+        # Base DPO loss
         loss, outputs = super().compute_loss(
             model, inputs, return_outputs=True, **kwargs
         )
-        step = int(self.state.global_step or 0)
-        max_steps = int(self.state.max_steps or 1)
 
-        # short-circuit: fully off
-        # log if step % log_every == 0
-        log_every = int(self.reg_cfg.get("log_every", 50))
-        if step % log_every == 0:
-            for name, m in model.named_modules():
-                if isinstance(m, TopKLoRALinearSTE):
-                    st = m.get_gate_stats()
-                    if st:
-                        self.log(
-                            {
-                                f"{name}.k": st["k"],
-                                f"{name}.tau": st["tau"],
-                                f"{name}.frac_active_vs_target": st[
-                                    "frac_active_vs_target"
-                                ],
-                            }
-                        )
-                        break
+        step = self.state.global_step or 0
+        max_steps = max(1, self.state.max_steps or 1)
+        log_every = self.reg_cfg["log_every"]
+        do_log = log_every > 0 and (step % log_every == 0)
 
+        # Log gate stats periodically
+        if do_log:
+            self._log_gate_stats(model, step)
+
+        # Early exit if regularizers disabled
         if self.reg_mode == "off":
-            # Always clear live caches to avoid cross-step graph retention
-            for m in model.modules():
-                if isinstance(m, TopKLoRALinearSTE):
-                    if hasattr(m, "_z_live"):
-                        m._z_live = None
-                    if hasattr(m, "_g_soft_live"):
-                        m._g_soft_live = None
+            self._clear_caches(model)
             return (loss, outputs) if return_outputs else loss
 
-        reg = loss.new_tensor(0.0)
+        # Config
+        L_DECORR = float(self.reg_cfg["L_DECORR"])
+        L_USAGE = float(self.reg_cfg.get("L_USAGE", 0.0))
+        L_ORTHO = float(self.reg_cfg.get("L_ORTHO", 0.0))
+        DECORR_EVERY = int(self.reg_cfg["DECORR_EVERY"])
+        USAGE_EVERY = int(self.reg_cfg.get("USAGE_EVERY", 2))
+        ORTHO_EVERY = int(self.reg_cfg["ORTHO_EVERY"])
 
-        # logging accumulators
-        log_every = int(self.reg_cfg["log_every"])
-        do_log = (log_every > 0) and (step % log_every == 0)
+        run_decorr = self._should_compute(L_DECORR, DECORR_EVERY, step)
+        run_usage = self._should_compute(L_USAGE, USAGE_EVERY, step)
+        run_ortho = self.reg_mode == "z_plus_ortho" and self._should_compute(
+            L_ORTHO, ORTHO_EVERY, step
+        )
+
+        # Accumulators
+        reg = loss.new_tensor(0.0)
         acc = {
             "reg/decorr": 0.0,
-            "reg/mass": 0.0,
-            "reg/entropy": 0.0,
-            "reg/ortho_A": 0.0,
-            "reg/ortho_B": 0.0,
+            "reg/usage": 0.0,
+            "reg/ortho": 0.0,
             "reg/sched_w": 0.0,
         }
         n_layers = 0
-
-        # pull config once
-        L_DECORR = float(self.reg_cfg["L_DECORR"])
-        L_MASS = float(self.reg_cfg["L_MASS"])
-        L_ENTROPY = float(self.reg_cfg["L_ENTROPY"])
-        L_ORTHO_A = float(self.reg_cfg["L_ORTHO_A"])
-        L_ORTHO_B = float(self.reg_cfg["L_ORTHO_B"])
-        ORTHO_EVERY = int(self.reg_cfg["ORTHO_EVERY"])
-        DECORR_EVERY = int(self.reg_cfg.get("DECORR_EVERY", 1))
-        MASS_EVERY = int(self.reg_cfg.get("MASS_EVERY", 1))
 
         try:
             for m in model.modules():
                 if not isinstance(m, TopKLoRALinearSTE):
                     continue
 
-                # live tensors from forward (set by your TopK wrapper)
                 z_live = getattr(m, "_z_live", None)
-                # If we don't have live z (e.g., first steps or different wrapper), skip safely
                 if z_live is None:
                     continue
 
-                # layer progress & schedule weight
+                # Schedule weight based on layer progress
                 try:
-                    p_layer = float(m.progress)
+                    progress = float(m.progress)
                 except Exception:
-                    p_layer = step / max(1, max_steps)
-                w_sched = self._sched_scalar(p_layer)
+                    progress = step / max_steps
+                w = self._sched_weight(progress)
 
-                # which terms are (potentially) active
-                need_decorr = (
-                    (DECORR_EVERY > 0)
-                    and (step % DECORR_EVERY == 0)
-                    and self._active(
-                        L_DECORR, self.reg_cfg.get("schedule_decorr", True), w_sched
-                    )
-                )
-                need_mass = (
-                    (MASS_EVERY > 0)
-                    and (step % MASS_EVERY == 0)
-                    and self._active(
-                        L_MASS, self.reg_cfg.get("schedule_mass", True), w_sched
-                    )
-                )
-                need_ent = self._active(
-                    L_ENTROPY, self.reg_cfg.get("schedule_ent", True), w_sched
-                )
-                need_orthoA = (
-                    (self.reg_mode == "z_plus_ortho")
-                    and ORTHO_EVERY > 0
-                    and (step % ORTHO_EVERY == 0)
-                    and self._active(
-                        L_ORTHO_A, self.reg_cfg.get("schedule_ortho", True), w_sched
-                    )
-                )
-                need_orthoB = (
-                    (self.reg_mode == "z_plus_ortho")
-                    and ORTHO_EVERY > 0
-                    and (step % ORTHO_EVERY == 0)
-                    and self._active(
-                        L_ORTHO_B, self.reg_cfg.get("schedule_ortho", True), w_sched
-                    )
-                )
-
-                # If every term is scheduled & weight == 0, hard-skip this module (DS-safe)
-                all_sched = (
-                    self.reg_cfg.get("schedule_decorr", True)
-                    and self.reg_cfg.get("schedule_mass", True)
-                    and self.reg_cfg.get("schedule_ent", True)
-                    and (
-                        self.reg_mode != "z_plus_ortho"
-                        or self.reg_cfg.get("schedule_ortho", True)
-                    )
-                )
-                if all_sched and (
-                    not (
-                        need_decorr
-                        or need_mass
-                        or need_ent
-                        or need_orthoA
-                        or need_orthoB
-                    )
-                ):
-                    if do_log:
-                        acc["reg/sched_w"] += w_sched
-                        n_layers += 1
+                if w <= 0 and not any([run_decorr, run_usage, run_ortho]):
                     continue
 
-                # Prepare gates once (used by mass/entropy and usage balancing)
-                k_now = m._current_k()
-                tau = m._tau()
-                g_soft_live = getattr(m, "_g_soft_live", None)
-                g_soft = (
-                    g_soft_live
-                    if g_soft_live is not None
-                    else _soft_topk_mass(z_live, k_now, tau)
-                )
-
-                # -------- z-based regs (always allowed in "z_only" and "z_plus_ortho") --------
-                if need_decorr:
-                    Z = z_live.reshape(-1, z_live.size(-1)).float()
-                    Z = Z - Z.mean(dim=0, keepdim=True)
-                    C = (Z.T @ Z) / (Z.size(0) + 1e-6)
-                    off = C - torch.diag(torch.diag(C))
-                    r_decorr = (off**2).mean().to(loss.dtype)
-                    if self.reg_cfg.get("schedule_decorr", True):
-                        r_decorr = r_decorr * r_decorr.new_tensor(w_sched)
+                # Decorrelation
+                if run_decorr and w > 0:
+                    r_decorr = self._compute_decorr(z_live).to(loss.dtype) * w
                     reg = reg + L_DECORR * r_decorr
                     if do_log:
-                        acc["reg/decorr"] += float(r_decorr.detach().cpu())
+                        acc["reg/decorr"] += float(r_decorr.detach())
 
-                if need_mass or need_ent:
-                    # mass and entropy use precomputed g_soft
-                    if need_mass:
-                        r_mass = (g_soft.sum(dim=-1) - k_now).pow(2).mean()
-                        if self.reg_cfg.get("schedule_mass", True):
-                            r_mass = r_mass * r_mass.new_tensor(w_sched)
-                        reg = reg + L_MASS * r_mass
-                        if do_log:
-                            acc["reg/mass"] += float(r_mass.detach().cpu())
-
-                    if need_ent:
-                        r_ent = (
-                            -(g_soft.clamp_min(1e-8) * g_soft.clamp_min(1e-8).log())
-                            .sum(dim=-1)
-                            .mean()
-                        )
-                        if self.reg_cfg.get("schedule_ent", True):
-                            r_ent = r_ent * r_ent.new_tensor(w_sched)
-                        reg = reg + L_ENTROPY * r_ent
-                        if do_log:
-                            acc["reg/entropy"] += float(r_ent.detach().cpu())
-
-                # -------- orthogonality (only in "z_plus_ortho") --------
-                if need_orthoA:
-                    Aw = m.A_module.weight
-                    # rows ~ latents
-                    A_rows = F.normalize(Aw.float(), p=2, dim=1)
-                    GA = A_rows @ A_rows.T
-                    GA_off = GA - torch.diag(torch.diag(GA))
-                    r_oa = (GA_off**2).mean().to(loss.dtype)
-                    if self.reg_cfg.get("schedule_ortho", True):
-                        r_oa = r_oa * r_oa.new_tensor(w_sched)
-                    reg = reg + L_ORTHO_A * r_oa
+                # Usage balancing
+                if run_usage and w > 0:
+                    g_soft = getattr(m, "_g_soft_live", None)
+                    if g_soft is None:
+                        g_soft = _soft_topk_mass(z_live, m._current_k(), m._tau())
+                    r_usage = self._compute_usage_balance(g_soft).to(loss.dtype) * w
+                    reg = reg + L_USAGE * r_usage
                     if do_log:
-                        acc["reg/ortho_A"] += float(r_oa.detach().cpu())
+                        acc["reg/usage"] += float(r_usage.detach())
 
-                if need_orthoB:
-                    Bw = m.B_module.weight
-                    # cols ~ latents
-                    B_cols = F.normalize(Bw.float(), p=2, dim=0)
-                    GB = B_cols.T @ B_cols
-                    GB_off = GB - torch.diag(torch.diag(GB))
-                    r_ob = (GB_off**2).mean().to(loss.dtype)
-                    if self.reg_cfg.get("schedule_ortho", True):
-                        r_ob = r_ob * r_ob.new_tensor(w_sched)
-                    reg = reg + L_ORTHO_B * r_ob
+                # Orthogonality (A rows + B cols combined)
+                if run_ortho and w > 0:
+                    r_ortho_a = self._compute_ortho(m.A_module.weight, dim=1)
+                    r_ortho_b = self._compute_ortho(m.B_module.weight, dim=0)
+                    r_ortho = ((r_ortho_a + r_ortho_b) / 2).to(loss.dtype) * w
+                    reg = reg + L_ORTHO * r_ortho
                     if do_log:
-                        acc["reg/ortho_B"] += float(r_ob.detach().cpu())
+                        acc["reg/ortho"] += float(r_ortho.detach())
 
                 if do_log:
-                    acc["reg/sched_w"] += w_sched
-                    n_layers += 1
-
-                # Optional: L1 and usage variance regularization (lightweight)
-                # Only apply if needed - comment out for max speed
-                # L1 = 1e-5
-                # reg = reg + L1 * z_live.abs().mean()
-                # usage = g_soft.mean(dim=(0, 1))                 # [r]
-                # cov = ((usage - usage.mean())**2).mean()
-                # reg = reg + 1e-4 * cov
+                    acc["reg/sched_w"] += w
+                n_layers += 1
 
         finally:
-            # critical: drop live caches every step to avoid cross-step graphs
-            for m in model.modules():
-                if isinstance(m, TopKLoRALinearSTE):
-                    if hasattr(m, "_z_live"):
-                        m._z_live = None
-                    if hasattr(m, "_g_soft_live"):
-                        m._g_soft_live = None
+            self._clear_caches(model)
 
         loss = loss + reg
 
+        # Log averages
         if do_log and n_layers > 0:
             for k in acc:
                 acc[k] /= n_layers
-            # also log one layer's gate stats
-            for name, m in model.named_modules():
-                if isinstance(m, TopKLoRALinearSTE):
-                    st = m.get_gate_stats()
-                    if st:
-                        acc["gates/k"] = st["k"]
-                        acc["gates/tau"] = st["tau"]
-                        acc["gates/frac_active_vs_target"] = st["frac_active_vs_target"]
-                    break
             self.log(acc)
 
         return (loss, outputs) if return_outputs else loss
@@ -1691,9 +1580,9 @@ def run_dpo(cfg, quant_cfg):
         cfg, tokenizer=tokenizer, dpo_args=dpo_args
     )
 
-    # Configure LoRA
-    target_modules = list(experiment_args.lora.target_modules)
-    logging.info(f"Target modules: {len(target_modules)} modules")
+    # Configure LoRA - resolve target_modules from explicit list or module_type shorthand
+    target_modules = resolve_target_modules(experiment_args.lora)
+    logging.info(f"Target modules: {target_modules}")
 
     lora_config = LoraConfig(
         r=experiment_args.lora.r,
@@ -1877,26 +1766,34 @@ def run_dpo(cfg, quant_cfg):
             if cnt:
                 logging.info(f"[gradnorm] mean={tot / cnt:.4f} over {cnt} params")
 
-    # Regularization config (aligned with SFT pattern)
+    # # Regularization config (aligned with SFT pattern)
+    # reg_cfg = {
+    #     "log_every": 100,  # Reduced logging frequency for speed
+    #     "L_DECORR": 1e-4,  # decorrelate latents
+    #     "L_MASS": 1e-3,  # enforce soft mass ~= k
+    #     "L_ENTROPY": 0.0,  # encourage sharp gates (disabled by default)
+    #     "L_ORTHO_A": 1e-4,  # orthogonality on A (rows ~ latents)
+    #     "L_ORTHO_B": 1e-4,  # orthogonality on B (columns ~ latents)
+    #     # Reduced from 4 to 20 for better speed (only for z_plus_ortho mode)
+    #     "ORTHO_EVERY": 20,
+    #     # CRITICAL: Decorrelation is expensive (r×r matrix), only do every 10 steps
+    #     "DECORR_EVERY": 10,
+    #     "MASS_EVERY": 2,  # Mass is cheap but still skip some steps
+    #     "schedule_decorr": True,
+    #     "schedule_mass": True,
+    #     "schedule_ent": True,
+    #     "schedule_ortho": True,
+    #     "sched_start": 0.0,
+    #     "sched_end": 0.15,
+    #     "sched_type": "cubic",
+    # }
+
     reg_cfg = {
-        "log_every": 100,  # Reduced logging frequency for speed
-        "L_DECORR": 1e-4,  # decorrelate latents
-        "L_MASS": 1e-3,  # enforce soft mass ~= k
-        "L_ENTROPY": 0.0,  # encourage sharp gates (disabled by default)
-        "L_ORTHO_A": 1e-4,  # orthogonality on A (rows ~ latents)
-        "L_ORTHO_B": 1e-4,  # orthogonality on B (columns ~ latents)
-        # Reduced from 4 to 20 for better speed (only for z_plus_ortho mode)
-        "ORTHO_EVERY": 20,
-        # CRITICAL: Decorrelation is expensive (r×r matrix), only do every 10 steps
-        "DECORR_EVERY": 10,
-        "MASS_EVERY": 2,  # Mass is cheap but still skip some steps
-        "schedule_decorr": True,
-        "schedule_mass": True,
-        "schedule_ent": True,
-        "schedule_ortho": True,
-        "sched_start": 0.0,
-        "sched_end": 0.15,
+        "L_DECORR": 1e-4,
+        "DECORR_EVERY": 3,  # slightly more frequent than default
         "sched_type": "cubic",
+        "sched_start": 0.0,
+        "sched_end": 0.25,
     }
 
     # Prepare callbacks
@@ -1941,7 +1838,7 @@ def run_dpo(cfg, quant_cfg):
         processing_class=tokenizer,
         callbacks=callbacks,
         reg_cfg=reg_cfg,
-        reg_mode="off",  # Enable TopK-aware regularization
+        reg_mode="z_only",  # Enable z-based regs (decorrelation, mass, entropy)
     )
 
     print(trainer.train_dataset[0])

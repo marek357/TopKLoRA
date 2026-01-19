@@ -9,8 +9,8 @@ datasets_to_use:
   - "oasst1"
   - "tulu_v2"
   - "infinity_instruct"
-  - "h4_instruction"
   - "alpaca"
+  # - "h4_instruction"
 
 # Mixing strategy: concat (deterministic) or interleave (probabilistic sampling)
 mix_strategy: "interleave"

@@ -1,0 +1,64 @@
+# Sweep configuration for DPO TopK single-layer experiments
+# 
+# Usage with Hydra multirun (-m flag):
+#
+# === Basic sweep over r, k, k_final values ===
+# python main.py -m training=dpo_topk_sweep \
+#     'training.dpo_experiment.lora.r=1024,4096,8192' \
+#     'training.dpo_experiment.lora.k=64,128,256,512' \
+#     'training.dpo_experiment.lora.k_final=4,8,32,64'
+#
+# === Sweep including MLP vs MLP+Attn ===
+# python main.py -m training=dpo_topk_sweep \
+#     'training.dpo_experiment.lora.r=1024,4096' \
+#     'training.dpo_experiment.lora.k=128,512' \
+#     'training.dpo_experiment.lora.k_final=8,32' \
+#     'training.dpo_experiment.lora.module_type=mlp,mlp_attn'
+#
+# === Sweep with different layers ===
+# python main.py -m training=dpo_topk_sweep \
+#     'training.dpo_experiment.lora.r=4096' \
+#     'training.dpo_experiment.lora.k=256' \
+#     'training.dpo_experiment.lora.layer=16,17,18,19,20'
+
+method: "dpo"
+
+defaults:
+  - model: gemma_2_2b
+  - experiment/topk_single_layer_base@sft_experiment
+  - experiment/topk_single_layer_base@dpo_experiment
+  - dataset/alpaca-train@sft_dataset
+  - dataset/hh-rlhf@dpo_dataset
+  - base_sft_merged_model: gemma_2_2b
+  - quantization: 4bit
+
+dump_trained_model: True
+dump_path: "models/dpo_topk_sweep/${training.model.model_name}/r${training.dpo_experiment.lora.r}_k${training.dpo_experiment.lora.k}_kf${training.dpo_experiment.lora.k_final}_${training.dpo_experiment.lora.module_type}"
+
+sft:
+  enabled: False
+
+dpo:
+  enabled: True
+  max_prompt_length: 256
+  max_completion_length: 256
+  beta: 0.1
+  loss_type: 'sigmoid'
+  num_train_epochs: 1
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8
+  gradient_checkpointing: True
+  max_steps: 5000
+  optim: 'adamw_bnb_8bit'
+  learning_rate: 1e-5
+  warmup_ratio: 0.05
+  bf16: True
+  fp16: False
+  max_grad_norm: 0.5
+  save_strategy: 'steps'
+  save_steps: 500
+  save_total_limit: 2
+  eval_strategy: 'steps'
+  eval_steps: 250
+  do_eval: True

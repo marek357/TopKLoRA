@@ -13,6 +13,7 @@ lora:
   #k_final: 4
   # k_schedule: constant
   k_schedule: cubic
+  k_warmup_frac: 0.2
   temperature: 0.1
   temperature_final: 0.005
   temperature_schedule: linear

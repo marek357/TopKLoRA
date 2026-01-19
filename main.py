@@ -7,9 +7,13 @@ from transformers import set_seed
 from src.sft import run_sft
 from src.dpo import run_dpo
 from src.utils import build_quant_config
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 import logging
 import socket
+
+# Register custom OmegaConf resolvers for sweep configs
+OmegaConf.register_new_resolver("mult", lambda a, b: int(a) * int(b), replace=True)
+OmegaConf.register_new_resolver("div", lambda a, b: int(a) // int(b), replace=True)
 
 
 @hydra.main(
