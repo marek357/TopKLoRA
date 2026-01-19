@@ -20,6 +20,13 @@ dataset: # Prompt source configuration (HH-RLHF).
 latents: # Latent statistics collection settings.
   quantiles: [0.5, 0.9, 0.99] # Quantiles to record per latent.
   max_length: 2048 # Token limit when collecting stats.
+  selection:
+    enabled: true
+    seed: 42
+    max_latents: 128
+    p_active_min: 0.01
+    p_active_max: 0.8
+    dead_p_active_max: 0.0099
 
 # evidence packs
 # train_per_latent is used for both train/eval unless overridden
