@@ -1,0 +1,12 @@
+defaults:
+  - quantization: 4bit
+  - base_model: sft
+  - module_type: mlp
+  - _self_
+
+k: 64
+r: 8192
+layer: 18
+type: dpo_${.module_type.name}_k${.k}_r${.r}_layer${.layer}
+adapter_checkpoint_dir: "models/dpo/${.module_type.name}/k${.k}/r${.r}/layer${.layer}"
+train_steps: 5000

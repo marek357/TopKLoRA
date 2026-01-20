@@ -213,3 +213,5 @@ if_outputs/
 layer_attribution_test/
 repofromgh/
 .vscode/settings.json
+sweep_scripts/
+test_model.py
