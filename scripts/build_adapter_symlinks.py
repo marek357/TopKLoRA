@@ -139,14 +139,16 @@ def ensure_symlink(src: Path, dest: Path, *, dry_run: bool, force: bool) -> str:
                 if not dry_run:
                     dest.unlink()
             else:
-                logging.warning("Destination exists and differs: %s (use --force to replace symlinks)", dest)
+                logging.warning(
+                    "Destination exists and differs: %s (use --force to replace symlinks)", dest)
                 return "skipped"
         else:
             if dest.is_dir() and not any(dest.iterdir()) and force:
                 if not dry_run:
                     dest.rmdir()
             else:
-                logging.warning("Destination exists and is not a symlink: %s", dest)
+                logging.warning(
+                    "Destination exists and is not a symlink: %s", dest)
                 return "skipped"
 
     dest.parent.mkdir(parents=True, exist_ok=True)

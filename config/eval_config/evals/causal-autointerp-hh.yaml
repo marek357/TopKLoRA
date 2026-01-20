@@ -57,11 +57,15 @@ evidence: # Evidence pack construction settings.
       temperature: 1.0 # Sampling temperature for eval (if enabled).
       top_p: 0.9 # Nucleus sampling p for eval (if enabled).
 
+vllm: # vLLM server settings for explainer/verifier.
+  base_url: "http://localhost:8080/v1" # OpenAI-compatible endpoint.
+  # To start the server: bash run_vllm_server.sh
+
 llm: # Explainer/verifier model settings.
   explainer:
     enabled: true # Enable hypothesis generation.
-    provider: openai # LLM backend provider.
-    model: gpt-4o # Explainer model ID.
+    provider: vllm # LLM backend provider (vllm uses OpenAI-compatible API).
+    model: Qwen/Qwen2.5-32B-Instruct-AWQ # Explainer model ID (must match vLLM server).
     temperature: 0.2 # Explainer sampling temperature.
     max_tokens: 512 # Explainer output token cap.
     evidence_per_latent: 8 # Evidence packs per latent for hypotheses.
@@ -78,16 +82,16 @@ llm: # Explainer/verifier model settings.
       - uncertainty_more_likely
   verifier:
     enabled: true # Enable hypothesis verification.
-    provider: openai # LLM backend provider.
-    model: gpt-4o # Verifier model ID.
+    provider: vllm # LLM backend provider.
+    model: Qwen/Qwen2.5-32B-Instruct-AWQ # Verifier model ID.
     temperature: 0.0 # Verifier sampling temperature.
     max_tokens: 256 # Verifier output token cap.
 
 stages: # Pipeline stage toggles.
-  prompts: true # Build prompt records.
-  latent_stats: true # Collect latent activation stats.
-  evidence_explainer: true # Generate training evidence packs.
-  evidence_verifier: true # Generate eval evidence packs.
+  prompts: false # Build prompt records.
+  latent_stats: false # Collect latent activation stats.
+  evidence_explainer: false # Generate training evidence packs.
+  evidence_verifier: false # Generate eval evidence packs.
   hypothesis: true # Generate hypotheses via explainer.
   verification: true # Run blind + hypothesis verification.
   summary: true # Aggregate summary metrics.

@@ -2,4 +2,4 @@ size: "2B"
 name: "gemma"
 version: 2.0
 model_it_name: "google/gemma-2-2b-it"
-path: "/Users/aszab/repos/TopKLoRA/models/sft-gemma2-2b-it"
+path: "models/sft_base"

@@ -24,6 +24,7 @@ from tqdm import tqdm
 from src.models import TopKLoRALinearSTE, _hard_topk_mask
 from src.steering import FeatureSteeringContext, list_available_adapters
 from src.utils import hh_string_to_messages, generate_completions_from_prompts
+from src.causal_explainer import run_explainer
 
 
 logger = logging.getLogger(__name__)
@@ -522,6 +523,8 @@ def _build_evidence_packs(
             evidence_records.append(
                 {
                     "latent_id": latent_id,
+                    "adapter_name": entry["adapter_name"],
+                    "feature_idx": entry["feature_idx"],
                     "prompt_id": prompt_rec["prompt_id"],
                     "prompt": prompt_rec["prompt"],
                     "baseline_samples": baseline,
@@ -653,15 +656,28 @@ def run_autointerp_framework(cfg, model, tokenizer) -> None:
         )
         _write_jsonl(evidence_verifier_path, evidence_eval)
 
-    # TODO: Checked until here and works.
+    # Run explainer stage to generate hypotheses
+    if eval_cfg.stages.hypothesis:
+        logger.info("Running causal explainer to generate hypotheses...")
+        
+        # Get vLLM server URL from config or use default
+        vllm_cfg = getattr(eval_cfg, "vllm", None)
+        vllm_base_url = (
+            getattr(vllm_cfg, "base_url", "http://localhost:8080/v1")
+            if vllm_cfg else "http://localhost:8080/v1"
+        )
+        
+        hypotheses = run_explainer(
+            cfg,
+            output_dir=output_dir,
+            vllm_base_url=vllm_base_url,
+        )
+        logger.info(f"Generated {len(hypotheses)} hypotheses")
 
-    if eval_cfg.stages.explainer:
-        raise NotImplementedError
-
-    if eval_cfg.stages.verifier:
-        raise NotImplementedError
+    if eval_cfg.stages.verification:
+        raise NotImplementedError("Verification stage not yet implemented")
 
     if eval_cfg.stages.summary:
-        raise NotImplementedError
+        raise NotImplementedError("Summary stage not yet implemented")
 
     logger.info("Causal autointerp framework run complete.")
