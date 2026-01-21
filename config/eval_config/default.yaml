@@ -5,5 +5,4 @@ defaults:
   - model: topk_dpo_model
 
 seed: 42
-checkpoint_dir: adapter
 experiment_name: ${evals}_eval
