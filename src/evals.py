@@ -19,9 +19,9 @@ from peft import PeftModel
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from src.autointerp_framework_hh import run_autointerp_framework
 from src.delphi_autointerp import (
     delphi_collect_activations,
-    delphi_collect_activations_causal,
     delphi_score,
 )
 from src.models import TopKLoRALinearSTE
@@ -33,11 +33,10 @@ from src.utils import (
     format_adapter_suffix,
     generate_completions_from_prompts,
     preprocess_to_perspective_message,
+    wikitext_detokenizer,
     wrap_topk_lora_modules,
     write_json,
-    wikitext_detokenizer,
 )
-from src.autointerp_framework_hh import run_autointerp_framework
 
 device = (
     "cuda"
@@ -246,37 +245,6 @@ def auto_interp():
         return
 
     return eval_auto_interp
-
-
-def causal_auto_interp():
-    def eval_causal_auto_interp(cfg):
-        model, tokenizer, wrapped_modules = init_model_tokenizer_fixed(
-            cfg.model)
-        # sanity check below -- PEFT has a weird bug
-        # where it doesn't load the weights sometimes
-        # and initialises them to random (matrix_A)
-        # and zeros (matrix_B) instead
-        print("Sanity checking LoRA B weights...")
-        for name, module in model.named_modules():
-            if isinstance(module, TopKLoRALinearSTE):
-                b_max = module.B_module.weight.detach().abs().max()
-                a_max = module.A_module.weight.detach().abs().max()
-                assert b_max != 0, f"lora_B weights in {name} are all zero!"
-                assert a_max != 0, f"lora_A weights in {name} are all zero!"
-                print(f"{name}: B max = {b_max:.6f};  A max = {a_max:.6f}")
-
-        if cfg.evals.causal_auto_interp.collect_activations:
-            print("Collecting activations...")
-            torch.set_float32_matmul_precision("high")
-            delphi_collect_activations_causal(
-                cfg, model, tokenizer, wrapped_modules)
-
-        if cfg.evals.causal_auto_interp.score_activations:
-            print("Scoring activations...")
-            delphi_score(cfg, model, tokenizer, wrapped_modules)
-        return
-
-    return eval_causal_auto_interp
 
 
 def causal_autointerp_framework():
