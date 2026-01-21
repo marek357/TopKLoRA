@@ -145,8 +145,7 @@ def metrics():
         configs = get_dataset_config_names("HuggingFaceH4/hhh_alignment")
         parts = []
         for cfg_ in configs:
-            ds = load_dataset("HuggingFaceH4/hhh_alignment",
-                              cfg_, split="test")
+            ds = load_dataset("HuggingFaceH4/hhh_alignment", cfg_, split="test")
             ds = ds.add_column("subset", [cfg_] * len(ds))
             parts.append(ds)
             print(f"Loaded {cfg_:8} subset with {len(ds)} rows.")
@@ -201,8 +200,7 @@ def metrics():
 
                     # Sum log probs from the start of the reply only (not prompt)
                     reply_start = len(
-                        tokenizer(base_prompt, add_special_tokens=False)[
-                            "input_ids"]
+                        tokenizer(base_prompt, add_special_tokens=False)["input_ids"]
                     )
                     reply_logprob = selected_logprobs[:, reply_start:].sum()
 
@@ -218,8 +216,7 @@ def metrics():
                     )
 
                 metric_global.add(prediction=pred, reference=gold_idx)
-                metrics_by_subset[ex["subset"]].add(
-                    prediction=pred, reference=gold_idx)
+                metrics_by_subset[ex["subset"]].add(prediction=pred, reference=gold_idx)
 
         results = {"overall": metric_global.compute()["accuracy"]}
         for subset, m in metrics_by_subset.items():
@@ -235,8 +232,7 @@ def metrics():
 
 def auto_interp():
     def eval_auto_interp(cfg):
-        model, tokenizer, wrapped_modules = init_model_tokenizer_fixed(
-            cfg.model)
+        model, tokenizer, wrapped_modules = init_model_tokenizer_fixed(cfg.model)
         if cfg.evals.auto_interp.collect_activations:
             print("Collecting activations...")
             torch.set_float32_matmul_precision("high")
@@ -270,8 +266,7 @@ def toxicity():
             model, tokenizer = load_base_model_for_eval(cfg)
         else:
             print("Evaluating toxicity on the adapter model...")
-            model, tokenizer, wrapped_modules = init_model_tokenizer_fixed(
-                cfg.model)
+            model, tokenizer, wrapped_modules = init_model_tokenizer_fixed(cfg.model)
             print(model)
             # assert False
 
@@ -287,8 +282,7 @@ def toxicity():
             cfg.evals.toxicity.dataset_name, split=cfg.evals.toxicity.split
         )
 
-        challenging_dataset = dataset.filter(
-            lambda example: example["challenging"])
+        challenging_dataset = dataset.filter(lambda example: example["challenging"])
 
         prompt_only = challenging_dataset.map(
             preprocess_to_perspective_message,
@@ -303,7 +297,7 @@ def toxicity():
 
         for start in tqdm(range(0, len(prompt_only), batch_size), desc="Generating"):
             # ── Slice a (shallow‑copied) mini‑dataset and pull the column as a python list
-            batch_messages = prompt_only[start: start + batch_size]["messages"]
+            batch_messages = prompt_only[start : start + batch_size]["messages"]
 
             # ── Convert each conversation into a single prompt string
             batch_prompts = [
@@ -350,15 +344,13 @@ def toxicity():
         for idx, text in enumerate(
             tqdm(completions_only, desc="Collecting toxicity evals")
         ):
-            response = analyze_text_toxicity_eval(
-                text, requested_attributes, client)
+            response = analyze_text_toxicity_eval(text, requested_attributes, client)
             toxicity_score = response["attributeScores"]["TOXICITY"]["summaryScore"][
                 "value"
             ]
             toxicity_scores.append(toxicity_score)
             if cfg.evals.toxicity.dump_analysis:
-                analysis_dump["details"].append(
-                    {"text": text, "score": toxicity_score})
+                analysis_dump["details"].append({"text": text, "score": toxicity_score})
             # printing first 30 chars because terminal gets flooded otherwise
             # print(f"Text: {repr(text)[:30]}...\n Score: {toxicity_score}\n")
         print(f"Overall Toxicity: {(np.array(toxicity_scores) > 0.5).mean()} ")
@@ -394,8 +386,7 @@ def instruction_following():
             model, tokenizer = load_base_model_for_eval(cfg)
         else:
             print("Evaluating instruction following on the adapter model...")
-            model, tokenizer, wrapped_modules = init_model_tokenizer_fixed(
-                cfg.model)
+            model, tokenizer, wrapped_modules = init_model_tokenizer_fixed(cfg.model)
 
         evaluator = Evaluator(instruction_registry)
         input_examples = get_default_dataset("en")
@@ -419,12 +410,9 @@ def instruction_following():
             tokenizer.pad_token = tokenizer.eos_token
 
         pad_id = tokenizer.pad_token_id
-        batch_size = getattr(
-            cfg.evals.instruction_following, "batch_size", 100)
-        max_length = getattr(
-            cfg.evals.instruction_following, "max_length", 512)
-        max_new_tokens = getattr(
-            cfg.evals.instruction_following, "max_new_tokens", 256)
+        batch_size = getattr(cfg.evals.instruction_following, "batch_size", 100)
+        max_length = getattr(cfg.evals.instruction_following, "max_length", 512)
+        max_new_tokens = getattr(cfg.evals.instruction_following, "max_new_tokens", 256)
         repetition_penalty = getattr(
             cfg.evals.instruction_following, "repetition_penalty", 1.0
         )
@@ -437,7 +425,7 @@ def instruction_following():
 
         responses = {}
         for start in tqdm(range(0, max_samples, batch_size), desc="Generating"):
-            batch = prompts_with_text[start: start + batch_size]
+            batch = prompts_with_text[start : start + batch_size]
             batch_texts = [rendered for _, rendered in batch]
 
             gen_kwargs = dict(
@@ -541,8 +529,7 @@ def perplexity():
         if max_tokens > 0 and input_ids.size(1) > max_tokens:
             input_ids = input_ids[:, :max_tokens]
 
-        model_max_length = getattr(
-            model.config, "max_position_embeddings", None)
+        model_max_length = getattr(model.config, "max_position_embeddings", None)
         block_size = cfg.evals.perplexity.block_size
         if model_max_length is not None:
             block_size = min(block_size, model_max_length)
