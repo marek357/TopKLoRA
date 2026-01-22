@@ -3,12 +3,16 @@ import dataclasses
 import json
 import os
 import sys
+import hashlib
+import heapq
+import random
 from itertools import islice
 from pathlib import Path
 
+import numpy as np
 import torch
 from datasets import load_dataset
-from delphi.clients import Offline, OpenRoute
+from delphi.clients import Offline, OpenRouter
 from delphi.config import ConstructorConfig, SamplerConfig
 from delphi.explainers import ContrastiveExplainer, DefaultExplainer
 from delphi.latents import LatentCache, LatentDataset
@@ -20,6 +24,9 @@ from delphi.scorers import (
     SurprisalScorer,
 )
 from torch.utils.data import DataLoader
+from src.autointerp_utils import _read_jsonl, _write_jsonl, build_latent_index
+from src.utils import hh_string_to_messages, autointerp_violates_alternation
+import logging
 
 # Add path for our improvements
 sys.path.append("/scratch/network/ssd/marek/lora_interp/src")
@@ -27,11 +34,275 @@ sys.path.append("/scratch/network/ssd/marek/lora_interp/src")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _stable_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _extract_prompt_from_example(example) -> str:
+    if "prompt" in example and example["prompt"]:
+        return example["prompt"].strip()
+    if "text" in example and example["text"]:
+        return example["text"].strip()
+    for key in ("chosen", "rejected"):
+        if key in example and example[key]:
+            msgs = hh_string_to_messages(example[key])
+            for msg in msgs:
+                if msg.get("role") == "user":
+                    return msg.get("content", "").strip()
+    return ""
+
+
+def _extract_first_user(msgs) -> str:
+    for msg in msgs:
+        if msg.get("role") == "user":
+            return msg.get("content", "").strip()
+    return ""
+
+
+def _extract_continuation_messages(example, choice, rng):
+    selected = choice
+    if selected is None:
+        if "chosen" in example and "rejected" in example:
+            selected = rng.choice(["chosen", "rejected"])
+
+    if selected in ("chosen", "rejected") and selected in example:
+        convo_text = example[selected]
+        msgs = hh_string_to_messages(convo_text)
+        return msgs, convo_text, selected
+
+    return None, "", selected
+
+
+def _stream_and_format_dataset(
+    dataset,
+    max_examples,
+    rng,
+    continuation_choice,
+    dataset_split,
+    dataset_config,
+):
+    inputs = []
+    prompt_records = []
+    incorrectly_formatted = 0
+    skipped_empty_prompt = 0
+    skipped_empty_continuation = 0
+
+    for example in islice(dataset, max_examples):
+        prompt_text = _extract_prompt_from_example(example)
+        messages, continuation_text, continuation_source = (
+            _extract_continuation_messages(example, continuation_choice, rng)
+        )
+
+        prompt_text = _extract_first_user(messages) or prompt_text
+        if not prompt_text:
+            skipped_empty_prompt += 1
+            continue
+        if not continuation_text and not messages:
+            skipped_empty_continuation += 1
+            continue
+        if not continuation_text and messages:
+            continuation_text = json.dumps(messages, ensure_ascii=False)
+
+        if autointerp_violates_alternation(messages):
+            incorrectly_formatted += 1
+            continue
+
+        prompt_id = _stable_hash(f"{prompt_text}\n\n{continuation_text}")
+        record = {
+            "prompt_id": prompt_id,
+            "prompt": prompt_text,
+            "continuation": continuation_text,
+            "continuation_source": continuation_source or "random",
+            "meta": {
+                "split": dataset_split,
+                "config": dataset_config,
+            },
+        }
+        record["meta"].update(
+            {
+                "num_messages": len(messages),
+                "multiturn": len(messages) > 2,
+            }
+        )
+        inputs.append({"input": messages})
+
+        prompt_records.append(record)
+
+    stats = {
+        "incorrectly_formatted": incorrectly_formatted,
+        "skipped_empty_prompt": skipped_empty_prompt,
+        "skipped_empty_continuation": skipped_empty_continuation,
+        "total_records": len(prompt_records),
+    }
+    return inputs, prompt_records, stats
+
+
+def _collect_latent_stats_from_cache(
+    cache,
+    wrapped_modules,
+    prompt_ids,
+    exp_cfg,
+):
+    # Hyperparameters controlling top-prompt tracking
+    top_prompt_count = int(getattr(exp_cfg, "top_prompt_count"))
+
+    latent_index, adapter_offsets = build_latent_index(wrapped_modules)
+
+    # Allocate aggregation buffers across the full latent space
+    total_latents = len(latent_index)
+    sums = np.zeros(total_latents, dtype=np.float64)
+    sums_sq = np.zeros(total_latents, dtype=np.float64)
+    active_counts = np.zeros(total_latents, dtype=np.int64)
+    top_prompts = [[] for _ in range(total_latents)] if top_prompt_count > 0 else None
+
+    # Aggregate per-sequence maxima into global statistics
+    def _update_from_sequence(seq_idx, max_by_latent, adapter_offset):
+        prompt_id = prompt_ids[seq_idx] if seq_idx < len(prompt_ids) else None
+        for feature_idx, max_val in max_by_latent.items():
+            latent_global = adapter_offset + feature_idx
+            sums[latent_global] += max_val
+            sums_sq[latent_global] += max_val * max_val
+            active_counts[latent_global] += 1
+            if top_prompts is not None and prompt_id:
+                heap = top_prompts[latent_global]
+                score = float(max_val)
+                if len(heap) < top_prompt_count:
+                    heapq.heappush(heap, (score, prompt_id))
+                elif score > heap[0][0]:
+                    heapq.heapreplace(heap, (score, prompt_id))
+
+    # Walk cached non-zero activations and compute per-sequence max for each latent
+    for name, module in wrapped_modules.items():
+        hookpoint = f"{name}.topk"
+        if hookpoint not in cache.cache.latent_locations:
+            continue
+        locations_tensor = cache.cache.latent_locations[hookpoint]
+        activations_tensor = cache.cache.latent_activations[hookpoint]
+        if locations_tensor is None or activations_tensor is None:
+            continue
+        if locations_tensor.numel() == 0:
+            continue
+        adapter_offset = adapter_offsets[name]
+        locations = locations_tensor.numpy()
+        activations = activations_tensor.numpy()
+        order = np.argsort(locations[:, 0])
+        loc_sorted = locations[order]
+        act_sorted = activations[order]
+        current_seq = int(loc_sorted[0, 0])
+        max_by_latent = {}
+        for loc, act in zip(loc_sorted, act_sorted):
+            seq_idx = int(loc[0])
+            if seq_idx != current_seq:
+                _update_from_sequence(current_seq, max_by_latent, adapter_offset)
+                max_by_latent = {}
+                current_seq = seq_idx
+            feature_idx = int(loc[2])
+            prev = max_by_latent.get(feature_idx)
+            if prev is None or act > prev:
+                max_by_latent[feature_idx] = act
+        _update_from_sequence(current_seq, max_by_latent, adapter_offset)
+
+    # Convert aggregated buffers into summary records
+    counts = max(len(prompt_ids), 1)
+    latent_stats = []
+    top_prompt_records = []
+    for entry in latent_index:
+        latent_id = entry["latent_id"]
+        mean = sums[latent_id] / counts
+        var = sums_sq[latent_id] / counts - mean * mean
+        sigma = float(max(var, 1e-12) ** 0.5)
+        p_active = active_counts[latent_id] / counts
+        latent_stats.append(
+            {
+                "latent_id": latent_id,
+                "mu": float(mean),
+                "sigma": float(sigma),
+                "p_active": float(p_active),
+                "notes": {"dead": int(p_active <= 0.0)},
+                "adapter_name": entry["adapter_name"],
+                "feature_idx": entry["feature_idx"],
+            }
+        )
+        if top_prompts is not None:
+            heap = top_prompts[latent_id]
+            top_sorted = sorted(heap, key=lambda x: x[0], reverse=True)
+            top_prompt_records.append(
+                {
+                    "latent_id": latent_id,
+                    "adapter_name": entry["adapter_name"],
+                    "feature_idx": entry["feature_idx"],
+                    "prompts": [
+                        {
+                            "prompt_id": pid,
+                            "score": float(score),
+                            "activation": float(score),
+                        }
+                        for score, pid in top_sorted
+                    ],
+                }
+            )
+
+    return latent_stats, top_prompt_records
+
+
+def _select_latents_from_stats(cfg, latent_stats):
+    sel_cfg = getattr(cfg.evals.auto_interp, "latent_selection")
+
+    enabled = bool(getattr(sel_cfg, "enabled"))
+    if not enabled:
+        return [], []
+
+    seed = int(getattr(cfg, "seed"))
+    rng = np.random.default_rng(seed)
+
+    p_active_min = float(getattr(sel_cfg, "p_active_min"))
+    p_active_max = float(getattr(sel_cfg, "p_active_max"))
+    dead_max = float(getattr(sel_cfg, "dead_p_active_max"))
+    max_latents = int(getattr(sel_cfg, "max_latents"))
+
+    candidate_entries = []
+    for stats in latent_stats:
+        p_active = float(stats.get("p_active", 0.0))
+        if p_active <= dead_max:
+            continue
+        if p_active < p_active_min or p_active > p_active_max:
+            continue
+        candidate_entries.append(stats)
+
+    if not candidate_entries:
+        return [], []
+
+    if len(candidate_entries) <= max_latents:
+        top_indices = np.arange(len(candidate_entries))
+    else:
+        top_indices = rng.choice(
+            len(candidate_entries), size=max_latents, replace=False
+        )
+
+    selection_records = []
+    top_index_set = set(int(i) for i in top_indices.tolist())
+    for i, entry in enumerate(candidate_entries):
+        selection_records.append(
+            {
+                "latent_id": entry.get("latent_id"),
+                "adapter_name": entry.get("adapter_name"),
+                "feature_idx": entry.get("feature_idx"),
+                "p_active": float(entry.get("p_active", 0.0)),
+                "selected": int(i in top_index_set),
+            }
+        )
+
+    selection_records.sort(key=lambda x: x["p_active"], reverse=True)
+    selected_entries = [candidate_entries[i] for i in top_indices]
+    return selected_entries, selection_records
+
+
 class ChatTemplateCollator:
-    def __init__(self, tokenizer, device, max_length=1024):
+    def __init__(self, tokenizer, device, max_length=1024, add_generation_prompt=True):
         self.tokenizer = tokenizer
         self.device = device
         self.max_length = max_length
+        self.add_generation_prompt = add_generation_prompt
 
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
@@ -47,7 +318,7 @@ class ChatTemplateCollator:
             text = self.tokenizer.apply_chat_template(
                 msgs,
                 tokenize=False,
-                add_generation_prompt=True,
+                add_generation_prompt=self.add_generation_prompt,
             )
             texts.append(text)
 
@@ -132,39 +403,69 @@ def save_score(result, model_str, scorer):
 
 def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
     print("starting activation collection")
+    exp_cfg = cfg.evals.auto_interp.activation_collection
 
-    if not hasattr(cfg, "dataset_name"):
+    if not hasattr(exp_cfg, "dataset_name"):
         raise ValueError(
             "cfg must have 'dataset_name' attribute for activation collection"
         )
 
-    # TODO: Adapt to work with hh-rlhf dataset
-    flat_ds = load_dataset(cfg.dataset_name, "en", split="train", streaming=True)
+    dataset_split = getattr(exp_cfg, "dataset_split", "train")
+    dataset_config = getattr(exp_cfg, "dataset_config_name")
+    flat_ds = load_dataset(
+        exp_cfg.dataset_name,
+        name=dataset_config,
+        split=dataset_split,
+        streaming=True,
+    )
 
-    def stream_and_format(dataset, max_examples):
-        for example in islice(dataset, max_examples):
-            yield {
-                "input": [
-                    {"role": "user", "content": example["text"]},
-                    {"role": "assistant", "content": ""},
-                ]
-            }
+    continuation_choice = getattr(exp_cfg, "dataset_continuation")
+    rng = random.Random(int(getattr(cfg, "seed", 42)))
 
-    MAX_BATCHES = 500_000
-    flat_ds = list(stream_and_format(flat_ds, MAX_BATCHES))
-    chat_collate = ChatTemplateCollator(tokenizer, device, max_length=256)
+    max_batches = getattr(exp_cfg, "max_batches")
+    flat_ds, prompt_records, stats = _stream_and_format_dataset(
+        flat_ds,
+        max_batches,
+        rng,
+        continuation_choice,
+        dataset_split,
+        dataset_config,
+    )
+    if stats["total_records"]:
+        logging.info(
+            "Skipped %d/%d (%.2f%%) incorrectly formatted examples.",
+            stats["incorrectly_formatted"],
+            stats["total_records"],
+            stats["incorrectly_formatted"] / stats["total_records"] * 100,
+        )
+    if stats["skipped_empty_prompt"]:
+        logging.info(
+            "Skipped %d examples with empty prompt.",
+            stats["skipped_empty_prompt"],
+        )
+    if stats["skipped_empty_continuation"]:
+        logging.info(
+            "Skipped %d examples with empty continuation.",
+            stats["skipped_empty_continuation"],
+        )
+    chat_collate = ChatTemplateCollator(
+        tokenizer,
+        device,
+        max_length=getattr(exp_cfg, "seq_len"),
+        add_generation_prompt=False,
+    )
 
     loader = DataLoader(  # type: ignore[arg-type]
         flat_ds,
-        batch_size=cfg.evals.causal_auto_interp.batch_size,
+        batch_size=exp_cfg.batch_size,
         shuffle=False,
         collate_fn=chat_collate,
         drop_last=False,
     )
 
-    N_TOKENS = 50_000_000
-    SEQ_LEN = 256
-    n_seqs = (N_TOKENS + SEQ_LEN - 1) // SEQ_LEN
+    n_tokens = int(getattr(exp_cfg, "n_tokens"))
+    seq_len = int(getattr(exp_cfg, "seq_len"))
+    n_seqs = (n_tokens + seq_len - 1) // seq_len
 
     rows = []
     for batch in loader:
@@ -179,6 +480,7 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
 
     # shape (n_seqs, SEQ_LEN)
     tokens_array = torch.stack(rows[:n_seqs], dim=0)
+    prompt_ids = [rec["prompt_id"] for rec in prompt_records][:n_seqs]
 
     topk_modules = {
         f"{name}.topk": module.topk for name, module in wrapped_modules.items()
@@ -194,13 +496,13 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
     cache = LatentCache(
         model=model,
         hookpoint_to_sparse_encode=topk_modules,
-        batch_size=cfg.evals.causal_auto_interp.batch_size,
+        batch_size=exp_cfg.batch_size,
         transcode=False,
     )
 
     try:
         cache.run(
-            n_tokens=N_TOKENS,
+            n_tokens=n_tokens,
             tokens=tokens_array,
         )
         print("Cache collection complete. Checking cache contents...")
@@ -212,7 +514,7 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
         if total_entries == 0:
             print("WARNING: No latent activations were recorded.")
         out_dir = Path(
-            f"cache/delphi_cache_{cfg.evals.causal_auto_interp.r}_{cfg.evals.causal_auto_interp.k}"
+            f"delphi_cache/{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_layer{cfg.model.layer}_toks{exp_cfg.n_tokens}"
         )
         out_dir.mkdir(parents=True, exist_ok=True)
         cache.save_splits(n_splits=4, save_dir=out_dir)
@@ -226,6 +528,36 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
             config = {"hookpoint": hookpoint, "width": widths[hookpoint]}
             with open(hp_dir / "config.json", "w") as f:
                 json.dump(config, f)
+
+        stats_dir = out_dir / "stats"
+        stats_dir.mkdir(parents=True, exist_ok=True)
+        prompts_path = stats_dir / "prompts.jsonl"
+        latent_stats_path = stats_dir / "latent_stats.jsonl"
+        top_prompts_path = stats_dir / "top_prompts.jsonl"
+        _write_jsonl(str(prompts_path), prompt_records)
+
+        latent_stats, top_prompt_records = _collect_latent_stats_from_cache(
+            cache,
+            wrapped_modules,
+            prompt_ids,
+            exp_cfg,
+        )
+
+        _write_jsonl(str(latent_stats_path), latent_stats)
+        _write_jsonl(str(top_prompts_path), top_prompt_records)
+
+        selected_latents, selection_records = _select_latents_from_stats(
+            cfg,
+            latent_stats,
+        )
+        latent_selection_path = getattr(
+            cfg, "latent_selection_path", str(stats_dir / "latent_selection.jsonl")
+        )
+        if selection_records:
+            _write_jsonl(str(latent_selection_path), selection_records)
+            print(
+                f"Selected {len(selected_latents)} latents; wrote selection to {latent_selection_path}"
+            )
     finally:
         for module, original in original_modes.items():
             module.is_topk_experiment = original
@@ -264,11 +596,18 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
     print("ENHANCED INTERPRETABILITY-FOCUSED ANALYSIS")
     print("=" * 60)
 
-    # TODO: Follow the methodology from causal-autointerp-hh
-    interp_results = load_interpretability_rankings()
+    selection_records = _read_jsonl(cfg.latent_selection_path)
+    priority_latents = {}
+    for entry in selection_records:
+        if entry.get("selected") == 1:
+            priority_latents.setdefault(entry["adapter_name"], []).append(
+                entry["feature_idx"]
+            )
 
-    # TODO: select most promising latents
-    priority_latents = get_priority_latents(interp_results, top_k=config.r)
+    topk_modules = [name for name in topk_modules if name in priority_latents]
+    print(
+        f"Loaded priority latents for {len(topk_modules)} modules from {cfg.latent_selection_path}"
+    )
 
     model_type = getattr(cfg.model, "type", "sft_model")
 
@@ -278,8 +617,8 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
         modules=topk_modules,
         latents={
             # Focus on most interpretable latents only
-            name: torch.tensor(priority_latents[idx + 1], dtype=torch.long)
-            for idx, name in enumerate(topk_modules)
+            name: torch.tensor(priority_latents[name], dtype=torch.long)
+            for name in topk_modules
         },
         tokenizer=tokenizer,
         sampler_cfg=SamplerConfig(
