@@ -29,7 +29,6 @@ from src.utils import hh_string_to_messages, autointerp_violates_alternation
 import logging
 
 # Add path for our improvements
-sys.path.append("/scratch/network/ssd/marek/lora_interp/src")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
