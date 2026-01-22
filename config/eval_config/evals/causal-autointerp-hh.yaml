@@ -1,7 +1,7 @@
 name: causal-autointerp-framework # Eval name for logging/selection.
 # output_dir: eval_outputs/causal_autointerp_framework_mlp # Output folder for all artifacts.
 # output_dir: eval_outputs/causal_autointerp_framework_attn # Output folder for all artifacts.
-output_dir: eval_outputs/causal_autointerp_framework_${model.r}_${model.k}_attn # Output folder for all artifacts.
+output_dir: eval_outputs/causal_autointerp_framework/${model.module_type.name}_k${model.k}_r${model.r}_layer${model.layer} # Output folder for all artifacts.
 
 dataset: # Prompt source configuration (HH-RLHF).
   name: Anthropic/hh-rlhf # Hugging Face dataset ID.
