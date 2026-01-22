@@ -233,11 +233,11 @@ def metrics():
 def auto_interp():
     def eval_auto_interp(cfg):
         model, tokenizer, wrapped_modules = init_model_tokenizer_fixed(cfg.model)
-        if cfg.evals.auto_interp.collect_activations:
+        if bool(cfg.evals.auto_interp.activation_collection.enabled):
             print("Collecting activations...")
-            torch.set_float32_matmul_precision("high")
+            torch.backends.cudnn.conv.fp32_precision = "tf32"
             delphi_collect_activations(cfg, model, tokenizer, wrapped_modules)
-        delphi_score(cfg, model, tokenizer, wrapped_modules)
+        # delphi_score(cfg, model, tokenizer, wrapped_modules)
         return
 
     return eval_auto_interp
