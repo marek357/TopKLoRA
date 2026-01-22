@@ -13,7 +13,7 @@ import os
 import random
 import hashlib
 import heapq
-from typing import Any, Dict, Iterable, List, Tuple, Literal
+from typing import Any, Dict, List, Tuple, Literal
 
 import numpy as np
 import torch
@@ -25,6 +25,12 @@ from src.models import TopKLoRALinearSTE, _hard_topk_mask
 from src.steering import FeatureSteeringContext, list_available_adapters
 from src.utils import hh_string_to_messages, generate_completions_from_prompts
 from src.causal_explainer import run_explainer
+from src.autointerp_utils import (
+    _ensure_dir,
+    _write_jsonl,
+    _read_jsonl,
+    build_latent_index,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -39,30 +45,9 @@ def _select_device() -> torch.device:
     return torch.device("cpu")
 
 
-def _ensure_dir(path: str) -> None:
-    """Create the directory and parents if they do not already exist."""
-    os.makedirs(path, exist_ok=True)
-
-
 def _stable_hash(text: str) -> str:
     """Return a short stable hash for deriving IDs from prompt text."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-
-
-def _write_jsonl(path: str, records: Iterable[Dict[str, Any]]) -> None:
-    """Write a sequence of records to a JSONL file."""
-    _ensure_dir(os.path.dirname(path))
-    with open(path, "w", encoding="utf-8") as f:
-        for rec in records:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-
-def _read_jsonl(path: str) -> List[Dict[str, Any]]:
-    """Read a JSONL file into a list of dictionaries."""
-    if not os.path.exists(path):
-        return []
-    with open(path, "r", encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
 
 
 def _render_prompt(tokenizer, prompt: str) -> str:
@@ -582,7 +567,7 @@ def run_autointerp_framework(cfg, model, tokenizer) -> None:
         all_prompts = _read_jsonl(prompts_path)
 
     modules = _list_topk_modules(model)
-    latent_index = _build_latent_index(modules)
+    latent_index, _ = build_latent_index(modules)
 
     with open(latent_index_path, "w", encoding="utf-8") as f:
         json.dump(latent_index, f, indent=2)
@@ -607,7 +592,7 @@ def run_autointerp_framework(cfg, model, tokenizer) -> None:
 
     selected_latents = latent_index
     selection_records: List[Dict[str, Any]] = []
-    if latent_stats:
+    if eval_cfg.stages.latent_selection:
         selected_latents, selection_records = _select_latents(
             cfg,
             latent_index,
@@ -615,6 +600,12 @@ def run_autointerp_framework(cfg, model, tokenizer) -> None:
         )
         if selection_records:
             _write_jsonl(latent_selection_path, selection_records)
+    else:
+        selection_records = _read_jsonl(latent_selection_path)
+        selected_latents = [
+            entry for entry in selection_records if entry.get("selected") == 1
+        ]
+        logging.info(f"Loaded {len(selected_latents)} selected latents from file.")
 
     # Log selected latents per adapter
     if selected_latents:

@@ -90,7 +90,8 @@ llm: # Explainer/verifier model settings.
 stages: # Pipeline stage toggles.
   prompts: false # Build prompt records.
   latent_stats: false # Collect latent activation stats.
-  evidence_explainer: false # Generate training evidence packs.
+  latent_selection: false # Select latents.
+  evidence_explainer: true # Generate training evidence packs.
   evidence_verifier: false # Generate eval evidence packs.
   hypothesis: true # Generate hypotheses via explainer.
   verification: true # Run blind + hypothesis verification.
