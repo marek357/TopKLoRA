@@ -563,56 +563,49 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
 
 
 def delphi_score(cfg, model, tokenizer, wrapped_modules):
-    config = (
-        cfg.evals.causal_auto_interp
-        if hasattr(cfg.evals, "causal_auto_interp")
-        else cfg.evals.topk_lora_autointerp
-    )
-
+    cfg_exp = cfg.evals.auto_interp.delphi_scoring
     # Create model-specific identifier string based on config
-    # Format: {model_type}_{r}_{k}
-    model_type = getattr(cfg.model, "type", "unknown")
-    r_val = getattr(cfg.model, "r", config.r)
-    k_val = getattr(cfg.model, "k", config.k)
-    model_str = f"{model_type}_{r_val}_{k_val}"
+    model_str = f"{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_layer{cfg.model.layer}"
 
     topk_modules = [
-        # filter out query projections -- these have already been analyzed
         f"{name}.topk"
         for name, _ in wrapped_modules.items()
-        if "q_proj" not in name
+        # if "q_proj" not in name  # filter out query projections -- these have already been analyzed
     ]
-    print(topk_modules)
-    topk_modules = [elem for elem in topk_modules if "18" in elem]
-    print(f"Filtered to layer 18 modules: {topk_modules}")
-    # assert False, "Debug stop"
+
+    logging.info(f"Initial topk modules: {topk_modules}")
+    topk_modules = [elem for elem in topk_modules if str(cfg.model.layer) in elem]
+    logging.info(f"Filtered to layer {cfg.model.layer} modules: {topk_modules}")
+
     model.cpu()
     del model
     del wrapped_modules
 
-    # Load interpretability rankings and get priority latents
-    print("\n" + "=" * 60)
-    print("ENHANCED INTERPRETABILITY-FOCUSED ANALYSIS")
-    print("=" * 60)
+    selection_path = f"delphi_cache/{model_str}/stats/latent_selection.jsonl"
 
-    selection_records = _read_jsonl(cfg.latent_selection_path)
+    # Load interpretability rankings and get priority latents
+    selection_records = _read_jsonl(selection_path)
     priority_latents = {}
+    selected_latents_counter = 0
     for entry in selection_records:
         if entry.get("selected") == 1:
             priority_latents.setdefault(entry["adapter_name"], []).append(
                 entry["feature_idx"]
             )
+            selected_latents_counter += 1
 
     topk_modules = [name for name in topk_modules if name in priority_latents]
-    print(
-        f"Loaded priority latents for {len(topk_modules)} modules from {cfg.latent_selection_path}"
+    logging.info(
+        f"Loaded {selected_latents_counter} priority latents for {len(topk_modules)} modules from {selection_path}"
     )
 
-    model_type = getattr(cfg.model, "type", "sft_model")
+    # TODO: Checked until here
 
     # 1) Load the raw cache you saved
     dataset = LatentDataset(
-        raw_dir=Path(f"cache/{model_type}/layer_full/{config.r}_{config.k}"),
+        raw_dir=Path(
+            f"delphi_cache/{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_layer{cfg.model.layer}"
+        ),
         modules=topk_modules,
         latents={
             # Focus on most interpretable latents only
@@ -660,52 +653,55 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
 
     # GPU Memory Management Configuration
 
+    num_gpus = 1
     # Clear any existing CUDA cache
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        # Use GPUs 0 and 3 (both completely free)
+        # os.environ["CUDA_VISIBLE_DEVICES"] = "0,3"
+        # Set PyTorch CUDA memory management for fragmentation
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        num_gpus = len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
 
-    # Based on testing, the optimal configuration is:
-    # - Single GPU (GPU 0, 3, or 4 are all free)
-    # - Conservative memory settings to avoid OOM errors
-    # - Reduced context length to fit in memory
+        logging.info(
+            f"🔧 Using GPUs: {os.environ['CUDA_VISIBLE_DEVICES']} (multi-GPU with tensor parallelism)"
+        )
 
-    # Use GPUs 0 and 3 (both completely free)
-    # os.environ["CUDA_VISIBLE_DEVICES"] = "0,3"
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
-    print(
-        f"🔧 Using GPUs: {os.environ['CUDA_VISIBLE_DEVICES']} (multi-GPU with tensor parallelism)"
-    )
-
-    # Set PyTorch CUDA memory management for fragmentation
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
-    num_gpus = len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
+    explainer_config = cfg_exp.explainer_model_config
 
     client = Offline(
-        "Qwen/Qwen3-30B-A3B-Thinking-2507",
-        num_gpus=4,  # TP=2
-        max_model_len=18000,  # smaller KV → faster & safer
-        max_memory=0.65,
-        prefix_caching=False,
-        batch_size=1,
+        explainer_config.model_name,
+        num_gpus=num_gpus,  # TP=2
+        max_model_len=explainer_config.max_model_len,  # smaller KV → faster & safer
+        max_memory=explainer_config.max_memory,  # GB per GPU
+        prefix_caching=explainer_config.prefix_caching,
+        batch_size=explainer_config.batch_size,
         enforce_eager=False,  # allow CUDA graphs
-        number_tokens_to_generate=14_500,
+        number_tokens_to_generate=explainer_config.number_tokens_to_generate,
         # max_num_batched_tokens=3072,
     )
 
     # Add device attribute for SurprisalScorer compatibility
-    client.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    client.device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "mps"
+        if torch.backends.mps.is_available()
+        else "cpu"
+    )
 
-    print("✅ Model loaded successfully with multi-GPU tensor parallelism!")
-    print(f"   - GPUs: {os.environ['CUDA_VISIBLE_DEVICES']} (tensor parallelism)")
+    if torch.cuda.is_available():
+        logging.info("✅ Model loaded successfully with multi-GPU tensor parallelism!")
+        logging.info(
+            f"   - GPUs: {os.environ['CUDA_VISIBLE_DEVICES']} (tensor parallelism)"
+        )
+    else:
+        logging.info(f"✅ Model loaded successfully on {client.device}!")
 
-    openai_run = False
-    if not openai_run:
+    if not cfg_exp.use_openai_simulator:
         # TODO may have to modify to adapt for cot (not originally implemented)
-        explainer = DefaultExplainer(client, cot=True)
-        # explainer = CachedExplainer(
-        # base_explainer, cache=llm_cache, tokenizer=tokenizer)
+        # explainer = DefaultExplainer(client, cot=True)
+        explainer = DefaultExplainer(client, cot=False)
         explainer_pipe = process_wrapper(
             explainer,
             postprocess=lambda x: save_explanation(x, model_str, "enhanced_default"),
@@ -714,28 +710,10 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
         detection_scorer = DetectionScorer(
             client, tokenizer=tokenizer, n_examples_shown=5
         )
-        # detection_scorer = CachedDetectionScorer(
-        #     base_detection_scorer, cache=llm_cache)
-
-        # Enhanced preprocessing and scoring
-        def preprocess(explained):
-            rec = explained.record
-            rec.explanation = explained.explanation
-            rec.extra_examples = rec.not_active
-            return rec
-
-        detection_pipe = process_wrapper(
-            detection_scorer,
-            preprocess=preprocess,
-            postprocess=lambda x: save_score(x, model_str, "enhanced_detection"),
-        )
 
         # Enhanced pipeline with multiple scoring methods
-        print(
+        logging.info(
             f"Running enhanced interpretability analysis on {len(priority_latents)} latents"
-        )
-        print(
-            f"Analysis includes: explanations, detection scoring, and surprisal analysis"
         )
 
         # Multi-stage pipeline
@@ -753,7 +731,7 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
                 det_result = await detection_scorer(rec)
                 save_score(det_result, _model_str, "enhanced_detection")
             except Exception as e:
-                print(f"Detection scoring failed for {rec.latent}: {e}")
+                logging.error(f"Detection scoring failed for {rec.latent}: {e}")
 
             return explained
 
@@ -788,21 +766,21 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
             sim_pipe,  # runs simulation scoring in one stage
         )
 
-    # Reduce concurrency to prevent memory issues
-    # With the 32B model, we need to be very conservative with parallel processing
-    max_concurrent = 3  # Process one at a time to avoid memory pressure
+    max_concurrent = int(getattr(cfg_exp, "max_concurrent", 1))
 
     asyncio.run(pipeline.run(max_concurrent=max_concurrent))
 
-    print(f"✅ Pipeline completed with max_concurrent={max_concurrent} (memory-safe)")
-
+    logging.info(
+        f"✅ Pipeline completed with max_concurrent={max_concurrent} (memory-safe)"
+    )
     # Generate summary after analysis
-    print(f"\n{'=' * 60}")
-    print("ENHANCED INTERPRETABILITY ANALYSIS COMPLETE")
-    print(f"{'=' * 60}")
-    print(f"Analyzed {len(priority_latents)} most interpretable latents")
-    print(f"Model identifier: {model_str}")
-    print(f"Results saved to:")
-    print(f"  - Explanations: autointerp/{model_str}/explanations/enhanced_default/")
-    print(f"  - Detection scores: autointerp/{model_str}/scores/enhanced_detection/")
-    print(f"{'=' * 60}\n")
+    logging.info(f"\n{'=' * 60}")
+    logging.info("ENHANCED INTERPRETABILITY ANALYSIS COMPLETE")
+    logging.info(f"Results saved to:")
+    logging.info(
+        f"  - Explanations: autointerp/{model_str}/explanations/enhanced_default/"
+    )
+    logging.info(
+        f"  - Detection scores: autointerp/{model_str}/scores/enhanced_detection/"
+    )
+    logging.info(f"{'=' * 60}\n")

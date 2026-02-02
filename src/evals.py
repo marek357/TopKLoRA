@@ -237,7 +237,8 @@ def auto_interp():
             print("Collecting activations...")
             torch.backends.cudnn.conv.fp32_precision = "tf32"
             delphi_collect_activations(cfg, model, tokenizer, wrapped_modules)
-        # delphi_score(cfg, model, tokenizer, wrapped_modules)
+        if bool(cfg.evals.auto_interp.delphi_scoring.enabled):
+            delphi_score(cfg, model, tokenizer, wrapped_modules)
         return
 
     return eval_auto_interp

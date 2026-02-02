@@ -18,8 +18,8 @@ name: auto-interpret
 # chat_system_prompt: "You are a helpful assistant."
 
 activation_collection:
-  enabled: true
-  n_tokens: 10000
+  enabled: false
+  n_tokens: 100000
   seq_len: 256
   top_prompt_count: 100
   max_batches: 500000
@@ -31,11 +31,26 @@ activation_collection:
 
 # selection of top latents to analyse
 latent_selection:
-  enabled: true
+  enabled: false
   max_latents: 128
   p_active_min: 0.01
   p_active_max: 0.8
   dead_p_active_max: 0.0099
+
+delphi_scoring:
+  enabled: true
+
+  use_openai_simulator: false
+
+  explainer_model_config:
+    # model_name: Qwen/Qwen3-30B-A3B-Thinking-2507
+    model_name: gpt2
+    max_model_len: 18000
+    max_memory: 0.65
+    prefix_cachin: false
+    batch_size: 1
+    number_of_tokens_to_generate: 14500
+    max_concurrent: 1 # Process one at a time to avoid memory pressure
 
 seed: 42
 build_eval_function:
