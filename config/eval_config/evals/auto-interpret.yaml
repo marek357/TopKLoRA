@@ -14,11 +14,10 @@ activation_collection:
 
 # selection of top latents to analyse
 latent_selection:
-  enabled: false
+  enabled: true
   max_latents: 128
   p_active_min: 0.01
-  p_active_max: 0.8
-  dead_p_active_max: 0.0099
+  p_active_max: 0.9
 
 # delphi scoring
 delphi_scoring:

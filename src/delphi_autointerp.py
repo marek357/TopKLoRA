@@ -258,14 +258,11 @@ def _select_latents_from_stats(cfg, latent_stats):
 
     p_active_min = float(getattr(sel_cfg, "p_active_min"))
     p_active_max = float(getattr(sel_cfg, "p_active_max"))
-    dead_max = float(getattr(sel_cfg, "dead_p_active_max"))
     max_latents = int(getattr(sel_cfg, "max_latents"))
 
     candidate_entries = []
     for stats in latent_stats:
         p_active = float(stats.get("p_active", 0.0))
-        if p_active <= dead_max:
-            continue
         if p_active < p_active_min or p_active > p_active_max:
             continue
         candidate_entries.append(stats)
@@ -547,21 +544,38 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
         _write_jsonl(str(latent_stats_path), latent_stats)
         _write_jsonl(str(top_prompts_path), top_prompt_records)
 
-        selected_latents, selection_records = _select_latents_from_stats(
-            cfg,
-            latent_stats,
-        )
-        latent_selection_path = getattr(
-            cfg, "latent_selection_path", str(stats_dir / "latent_selection.jsonl")
-        )
-        if selection_records:
-            _write_jsonl(str(latent_selection_path), selection_records)
-            print(
-                f"Selected {len(selected_latents)} latents; wrote selection to {latent_selection_path}"
-            )
     finally:
         for module, original in original_modes.items():
             module.is_topk_experiment = original
+
+    if bool(cfg.evals.auto_interp.latent_selection.enabled):
+        delphi_select_latents(cfg)
+
+
+def delphi_select_latents(cfg):
+    stats_dir = Path(
+        f"delphi_cache/{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_layer{cfg.model.layer}/stats"
+    )
+    if not os.path.exists(stats_dir):
+        raise ValueError(f"Stats dir not found: {stats_dir}")
+
+    latent_stats_path = stats_dir / "latent_stats.jsonl"
+    if not os.path.exists(latent_stats_path):
+        raise ValueError(f"Latent stats file not found: {latent_stats_path}")
+
+    latent_stats = _read_jsonl(latent_stats_path)
+    selected_latents, selection_records = _select_latents_from_stats(
+        cfg,
+        latent_stats,
+    )
+    latent_selection_path = getattr(
+        cfg, "latent_selection_path", str(stats_dir / "latent_selection.jsonl")
+    )
+    if selection_records:
+        _write_jsonl(str(latent_selection_path), selection_records)
+        print(
+            f"Selected {len(selected_latents)} latents; wrote selection to {latent_selection_path}"
+        )
 
 
 def delphi_score(cfg, model, tokenizer, wrapped_modules):
@@ -617,7 +631,7 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
         tokenizer=tokenizer,
         # TODO: Figure out what is the optimal config here.
         sampler_cfg=SamplerConfig(
-            n_examples_train=60,  # Increased training examples for better analysis
+            n_examples_train=50,  # Increased training examples for better analysis
             n_examples_test=40,  # More test examples for robust evaluation
             n_quantiles=10,  # Standard quantile analysis
             train_type="mix",  # Mixed sampling for diverse training examples

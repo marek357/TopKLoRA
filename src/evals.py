@@ -22,6 +22,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from src.autointerp_framework_hh import run_autointerp_framework
 from src.delphi_autointerp import (
     delphi_collect_activations,
+    delphi_select_latents,
     delphi_score,
 )
 from src.models import TopKLoRALinearSTE
@@ -237,6 +238,8 @@ def auto_interp():
             print("Collecting activations...")
             torch.backends.cudnn.conv.fp32_precision = "tf32"
             delphi_collect_activations(cfg, model, tokenizer, wrapped_modules)
+        elif bool(cfg.evals.auto_interp.latent_selection.enabled):
+            delphi_select_latents(cfg)
         if bool(cfg.evals.auto_interp.delphi_scoring.enabled):
             delphi_score(cfg, model, tokenizer, wrapped_modules)
         return
