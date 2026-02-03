@@ -27,6 +27,8 @@ from torch.utils.data import DataLoader
 from src.autointerp_utils import _read_jsonl, _write_jsonl, build_latent_index
 from src.utils import hh_string_to_messages, autointerp_violates_alternation
 import logging
+from dotenv import load_dotenv
+from src.openai_client import OpenAIClient
 
 # Add path for our improvements
 
@@ -513,7 +515,7 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
         if total_entries == 0:
             print("WARNING: No latent activations were recorded.")
         out_dir = Path(
-            f"delphi_cache/{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_layer{cfg.model.layer}_toks{exp_cfg.n_tokens}"
+            f"delphi_cache/{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_layer{cfg.model.layer}"
         )
         out_dir.mkdir(parents=True, exist_ok=True)
         cache.save_splits(n_splits=4, save_dir=out_dir)
@@ -589,7 +591,8 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
     selected_latents_counter = 0
     for entry in selection_records:
         if entry.get("selected") == 1:
-            priority_latents.setdefault(entry["adapter_name"], []).append(
+            # make sure to add ".topk" suffix
+            priority_latents.setdefault(entry["adapter_name"] + ".topk", []).append(
                 entry["feature_idx"]
             )
             selected_latents_counter += 1
@@ -599,8 +602,7 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
         f"Loaded {selected_latents_counter} priority latents for {len(topk_modules)} modules from {selection_path}"
     )
 
-    # TODO: Checked until here
-
+    logging.info(f"Topk modules after filtering: {topk_modules}")
     # 1) Load the raw cache you saved
     dataset = LatentDataset(
         raw_dir=Path(
@@ -613,8 +615,9 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
             for name in topk_modules
         },
         tokenizer=tokenizer,
+        # TODO: Figure out what is the optimal config here.
         sampler_cfg=SamplerConfig(
-            n_examples_train=30,  # Increased training examples for better analysis
+            n_examples_train=60,  # Increased training examples for better analysis
             n_examples_test=40,  # More test examples for robust evaluation
             n_quantiles=10,  # Standard quantile analysis
             train_type="mix",  # Mixed sampling for diverse training examples
@@ -628,7 +631,7 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
             # faiss_embedding_cache_enabled=True,
             # faiss_embedding_cache_dir=".embedding_cache",
             # example_ctx_len=32,      # Context length for examples
-            # min_examples=200,        # Minimum examples for robust analysis
+            # min_examples=200,  # Minimum examples for robust analysis
             # n_non_activating=20,     # Non-activating examples for contrast
             # center_examples=True,    # Center examples for better analysis
             # non_activating_source="FAISS",  # Use FAISS for better negative examples
@@ -636,67 +639,107 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
         ),
     )
 
-    # 2) Build your explainer client + explainer
-    # class OpenRouter(Client):
-    # def __init__(
-    #     self,
-    #     model: str,
-    #     api_key: str | None = None,
-    #     base_url="https://openrouter.ai/api/v1/chat/completions",
-    #     max_tokens: int = 3000,
-    #     temperature: float = 1.0,
-    # ):
-    # client = OpenRouter(
-    #     "Qwen/Qwen2.5-32B-Instruct-AWQ",
-    #     max_tokens=25_768, base_url="http://127.0.0.1:8081/v1/chat/completions"
-    # )
-
-    # GPU Memory Management Configuration
-
-    num_gpus = 1
-    # Clear any existing CUDA cache
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        # Use GPUs 0 and 3 (both completely free)
-        # os.environ["CUDA_VISIBLE_DEVICES"] = "0,3"
-        # Set PyTorch CUDA memory management for fragmentation
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-        num_gpus = len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
-
-        logging.info(
-            f"🔧 Using GPUs: {os.environ['CUDA_VISIBLE_DEVICES']} (multi-GPU with tensor parallelism)"
-        )
-
-    explainer_config = cfg_exp.explainer_model_config
-
-    client = Offline(
-        explainer_config.model_name,
-        num_gpus=num_gpus,  # TP=2
-        max_model_len=explainer_config.max_model_len,  # smaller KV → faster & safer
-        max_memory=explainer_config.max_memory,  # GB per GPU
-        prefix_caching=explainer_config.prefix_caching,
-        batch_size=explainer_config.batch_size,
-        enforce_eager=False,  # allow CUDA graphs
-        number_tokens_to_generate=explainer_config.number_tokens_to_generate,
-        # max_num_batched_tokens=3072,
+    scoring_cfg = getattr(cfg_exp, "scoring_client", None)
+    provider = (
+        str(getattr(scoring_cfg, "provider", "offline")).strip().lower()
+        if scoring_cfg is not None
+        else "offline"
     )
 
-    # Add device attribute for SurprisalScorer compatibility
-    client.device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.backends.mps.is_available()
-        else "cpu"
-    )
+    if provider == "offline":
+        # GPU Memory Management Configuration
+        num_gpus = 1
+        # Clear any existing CUDA cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            # Set PyTorch CUDA memory management for fragmentation
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+            visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+            num_gpus = len(visible_devices.split(","))
 
-    if torch.cuda.is_available():
-        logging.info("✅ Model loaded successfully with multi-GPU tensor parallelism!")
-        logging.info(
-            f"   - GPUs: {os.environ['CUDA_VISIBLE_DEVICES']} (tensor parallelism)"
+            logging.info(
+                f"🔧 Using GPUs: {visible_devices} (multi-GPU with tensor parallelism)"
+            )
+
+        explainer_config = scoring_cfg.offline_config
+
+        client = Offline(
+            explainer_config.model_name,
+            num_gpus=num_gpus,
+            max_model_len=explainer_config.max_model_len,  # smaller KV → faster & safer
+            max_memory=explainer_config.max_memory,  # GB per GPU
+            prefix_caching=explainer_config.prefix_caching,
+            batch_size=explainer_config.batch_size,
+            enforce_eager=explainer_config.enforce_eager,  # allow CUDA graphs
+            number_tokens_to_generate=explainer_config.number_tokens_to_generate,
+            # max_num_batched_tokens=3072,
         )
+
+        # Add device attribute for SurprisalScorer compatibility
+        client.device = torch.device(
+            "cuda"
+            if torch.cuda.is_available()
+            else "mps"
+            if torch.backends.mps.is_available()
+            else "cpu"
+        )
+
+        if torch.cuda.is_available():
+            logging.info(
+                "✅ Model loaded successfully with multi-GPU tensor parallelism!"
+            )
+            logging.info(
+                f"   - GPUs: {os.environ.get('CUDA_VISIBLE_DEVICES', '0')} (tensor parallelism)"
+            )
+        else:
+            logging.info(f"✅ Model loaded successfully on {client.device}!")
+    elif provider == "openai":
+        load_dotenv()
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "OPENAI_API_KEY is not set. Add it to your .env file or environment."
+            )
+
+        explainer_config = scoring_cfg.openai_config
+        openai_model = getattr(explainer_config, "openai_model", "gpt-4o-mini")
+        openai_base_url = getattr(explainer_config, "openai_base_url", None)
+        openai_temperature = float(getattr(explainer_config, "openai_temperature", 0.0))
+        openai_max_tokens = int(getattr(explainer_config, "openai_max_tokens", 3000))
+        openai_timeout = float(getattr(explainer_config, "openai_timeout", 60.0))
+        cost_monitor_enabled = bool(
+            getattr(explainer_config, "cost_monitor_enabled", False)
+        )
+        cost_monitor_every_n_requests = int(
+            getattr(explainer_config, "cost_monitor_every_n_requests", 10)
+        )
+        input_cost_per_1m = getattr(explainer_config, "input_cost_per_1m", None)
+        output_cost_per_1m = getattr(explainer_config, "output_cost_per_1m", None)
+        if input_cost_per_1m is not None:
+            input_cost_per_1m = float(input_cost_per_1m)
+        if output_cost_per_1m is not None:
+            output_cost_per_1m = float(output_cost_per_1m)
+
+        client = OpenAIClient(
+            openai_model,
+            api_key=api_key,
+            base_url=openai_base_url,
+            max_tokens=openai_max_tokens,
+            temperature=openai_temperature,
+            timeout=openai_timeout,
+            tokenizer=tokenizer,
+            cost_monitor_enabled=cost_monitor_enabled,
+            cost_monitor_every_n_requests=cost_monitor_every_n_requests,
+            input_cost_per_1m=input_cost_per_1m,
+            output_cost_per_1m=output_cost_per_1m,
+        )
+
+        client.device = torch.device("cpu")
+        logging.info(f"✅ Using OpenAI API model: {openai_model}")
     else:
-        logging.info(f"✅ Model loaded successfully on {client.device}!")
+        raise ValueError(
+            f"Unknown scoring client provider '{provider}'. Use 'offline' or 'openai'."
+        )
 
     if not cfg_exp.use_openai_simulator:
         # TODO may have to modify to adapt for cot (not originally implemented)
@@ -776,7 +819,7 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
     # Generate summary after analysis
     logging.info(f"\n{'=' * 60}")
     logging.info("ENHANCED INTERPRETABILITY ANALYSIS COMPLETE")
-    logging.info(f"Results saved to:")
+    logging.info("Results saved to:")
     logging.info(
         f"  - Explanations: autointerp/{model_str}/explanations/enhanced_default/"
     )
