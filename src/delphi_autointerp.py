@@ -295,6 +295,173 @@ def _select_latents_from_stats(cfg, latent_stats):
     return selected_entries, selection_records
 
 
+def build_hookpoint_offsets(wrapped_modules):
+    """
+    Build a mapping from hookpoint names to their global latent ID offsets.
+    Assigns unique global IDs to latents across all hookpoints.
+
+    Args:
+        wrapped_modules: Dictionary of module name -> TopKLoRALinearSTE module.
+
+    Returns:
+        tuple: (hookpoint_offsets, hookpoint_widths, total_latents)
+            - hookpoint_offsets: dict mapping hookpoint name to global ID offset
+            - hookpoint_widths: dict mapping hookpoint name to latent width
+            - total_latents: total number of latents across all hookpoints
+    """
+    hookpoint_offsets = {}
+    hookpoint_widths = {}
+    offset = 0
+
+    for name, module in wrapped_modules.items():
+        hookpoint = f"{name}.topk"
+        width = module.r
+        hookpoint_offsets[hookpoint] = offset
+        hookpoint_widths[hookpoint] = width
+        offset += width
+
+    total_latents = offset
+    logging.info(
+        f"Built hookpoint offsets: {len(hookpoint_offsets)} hookpoints, "
+        f"{total_latents} total latents"
+    )
+    return hookpoint_offsets, hookpoint_widths, total_latents
+
+
+def compute_co_occurrence_from_cache(cache, wrapped_modules):
+    """
+    Compute co-occurrence statistics from cached latent activations.
+
+    For each position (batch_idx, seq_idx), finds all latents that fired
+    and increments co-occurrence counts for each pair.
+
+    Args:
+        cache: LatentCache object with populated cache.latent_locations
+        wrapped_modules: Dictionary of module name -> TopKLoRALinearSTE module
+
+    Returns:
+        tuple: (co_occurrence, hookpoint_meta)
+            - co_occurrence: dict[int, dict[int, int]] where
+                co_occurrence[latent_a][latent_b] = count of positions
+                where both latents fired together
+            - hookpoint_meta: dict with offsets, widths, total_latents
+    """
+    from collections import defaultdict
+    from tqdm import tqdm
+
+    hookpoint_offsets, hookpoint_widths, total_latents = build_hookpoint_offsets(
+        wrapped_modules
+    )
+
+    # Group all active latents by position (batch_idx, seq_idx)
+    position_to_latents = defaultdict(list)
+
+    for hookpoint, locations in cache.cache.latent_locations.items():
+        if locations is None or locations.numel() == 0:
+            continue
+
+        offset = hookpoint_offsets.get(hookpoint, 0)
+        locations_np = locations.numpy()
+
+        for i in range(locations_np.shape[0]):
+            batch_idx = int(locations_np[i, 0])
+            seq_idx = int(locations_np[i, 1])
+            local_latent_idx = int(locations_np[i, 2])
+            global_latent_id = offset + local_latent_idx
+
+            position_to_latents[(batch_idx, seq_idx)].append(global_latent_id)
+
+    # Compute co-occurrence counts
+    co_occurrence = defaultdict(lambda: defaultdict(int))
+
+    n_positions = len(position_to_latents)
+    logging.info(f"Computing co-occurrence across {n_positions} positions...")
+
+    for position, latent_ids in tqdm(
+        position_to_latents.items(), desc="Computing co-occurrence"
+    ):
+        # For each pair of latents at this position, increment co-occurrence
+        latent_ids_sorted = sorted(set(latent_ids))  # dedupe within position
+        n = len(latent_ids_sorted)
+        for i in range(n):
+            latent_a = latent_ids_sorted[i]
+            for j in range(i + 1, n):
+                latent_b = latent_ids_sorted[j]
+                # Store bidirectionally for easy lookup
+                co_occurrence[latent_a][latent_b] += 1
+                co_occurrence[latent_b][latent_a] += 1
+
+    # Convert to regular dicts for serialization
+    co_occurrence = {k: dict(v) for k, v in co_occurrence.items()}
+
+    total_pairs = sum(len(v) for v in co_occurrence.values()) // 2
+    logging.info(
+        f"Co-occurrence computed: {len(co_occurrence)} latents with "
+        f"{total_pairs} unique co-occurring pairs"
+    )
+
+    hookpoint_meta = {
+        "offsets": hookpoint_offsets,
+        "widths": hookpoint_widths,
+        "total_latents": total_latents,
+    }
+
+    return co_occurrence, hookpoint_meta
+
+
+def get_latent_info(global_latent_id, hookpoint_offsets, hookpoint_widths):
+    """
+    Get hookpoint and local index for a global latent ID.
+
+    Args:
+        global_latent_id: The global latent ID.
+        hookpoint_offsets: dict mapping hookpoint name to global ID offset
+        hookpoint_widths: dict mapping hookpoint name to latent width
+
+    Returns:
+        dict with 'hookpoint', 'local_idx', and 'global_id' keys.
+    """
+    for hookpoint, offset in hookpoint_offsets.items():
+        width = hookpoint_widths.get(hookpoint, 0)
+        if offset <= global_latent_id < offset + width:
+            return {
+                "hookpoint": hookpoint,
+                "local_idx": global_latent_id - offset,
+                "global_id": global_latent_id,
+            }
+    return {"hookpoint": None, "local_idx": None, "global_id": global_latent_id}
+
+
+def save_co_occurrence(co_occurrence, hookpoint_meta, save_dir):
+    """
+    Save co-occurrence data to disk.
+
+    Args:
+        co_occurrence: dict[int, dict[int, int]] co-occurrence counts
+        hookpoint_meta: dict with offsets, widths, total_latents
+        save_dir: Path to directory where data will be saved
+    """
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save co-occurrence as JSON
+    co_occurrence_path = save_dir / "co_occurrence.json"
+    with open(co_occurrence_path, "w") as f:
+        # Convert int keys to strings for JSON compatibility
+        json_compatible = {
+            str(k): {str(k2): v2 for k2, v2 in v.items()}
+            for k, v in co_occurrence.items()
+        }
+        json.dump(json_compatible, f)
+
+    # Save hookpoint offsets for ID resolution
+    offsets_path = save_dir / "hookpoint_offsets.json"
+    with open(offsets_path, "w") as f:
+        json.dump(hookpoint_meta, f, indent=2)
+
+    logging.info(f"Saved co-occurrence data to {save_dir}")
+
+
 class ChatTemplateCollator:
     def __init__(self, tokenizer, device, max_length=1024, add_generation_prompt=True):
         self.tokenizer = tokenizer
@@ -543,6 +710,16 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
 
         _write_jsonl(str(latent_stats_path), latent_stats)
         _write_jsonl(str(top_prompts_path), top_prompt_records)
+
+        # Compute and save co-occurrence if enabled
+        compute_co_occurrence = bool(getattr(exp_cfg, "compute_co_occurrence", False))
+        if compute_co_occurrence:
+            logging.info("Computing co-occurrence from cache...")
+            co_occurrence, hookpoint_meta = compute_co_occurrence_from_cache(
+                cache, wrapped_modules
+            )
+            save_co_occurrence(co_occurrence, hookpoint_meta, stats_dir)
+            logging.info(f"Saved co-occurrence data to {stats_dir}")
 
     finally:
         for module, original in original_modes.items():

@@ -11,6 +11,7 @@ activation_collection:
   dataset_split: train
   dataset_continuation: rejected # or "chosen" or "null" for randomly selected
   dataset_config_name: null
+  compute_co_occurrence: true # compute latent co-occurrence statistics across all hookpoints
 
 # selection of top latents to analyse
 latent_selection:
