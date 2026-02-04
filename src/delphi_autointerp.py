@@ -452,7 +452,7 @@ def save_co_occurrence(co_occurrence, hookpoint_meta, save_dir):
             str(k): {str(k2): v2 for k2, v2 in v.items()}
             for k, v in co_occurrence.items()
         }
-        json.dump(json_compatible, f)
+        json.dump(json_compatible, f, indent=2)
 
     # Save hookpoint offsets for ID resolution
     offsets_path = save_dir / "hookpoint_offsets.json"
@@ -719,8 +719,6 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
                 cache, wrapped_modules
             )
             save_co_occurrence(co_occurrence, hookpoint_meta, stats_dir)
-            logging.info(f"Saved co-occurrence data to {stats_dir}")
-
     finally:
         for module, original in original_modes.items():
             module.is_topk_experiment = original
