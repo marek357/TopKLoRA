@@ -22,7 +22,8 @@ latent_selection:
 
 # delphi scoring
 delphi_scoring:
-  enabled: true
+  enabled: false
+  max_concurrent: 1 # Maximum concurrent pipeline tasks (applies to all providers)
 
   use_openai_simulator: false
 
@@ -51,7 +52,6 @@ delphi_scoring:
       batch_size: 1
       number_tokens_to_generate: 14500
       enforce_eager: true
-      max_concurrent: 1 # Process one at a time to avoid memory pressure
 
 seed: 42
 build_eval_function:

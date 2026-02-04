@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Union
 import logging
 
@@ -40,6 +41,7 @@ class OpenAIClient(Client):
         self.total_completion_tokens = 0
         self.total_cost = 0.0
         self.request_count = 0
+        self._stats_lock = asyncio.Lock()
 
     async def generate(
         self, prompt: Union[str, list[dict[str, str]]], **kwargs
@@ -68,45 +70,48 @@ class OpenAIClient(Client):
         )
 
         if prompt_logprobs is not None:
-            # OpenAI chat completions do not provide prompt logprobs.
-            pass
+            logging.warning(
+                "prompt_logprobs requested but OpenAI chat completions API does not support prompt logprobs"
+            )
 
         usage = getattr(response, "usage", None)
         if usage is not None:
             prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
             completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
-            self.total_prompt_tokens += prompt_tokens
-            self.total_completion_tokens += completion_tokens
-            self.request_count += 1
 
-            if self.input_cost_per_1m is not None:
-                self.total_cost += (
-                    prompt_tokens / 1_000_000.0
-                ) * self.input_cost_per_1m
-            if self.output_cost_per_1m is not None:
-                self.total_cost += (
-                    completion_tokens / 1_000_000.0
-                ) * self.output_cost_per_1m
+            async with self._stats_lock:
+                self.total_prompt_tokens += prompt_tokens
+                self.total_completion_tokens += completion_tokens
+                self.request_count += 1
 
-            if self.monitor_enabled and self.monitor_every_n_requests > 0:
-                if self.request_count % self.monitor_every_n_requests == 0:
-                    total_tokens = (
-                        self.total_prompt_tokens + self.total_completion_tokens
-                    )
-                    cost_str = (
-                        f", est. cost=${self.total_cost:.6f}"
-                        if self.input_cost_per_1m is not None
-                        or self.output_cost_per_1m is not None
-                        else ""
-                    )
-                    logging.info(
-                        "OpenAI usage: %d requests, %d tokens (prompt=%d, completion=%d)%s",
-                        self.request_count,
-                        total_tokens,
-                        self.total_prompt_tokens,
-                        self.total_completion_tokens,
-                        cost_str,
-                    )
+                if self.input_cost_per_1m is not None:
+                    self.total_cost += (
+                        prompt_tokens / 1_000_000.0
+                    ) * self.input_cost_per_1m
+                if self.output_cost_per_1m is not None:
+                    self.total_cost += (
+                        completion_tokens / 1_000_000.0
+                    ) * self.output_cost_per_1m
+
+                if self.monitor_enabled and self.monitor_every_n_requests > 0:
+                    if self.request_count % self.monitor_every_n_requests == 0:
+                        total_tokens = (
+                            self.total_prompt_tokens + self.total_completion_tokens
+                        )
+                        cost_str = (
+                            f", est. cost=${self.total_cost:.6f}"
+                            if self.input_cost_per_1m is not None
+                            or self.output_cost_per_1m is not None
+                            else ""
+                        )
+                        logging.info(
+                            "OpenAI usage: %d requests, %d tokens (prompt=%d, completion=%d)%s",
+                            self.request_count,
+                            total_tokens,
+                            self.total_prompt_tokens,
+                            self.total_completion_tokens,
+                            cost_str,
+                        )
 
         message = response.choices[0].message.content or ""
         return Response(text=message, logprobs=None, prompt_logprobs=None)

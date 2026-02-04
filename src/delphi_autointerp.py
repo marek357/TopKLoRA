@@ -27,7 +27,6 @@ from torch.utils.data import DataLoader
 from src.autointerp_utils import _read_jsonl, _write_jsonl, build_latent_index
 from src.utils import hh_string_to_messages, autointerp_violates_alternation
 import logging
-from dotenv import load_dotenv
 from src.openai_client import OpenAIClient
 
 # Add path for our improvements
@@ -567,7 +566,7 @@ def save_score(result, model_str, scorer):
 
 
 def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
-    print("starting activation collection")
+    logging.info("starting activation collection")
     exp_cfg = cfg.evals.auto_interp.activation_collection
 
     if not hasattr(exp_cfg, "dataset_name"):
@@ -670,14 +669,14 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
             n_tokens=n_tokens,
             tokens=tokens_array,
         )
-        print("Cache collection complete. Checking cache contents...")
+        logging.info("Cache collection complete. Checking cache contents...")
         total_entries = 0
         for hookpoint, locations in cache.cache.latent_locations.items():
             num_entries = int(locations.shape[0]) if locations is not None else 0
             total_entries += num_entries
-            print(f"  {hookpoint}: {num_entries} non-zero activations")
+            logging.info(f"  {hookpoint}: {num_entries} non-zero activations")
         if total_entries == 0:
-            print("WARNING: No latent activations were recorded.")
+            logging.info("WARNING: No latent activations were recorded.")
         out_dir = Path(
             f"delphi_cache/{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_layer{cfg.model.layer}"
         )
@@ -748,7 +747,7 @@ def delphi_select_latents(cfg):
     )
     if selection_records:
         _write_jsonl(str(latent_selection_path), selection_records)
-        print(
+        logging.info(
             f"Selected {len(selected_latents)} latents; wrote selection to {latent_selection_path}"
         )
 
@@ -758,11 +757,7 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
     # Create model-specific identifier string based on config
     model_str = f"{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_layer{cfg.model.layer}"
 
-    topk_modules = [
-        f"{name}.topk"
-        for name, _ in wrapped_modules.items()
-        # if "q_proj" not in name  # filter out query projections -- these have already been analyzed
-    ]
+    topk_modules = [f"{name}.topk" for name, _ in wrapped_modules.items()]
 
     logging.info(f"Initial topk modules: {topk_modules}")
     topk_modules = [elem for elem in topk_modules if str(cfg.model.layer) in elem]
@@ -883,7 +878,6 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
         else:
             logging.info(f"✅ Model loaded successfully on {client.device}!")
     elif provider == "openai":
-        load_dotenv()
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ValueError(
@@ -932,8 +926,8 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
 
     if not cfg_exp.use_openai_simulator:
         # TODO may have to modify to adapt for cot (not originally implemented)
-        # explainer = DefaultExplainer(client, cot=True)
-        explainer = DefaultExplainer(client, cot=False)
+        explainer = DefaultExplainer(client, cot=True)
+        # explainer = DefaultExplainer(client)
         explainer_pipe = process_wrapper(
             explainer,
             postprocess=lambda x: save_explanation(x, model_str, "enhanced_default"),
@@ -1009,10 +1003,15 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
     logging.info(f"\n{'=' * 60}")
     logging.info("ENHANCED INTERPRETABILITY ANALYSIS COMPLETE")
     logging.info("Results saved to:")
-    logging.info(
-        f"  - Explanations: autointerp/{model_str}/explanations/enhanced_default/"
-    )
-    logging.info(
-        f"  - Detection scores: autointerp/{model_str}/scores/enhanced_detection/"
-    )
+    if cfg_exp.use_openai_simulator:
+        logging.info(
+            f"  - Simulation scores: autointerp/{model_str}/scores/OpenAISimulator/"
+        )
+    else:
+        logging.info(
+            f"  - Explanations: autointerp/{model_str}/explanations/enhanced_default/"
+        )
+        logging.info(
+            f"  - Detection scores: autointerp/{model_str}/scores/enhanced_detection/"
+        )
     logging.info(f"{'=' * 60}\n")
