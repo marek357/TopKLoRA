@@ -53,6 +53,8 @@ class TopKLoRALinearSTE(nn.Module):
         # "constant" | "linear" | "exp" | "cubic"
         temperature_schedule: str = "linear",
         k_schedule: str = "constant",  # "constant" | "linear" | "exp" | "cubic"
+        # fraction of training used to warm k from k_init to k_final
+        k_warmup_frac: float = 0.2,
         # target k at progress=1
         k_final: Optional[int] = None,
         hard_eval: bool = True,  # use hard mask in eval
@@ -90,12 +92,13 @@ class TopKLoRALinearSTE(nn.Module):
             float(temperature_final) if temperature_final is not None else 0.1 * self.t0
         )
         self.temperature_schedule = temperature_schedule
+        self.k_warmup_frac = max(float(k_warmup_frac), 1e-6)
         self.hard_eval = hard_eval
         self.relu_latents = relu_latents
         self.scale = (
             (self.alpha / self.r)
             if alpha_over_r
-            else (self.alpha / max(self.k_init, 1))
+            else (self.alpha / max(self.k_final, 1))
         )
         self.layer_name = layer_name
         self.topk = TopKModule(k_final)
@@ -250,7 +253,10 @@ class TopKLoRALinearSTE(nn.Module):
     def _current_k(self):
         # p in [0,1]; compress so k finishes warming up by 5% of training
         p = self._progress_scalar
-        warm = min(p / 0.05, 1.0)  # 0..1 grows only during first 5%
+        warm = min(
+            p / self.k_warmup_frac, 1.0
+        )  # 0..1 grows only during first k_warmup_frac
+        # warm = min(p / 0.05, 1.0)  # 0..1 grows only during first 5%
         if self.k_schedule == "constant" or self.k_init == self.k_final:
             return self.k_init
         if self.k_schedule == "linear":
@@ -281,8 +287,8 @@ class TopKLoRALinearSTE(nn.Module):
         else:
             z = z_pre
 
-        # keep both: live for regs, detached for callbacks
-        # self._z_live = z                         # may carry graph
+        # keep both: live for regs (with graph), detached for callbacks
+        self._z_live = z  # carries graph for regularizers
         self._last_z = z.detach()  # safe for logging
 
         tau = self._tau()
@@ -302,8 +308,8 @@ class TopKLoRALinearSTE(nn.Module):
         # g = g_hard.detach() + g_soft - g_soft.detach()
         g = g_hard + g_soft - g_soft.detach()
 
-        # keep both: live for regs, detached for callbacks
-        # self._g_soft_live = g_soft               # may carry graph
+        # keep both: live for regs (with graph), detached for callbacks
+        self._g_soft_live = g_soft  # carries graph for usage regularizer
         self._last_g_soft = g_soft.detach()
 
         self._last_ghard_mean = g.mean().detach()

@@ -141,7 +141,12 @@ def load_base_model_for_eval(cfg):
 
 def metrics():
     def eval_metrics(cfg):
-        model, tokenizer, _ = init_model_tokenizer_fixed(cfg.model)
+        if cfg.evals.metrics.eval_base_model:
+            print("Evaluating metrics on the base model...")
+            model, tokenizer = load_base_model_for_eval(cfg)
+        else:
+            print("Evaluating metrics on the adapter model...")
+            model, tokenizer, _ = init_model_tokenizer_fixed(cfg.model)
 
         configs = get_dataset_config_names("HuggingFaceH4/hhh_alignment")
         parts = []
@@ -591,3 +596,583 @@ def perplexity():
         return report
 
     return eval_perplexity
+
+
+def monosemanticity():
+    def eval_monosemanticity(cfg):
+        model, tokenizer, wrapped_modules = init_model_tokenizer_fixed(cfg.model)
+        for name, module in wrapped_modules.items():
+            if not isinstance(module, TopKLoRALinearSTE):
+                print(
+                    f"Module: {module.__class__.__name__} is not an instance of TopKLoRALinearSTE."
+                )
+                print(module)
+                raise ValueError(
+                    "Monosemanticity evaluation requires TopKLoRALinearSTE wrapped modules."
+                )
+            # compute cosine similarity matrix of the LoRA B weights
+            B_weights = module.B_module.weight.detach()  # Shape: (k, in_features)
+            B_weights_norm = F.normalize(B_weights, p=2, dim=1)
+            cosine_sim_matrix = torch.matmul(
+                B_weights_norm, B_weights_norm.t()
+            )  # Shape: (k, k)
+
+            # Exclude self-similarity when computing extrema
+            diag_mask = torch.eye(
+                cosine_sim_matrix.size(0), device=cosine_sim_matrix.device
+            ).bool()
+            cos_for_max = cosine_sim_matrix.masked_fill(diag_mask, float("-inf"))
+            cos_for_min = cosine_sim_matrix.masked_fill(diag_mask, float("inf"))
+
+            max_sim, min_sim = cos_for_max.max().item(), cos_for_min.min().item()
+            print(
+                f"Module: {module.__class__.__name__}, Max Cosine Similarity between LoRA B weights: {max_sim:.4f}, Min Cosine Similarity: {min_sim:.4f}"
+            )
+            avg_sim = cos_for_max[~diag_mask].mean().item()
+            print(
+                f"Module: {module.__class__.__name__}, Average Cosine Similarity between LoRA B weights: {avg_sim:.4f}"
+            )
+
+            median_sim = cos_for_max[~diag_mask].median().item()
+            print(
+                f"Module: {module.__class__.__name__}, Median Cosine Similarity between LoRA B weights: {median_sim:.4f}"
+            )
+
+            # histogram of cosine similarities
+            # terminal friendly histogram
+            hist_bins = torch.histc(cos_for_max[~diag_mask], bins=10, min=-1.0, max=1.0)
+            print(f"Histogram of Cosine Similarities (10 bins from -1 to 1):")
+            for i in range(len(hist_bins)):
+                bin_range_start = -1.0 + i * 0.2
+                bin_range_end = bin_range_start + 0.2
+                print(
+                    f"  Bin {i + 1} [{bin_range_start:.1f}, {bin_range_end:.1f}): {int(hist_bins[i].item())}"
+                )
+
+    return eval_monosemanticity
+
+
+# ==============================================================================
+# TopK Interpretability Evaluation Suite
+# ==============================================================================
+# Comprehensive metrics for evaluating monosemanticity and interpretability
+# of TopK-LoRA adapters. Designed for model diffing workflows.
+# ==============================================================================
+
+
+def _compute_dead_latent_stats(
+    activation_counts: torch.Tensor,
+    total_samples: int,
+    threshold: float = 0.01,
+) -> dict:
+    """
+    Compute dead latent statistics from activation counts.
+
+    Args:
+        activation_counts: [r] tensor of how many samples activated each latent
+        total_samples: Total number of samples processed
+        threshold: Fraction threshold below which a latent is "dead"
+
+    Returns:
+        Dict with dead_count, dead_pct, alive_count, alive_pct
+    """
+    r = activation_counts.size(0)
+    activation_rate = activation_counts.float() / max(total_samples, 1)
+    dead_mask = activation_rate < threshold
+    dead_count = dead_mask.sum().item()
+    return {
+        "dead_count": int(dead_count),
+        "dead_pct": 100.0 * dead_count / r,
+        "alive_count": int(r - dead_count),
+        "alive_pct": 100.0 * (r - dead_count) / r,
+        "threshold": threshold,
+    }
+
+
+def _compute_usage_entropy(activation_counts: torch.Tensor) -> float:
+    """
+    Compute entropy of latent usage distribution.
+    Higher entropy = more uniform usage = better for interpretability.
+    Max entropy = log(r) for uniform distribution.
+
+    Returns normalized entropy in [0, 1].
+    """
+    r = activation_counts.size(0)
+    if r <= 1:
+        return 1.0
+
+    # Normalize to probability distribution
+    total = activation_counts.sum().float()
+    if total == 0:
+        return 0.0
+
+    p = activation_counts.float() / total
+    p = p.clamp(min=1e-10)  # Avoid log(0)
+
+    entropy = -(p * p.log()).sum().item()
+    max_entropy = np.log(r)
+
+    return entropy / max_entropy if max_entropy > 0 else 0.0
+
+
+def _compute_pairwise_correlations(z_activations: torch.Tensor) -> dict:
+    """
+    Compute pairwise correlation statistics between latent activations.
+    Low correlations = more monosemantic (each latent captures different concepts).
+
+    Args:
+        z_activations: [N, r] matrix of latent activations across N samples
+
+    Returns:
+        Dict with mean, max, std of off-diagonal correlations
+    """
+    if z_activations.size(0) < 2:
+        return {"mean_corr": 0.0, "max_corr": 0.0, "std_corr": 0.0}
+
+    # Center the activations
+    z = z_activations.float()
+    z = z - z.mean(dim=0, keepdim=True)
+
+    # Compute correlation matrix
+    std = z.std(dim=0, keepdim=True).clamp(min=1e-8)
+    z_norm = z / std
+    corr = (z_norm.T @ z_norm) / (z_norm.size(0) - 1)
+
+    # Mask diagonal
+    r = corr.size(0)
+    mask = ~torch.eye(r, device=corr.device, dtype=torch.bool)
+    off_diag = corr[mask]
+
+    if off_diag.numel() == 0:
+        return {"mean_corr": 0.0, "max_corr": 0.0, "std_corr": 0.0}
+
+    return {
+        "mean_corr": float(off_diag.abs().mean()),
+        "max_corr": float(off_diag.abs().max()),
+        "std_corr": float(off_diag.std()),
+    }
+
+
+def _compute_weight_orthogonality(weight: torch.Tensor, dim: int) -> float:
+    """
+    Compute orthogonality score for weight matrix.
+    Score of 0 = perfectly orthogonal, higher = more aligned.
+
+    Args:
+        weight: Weight matrix
+        dim: 0 for column orthogonality, 1 for row orthogonality
+    """
+    W = weight.float()
+    if dim == 1:  # rows
+        W_norm = F.normalize(W, p=2, dim=1)
+        G = W_norm @ W_norm.T
+    else:  # cols
+        W_norm = F.normalize(W, p=2, dim=0)
+        G = W_norm.T @ W_norm
+
+    # Mask diagonal
+    mask = ~torch.eye(G.size(0), device=G.device, dtype=torch.bool)
+    off_diag = G[mask]
+
+    if off_diag.numel() == 0:
+        return 0.0
+
+    return float((off_diag**2).mean().sqrt())
+
+
+def _compute_sparsity_stats(g_hard: torch.Tensor, k: int, r: int) -> dict:
+    """
+    Compute sparsity statistics from hard gating values.
+
+    Args:
+        g_hard: Gating tensor (0 or 1)
+        k: Target number of active latents
+        r: Total latent dimension
+    """
+    actual_active = g_hard.sum(dim=-1).float()  # per-sample active count
+
+    return {
+        "mean_active": float(actual_active.mean()),
+        "std_active": float(actual_active.std()) if actual_active.numel() > 1 else 0.0,
+        "target_k": k,
+        "total_r": r,
+        "sparsity_ratio": 1.0 - (float(actual_active.mean()) / r),
+    }
+
+
+def _collect_activations_for_eval(
+    model,
+    tokenizer,
+    wrapped_modules: dict,
+    prompts: list,
+    batch_size: int = 8,
+    max_length: int = 256,
+) -> dict:
+    """
+    Collect latent activations across a set of prompts for analysis.
+
+    Returns:
+        Dict mapping module_name -> {
+            "z_all": [N, r] all activations,
+            "activation_counts": [r] how many times each latent was active,
+            "total_samples": int,
+        }
+    """
+    results = {
+        name: {
+            "z_all": [],
+            "activation_counts": torch.zeros(module.r),
+            "total_samples": 0,
+        }
+        for name, module in wrapped_modules.items()
+        if isinstance(module, TopKLoRALinearSTE)
+    }
+
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model.eval()
+    with torch.no_grad():
+        for start in tqdm(
+            range(0, len(prompts), batch_size), desc="Collecting activations"
+        ):
+            batch = prompts[start : start + batch_size]
+
+            # Tokenize
+            enc = tokenizer(
+                batch,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+            ).to(model.device)
+
+            # Forward pass (activations will be captured in module._last_z)
+            _ = model(**enc)
+
+            # Collect from each module
+            for name, module in wrapped_modules.items():
+                if not isinstance(module, TopKLoRALinearSTE):
+                    continue
+
+                z = module._last_z
+                if z is None:
+                    continue
+
+                # Flatten batch and sequence dims -> [N, r]
+                z_flat = z.reshape(-1, z.size(-1)).cpu()
+
+                # Store activations (subsample if too large)
+                if len(results[name]["z_all"]) < 10000:
+                    results[name]["z_all"].append(z_flat)
+
+                # Count which latents were active (> threshold)
+                active = (z_flat.abs() > 0.01).float().sum(dim=0)
+                results[name]["activation_counts"] += active
+                results[name]["total_samples"] += z_flat.size(0)
+
+    # Concatenate activations
+    for name in results:
+        if results[name]["z_all"]:
+            results[name]["z_all"] = torch.cat(results[name]["z_all"], dim=0)
+        else:
+            r = wrapped_modules[name].r
+            results[name]["z_all"] = torch.zeros(0, r)
+
+    return results
+
+
+def topk_interpretability():
+    """
+    Comprehensive TopK-LoRA interpretability evaluation suite.
+
+    Computes:
+    1. Dead latent analysis (% latents never/rarely active)
+    2. Usage entropy (uniformity of latent usage)
+    3. Pairwise activation correlations (independence of latents)
+    4. Weight orthogonality (A rows, B cols)
+    5. Sparsity statistics (actual vs target k)
+    6. Cosine similarity of B columns (feature diversity)
+
+    All metrics designed to support interpretable model diffing.
+    """
+
+    def eval_topk_interpretability(cfg):
+        import wandb
+
+        print("=" * 70)
+        print("TopK Interpretability Evaluation Suite")
+        print("=" * 70)
+
+        # Load model
+        model, tokenizer, wrapped_modules = init_model_tokenizer_fixed(cfg.model)
+
+        # Get eval config
+        interp_cfg = cfg.evals.topk_interpretability
+        num_samples = getattr(interp_cfg, "num_samples", 1000)
+        batch_size = getattr(interp_cfg, "batch_size", 8)
+        max_length = getattr(interp_cfg, "max_length", 256)
+        dead_threshold = getattr(interp_cfg, "dead_threshold", 0.01)
+        dataset_name = getattr(
+            interp_cfg, "dataset_name", "allenai/real-toxicity-prompts"
+        )
+        dataset_split = getattr(interp_cfg, "dataset_split", "train")
+
+        # Load prompts for activation collection
+        print(f"\nLoading {num_samples} prompts from {dataset_name}...")
+        try:
+            dataset = load_dataset(dataset_name, split=dataset_split)
+
+            # Try different column names
+            text_col = None
+            for col in ["prompt", "text", "sentence", "content"]:
+                if col in dataset.column_names:
+                    text_col = col
+                    break
+                # Check for nested structure (e.g., real-toxicity-prompts)
+                if col == "prompt" and "prompt" in dataset.column_names:
+                    # Handle dict column
+                    try:
+                        sample = dataset[0]["prompt"]
+                        if isinstance(sample, dict) and "text" in sample:
+                            text_col = "prompt.text"
+                            break
+                    except Exception:
+                        pass
+
+            if text_col == "prompt.text":
+                prompts = [
+                    ex["prompt"]["text"]
+                    for ex in dataset.select(range(min(num_samples, len(dataset))))
+                ]
+            elif text_col:
+                prompts = dataset.select(range(min(num_samples, len(dataset))))[
+                    text_col
+                ]
+            else:
+                raise ValueError(
+                    f"Could not find text column in {dataset.column_names}"
+                )
+
+            prompts = [p for p in prompts if p and len(p.strip()) > 10][:num_samples]
+
+        except Exception as e:
+            print(f"Warning: Could not load dataset: {e}")
+            print("Using synthetic prompts for testing...")
+            prompts = [
+                "The weather today is",
+                "I think the best way to",
+                "In my opinion, we should",
+                "The most important thing is",
+            ] * (num_samples // 4 + 1)
+            prompts = prompts[:num_samples]
+
+        print(f"Collected {len(prompts)} prompts for analysis")
+
+        # Collect activations
+        print("\nCollecting activations across prompts...")
+        activation_data = _collect_activations_for_eval(
+            model,
+            tokenizer,
+            wrapped_modules,
+            prompts,
+            batch_size=batch_size,
+            max_length=max_length,
+        )
+
+        # Aggregate results
+        all_results = {}
+        summary = {
+            "total_layers": 0,
+            "avg_dead_pct": 0.0,
+            "avg_usage_entropy": 0.0,
+            "avg_mean_corr": 0.0,
+            "avg_max_corr": 0.0,
+            "avg_ortho_A": 0.0,
+            "avg_ortho_B": 0.0,
+            "avg_cosine_B_max": 0.0,
+        }
+
+        print("\n" + "=" * 70)
+        print("Per-Layer Analysis")
+        print("=" * 70)
+
+        for name, module in wrapped_modules.items():
+            if not isinstance(module, TopKLoRALinearSTE):
+                continue
+
+            print(f"\n--- {name} ---")
+            layer_results = {"name": name, "r": module.r, "k": module.k}
+
+            # Get activation data
+            data = activation_data.get(name, {})
+            z_all = data.get("z_all", torch.zeros(0, module.r))
+            counts = data.get("activation_counts", torch.zeros(module.r))
+            total = data.get("total_samples", 0)
+
+            # 1. Dead latent analysis
+            dead_stats = _compute_dead_latent_stats(
+                counts, total, threshold=dead_threshold
+            )
+            layer_results["dead_latents"] = dead_stats
+            print(
+                f"  Dead latents: {dead_stats['dead_count']}/{module.r} ({dead_stats['dead_pct']:.1f}%)"
+            )
+
+            # 2. Usage entropy
+            usage_entropy = _compute_usage_entropy(counts)
+            layer_results["usage_entropy"] = usage_entropy
+            print(f"  Usage entropy (normalized): {usage_entropy:.3f}")
+
+            # 3. Pairwise correlations (if we have enough samples)
+            if z_all.size(0) >= 100:
+                # Subsample for efficiency
+                subsample_idx = torch.randperm(z_all.size(0))[
+                    : min(5000, z_all.size(0))
+                ]
+                z_sub = z_all[subsample_idx]
+                corr_stats = _compute_pairwise_correlations(z_sub)
+            else:
+                corr_stats = {"mean_corr": 0.0, "max_corr": 0.0, "std_corr": 0.0}
+            layer_results["correlations"] = corr_stats
+            print(
+                f"  Activation correlations: mean={corr_stats['mean_corr']:.4f}, max={corr_stats['max_corr']:.4f}"
+            )
+
+            # 4. Weight orthogonality
+            A_ortho = _compute_weight_orthogonality(
+                module.A_module.weight.detach(), dim=1
+            )
+            B_ortho = _compute_weight_orthogonality(
+                module.B_module.weight.detach(), dim=0
+            )
+            layer_results["ortho_A"] = A_ortho
+            layer_results["ortho_B"] = B_ortho
+            print(f"  Weight orthogonality: A={A_ortho:.4f}, B={B_ortho:.4f}")
+
+            # 5. B column cosine similarity (feature diversity)
+            B_weights = module.B_module.weight.detach()
+            B_norm = F.normalize(B_weights, p=2, dim=0)  # normalize columns
+            cos_sim = B_norm.T @ B_norm  # [r, r]
+            mask = ~torch.eye(cos_sim.size(0), device=cos_sim.device, dtype=torch.bool)
+            off_diag = cos_sim[mask]
+            cos_max = float(off_diag.abs().max()) if off_diag.numel() > 0 else 0.0
+            cos_mean = float(off_diag.abs().mean()) if off_diag.numel() > 0 else 0.0
+            layer_results["B_cosine_max"] = cos_max
+            layer_results["B_cosine_mean"] = cos_mean
+            print(f"  B column cosine: mean={cos_mean:.4f}, max={cos_max:.4f}")
+
+            all_results[name] = layer_results
+
+            # Aggregate for summary
+            summary["total_layers"] += 1
+            summary["avg_dead_pct"] += dead_stats["dead_pct"]
+            summary["avg_usage_entropy"] += usage_entropy
+            summary["avg_mean_corr"] += corr_stats["mean_corr"]
+            summary["avg_max_corr"] += corr_stats["max_corr"]
+            summary["avg_ortho_A"] += A_ortho
+            summary["avg_ortho_B"] += B_ortho
+            summary["avg_cosine_B_max"] += cos_max
+
+        # Compute averages
+        n = max(summary["total_layers"], 1)
+        for key in summary:
+            if key.startswith("avg_"):
+                summary[key] /= n
+
+        # Print summary
+        print("\n" + "=" * 70)
+        print("Summary (averaged across layers)")
+        print("=" * 70)
+        print(f"  Total TopK layers: {summary['total_layers']}")
+        print(f"  Avg dead latent %: {summary['avg_dead_pct']:.2f}%")
+        print(
+            f"  Avg usage entropy: {summary['avg_usage_entropy']:.3f} (1.0 = perfectly uniform)"
+        )
+        print(
+            f"  Avg activation correlation: {summary['avg_mean_corr']:.4f} (lower = more independent)"
+        )
+        print(
+            f"  Avg weight orthogonality (A/B): {summary['avg_ortho_A']:.4f} / {summary['avg_ortho_B']:.4f}"
+        )
+        print(
+            f"  Avg B cosine similarity (max): {summary['avg_cosine_B_max']:.4f} (lower = more diverse)"
+        )
+
+        # Interpretability score (composite heuristic, higher = better)
+        # Components: low dead %, high entropy, low correlation, low cosine sim
+        interp_score = (
+            (100 - summary["avg_dead_pct"]) / 100 * 0.25  # alive latents
+            + summary["avg_usage_entropy"] * 0.25  # uniform usage
+            + (1 - min(summary["avg_mean_corr"], 1.0)) * 0.25  # independence
+            + (1 - min(summary["avg_cosine_B_max"], 1.0)) * 0.25  # diversity
+        )
+        summary["interpretability_score"] = interp_score
+        print(f"\n  ** Interpretability Score: {interp_score:.3f} / 1.0 **")
+
+        # Log to wandb
+        wandb.log(
+            {
+                "topk_interp/dead_pct": summary["avg_dead_pct"],
+                "topk_interp/usage_entropy": summary["avg_usage_entropy"],
+                "topk_interp/mean_correlation": summary["avg_mean_corr"],
+                "topk_interp/max_correlation": summary["avg_max_corr"],
+                "topk_interp/ortho_A": summary["avg_ortho_A"],
+                "topk_interp/ortho_B": summary["avg_ortho_B"],
+                "topk_interp/cosine_B_max": summary["avg_cosine_B_max"],
+                "topk_interp/interpretability_score": interp_score,
+            }
+        )
+
+        # Per-layer logging
+        for name, results in all_results.items():
+            clean_name = name.replace(".", "_")
+            wandb.log(
+                {
+                    f"topk_interp/layers/{clean_name}/dead_pct": results[
+                        "dead_latents"
+                    ]["dead_pct"],
+                    f"topk_interp/layers/{clean_name}/usage_entropy": results[
+                        "usage_entropy"
+                    ],
+                    f"topk_interp/layers/{clean_name}/mean_corr": results[
+                        "correlations"
+                    ]["mean_corr"],
+                    f"topk_interp/layers/{clean_name}/B_cosine_max": results[
+                        "B_cosine_max"
+                    ],
+                }
+            )
+
+        # Save detailed results
+        output_dir = Path(
+            getattr(interp_cfg, "output_dir", "eval_outputs/topk_interpretability")
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        results_path = (
+            output_dir / f"interpretability_results_{cfg.experiment_name}.json"
+        )
+        write_json(
+            str(results_path),
+            {
+                "summary": summary,
+                "per_layer": {
+                    k: {
+                        kk: vv if not isinstance(vv, torch.Tensor) else vv.tolist()
+                        for kk, vv in v.items()
+                    }
+                    for k, v in all_results.items()
+                },
+                "config": {
+                    "num_samples": len(prompts),
+                    "dead_threshold": dead_threshold,
+                    "dataset": dataset_name,
+                },
+            },
+        )
+        print(f"\nResults saved to: {results_path}")
+
+        return {"summary": summary, "per_layer": all_results}
+
+    return eval_topk_interpretability

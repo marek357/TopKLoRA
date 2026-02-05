@@ -1,0 +1,33 @@
+# Sweep configuration for TopK single-layer experiments
+# 
+# Usage with Hydra multirun (-m flag):
+#
+# === Basic sweep over r, k, k_final values ===
+# python main.py -m training=sft_recommended_topk_sweep \
+#     'training.sft_experiment.lora.r=1024,4096,8192' \
+#     'training.sft_experiment.lora.k=64,128,256,512' \
+#     'training.sft_experiment.lora.k_final=4,8,32,64'
+#
+# === Sweep including MLP vs MLP+Attn ===
+# python main.py -m training=sft_recommended_topk_sweep \
+#     'training.sft_experiment.lora.r=1024,4096' \
+#     'training.sft_experiment.lora.k=128,512' \
+#     'training.sft_experiment.lora.k_final=8,32' \
+#     'training.sft_experiment.lora.module_type=mlp,mlp_attn'
+#
+# === Sweep with different layers ===
+# python main.py -m training=sft_recommended_topk_sweep \
+#     'training.sft_experiment.lora.r=4096' \
+#     'training.sft_experiment.lora.k=256' \
+#     'training.sft_experiment.lora.layer=16,17,18,19,20'
+
+defaults:
+  - sft_recommended_base
+  - experiment/topk_single_layer_base@sft_experiment
+
+dump_trained_model: True
+dump_path: "models/sft_topk_sweep/${training.model.model_name}/r${training.sft_experiment.lora.r}_k${training.sft_experiment.lora.k}_kf${training.sft_experiment.lora.k_final}_${training.sft_experiment.lora.module_type}"
+
+sft:
+  save_steps: 500
+  max_steps: 6000
