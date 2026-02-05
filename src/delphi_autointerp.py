@@ -27,6 +27,7 @@ from torch.utils.data import DataLoader
 from src.autointerp_utils import _read_jsonl, _write_jsonl, build_latent_index
 from src.utils import hh_string_to_messages, autointerp_violates_alternation
 import logging
+from src.openai_client import OpenAIClient
 
 # Add path for our improvements
 
@@ -256,14 +257,11 @@ def _select_latents_from_stats(cfg, latent_stats):
 
     p_active_min = float(getattr(sel_cfg, "p_active_min"))
     p_active_max = float(getattr(sel_cfg, "p_active_max"))
-    dead_max = float(getattr(sel_cfg, "dead_p_active_max"))
     max_latents = int(getattr(sel_cfg, "max_latents"))
 
     candidate_entries = []
     for stats in latent_stats:
         p_active = float(stats.get("p_active", 0.0))
-        if p_active <= dead_max:
-            continue
         if p_active < p_active_min or p_active > p_active_max:
             continue
         candidate_entries.append(stats)
@@ -294,6 +292,173 @@ def _select_latents_from_stats(cfg, latent_stats):
     selection_records.sort(key=lambda x: x["p_active"], reverse=True)
     selected_entries = [candidate_entries[i] for i in top_indices]
     return selected_entries, selection_records
+
+
+def build_hookpoint_offsets(wrapped_modules):
+    """
+    Build a mapping from hookpoint names to their global latent ID offsets.
+    Assigns unique global IDs to latents across all hookpoints.
+
+    Args:
+        wrapped_modules: Dictionary of module name -> TopKLoRALinearSTE module.
+
+    Returns:
+        tuple: (hookpoint_offsets, hookpoint_widths, total_latents)
+            - hookpoint_offsets: dict mapping hookpoint name to global ID offset
+            - hookpoint_widths: dict mapping hookpoint name to latent width
+            - total_latents: total number of latents across all hookpoints
+    """
+    hookpoint_offsets = {}
+    hookpoint_widths = {}
+    offset = 0
+
+    for name, module in wrapped_modules.items():
+        hookpoint = f"{name}.topk"
+        width = module.r
+        hookpoint_offsets[hookpoint] = offset
+        hookpoint_widths[hookpoint] = width
+        offset += width
+
+    total_latents = offset
+    logging.info(
+        f"Built hookpoint offsets: {len(hookpoint_offsets)} hookpoints, "
+        f"{total_latents} total latents"
+    )
+    return hookpoint_offsets, hookpoint_widths, total_latents
+
+
+def compute_co_occurrence_from_cache(cache, wrapped_modules):
+    """
+    Compute co-occurrence statistics from cached latent activations.
+
+    For each position (batch_idx, seq_idx), finds all latents that fired
+    and increments co-occurrence counts for each pair.
+
+    Args:
+        cache: LatentCache object with populated cache.latent_locations
+        wrapped_modules: Dictionary of module name -> TopKLoRALinearSTE module
+
+    Returns:
+        tuple: (co_occurrence, hookpoint_meta)
+            - co_occurrence: dict[int, dict[int, int]] where
+                co_occurrence[latent_a][latent_b] = count of positions
+                where both latents fired together
+            - hookpoint_meta: dict with offsets, widths, total_latents
+    """
+    from collections import defaultdict
+    from tqdm import tqdm
+
+    hookpoint_offsets, hookpoint_widths, total_latents = build_hookpoint_offsets(
+        wrapped_modules
+    )
+
+    # Group all active latents by position (batch_idx, seq_idx)
+    position_to_latents = defaultdict(list)
+
+    for hookpoint, locations in cache.cache.latent_locations.items():
+        if locations is None or locations.numel() == 0:
+            continue
+
+        offset = hookpoint_offsets.get(hookpoint, 0)
+        locations_np = locations.numpy()
+
+        for i in range(locations_np.shape[0]):
+            batch_idx = int(locations_np[i, 0])
+            seq_idx = int(locations_np[i, 1])
+            local_latent_idx = int(locations_np[i, 2])
+            global_latent_id = offset + local_latent_idx
+
+            position_to_latents[(batch_idx, seq_idx)].append(global_latent_id)
+
+    # Compute co-occurrence counts
+    co_occurrence = defaultdict(lambda: defaultdict(int))
+
+    n_positions = len(position_to_latents)
+    logging.info(f"Computing co-occurrence across {n_positions} positions...")
+
+    for position, latent_ids in tqdm(
+        position_to_latents.items(), desc="Computing co-occurrence"
+    ):
+        # For each pair of latents at this position, increment co-occurrence
+        latent_ids_sorted = sorted(set(latent_ids))  # dedupe within position
+        n = len(latent_ids_sorted)
+        for i in range(n):
+            latent_a = latent_ids_sorted[i]
+            for j in range(i + 1, n):
+                latent_b = latent_ids_sorted[j]
+                # Store bidirectionally for easy lookup
+                co_occurrence[latent_a][latent_b] += 1
+                co_occurrence[latent_b][latent_a] += 1
+
+    # Convert to regular dicts for serialization
+    co_occurrence = {k: dict(v) for k, v in co_occurrence.items()}
+
+    total_pairs = sum(len(v) for v in co_occurrence.values()) // 2
+    logging.info(
+        f"Co-occurrence computed: {len(co_occurrence)} latents with "
+        f"{total_pairs} unique co-occurring pairs"
+    )
+
+    hookpoint_meta = {
+        "offsets": hookpoint_offsets,
+        "widths": hookpoint_widths,
+        "total_latents": total_latents,
+    }
+
+    return co_occurrence, hookpoint_meta
+
+
+def get_latent_info(global_latent_id, hookpoint_offsets, hookpoint_widths):
+    """
+    Get hookpoint and local index for a global latent ID.
+
+    Args:
+        global_latent_id: The global latent ID.
+        hookpoint_offsets: dict mapping hookpoint name to global ID offset
+        hookpoint_widths: dict mapping hookpoint name to latent width
+
+    Returns:
+        dict with 'hookpoint', 'local_idx', and 'global_id' keys.
+    """
+    for hookpoint, offset in hookpoint_offsets.items():
+        width = hookpoint_widths.get(hookpoint, 0)
+        if offset <= global_latent_id < offset + width:
+            return {
+                "hookpoint": hookpoint,
+                "local_idx": global_latent_id - offset,
+                "global_id": global_latent_id,
+            }
+    return {"hookpoint": None, "local_idx": None, "global_id": global_latent_id}
+
+
+def save_co_occurrence(co_occurrence, hookpoint_meta, save_dir):
+    """
+    Save co-occurrence data to disk.
+
+    Args:
+        co_occurrence: dict[int, dict[int, int]] co-occurrence counts
+        hookpoint_meta: dict with offsets, widths, total_latents
+        save_dir: Path to directory where data will be saved
+    """
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save co-occurrence as JSON
+    co_occurrence_path = save_dir / "co_occurrence.json"
+    with open(co_occurrence_path, "w") as f:
+        # Convert int keys to strings for JSON compatibility
+        json_compatible = {
+            str(k): {str(k2): v2 for k2, v2 in v.items()}
+            for k, v in co_occurrence.items()
+        }
+        json.dump(json_compatible, f, indent=2)
+
+    # Save hookpoint offsets for ID resolution
+    offsets_path = save_dir / "hookpoint_offsets.json"
+    with open(offsets_path, "w") as f:
+        json.dump(hookpoint_meta, f, indent=2)
+
+    logging.info(f"Saved co-occurrence data to {save_dir}")
 
 
 class ChatTemplateCollator:
@@ -401,7 +566,7 @@ def save_score(result, model_str, scorer):
 
 
 def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
-    print("starting activation collection")
+    logging.info("starting activation collection")
     exp_cfg = cfg.evals.auto_interp.activation_collection
 
     if not hasattr(exp_cfg, "dataset_name"):
@@ -504,16 +669,16 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
             n_tokens=n_tokens,
             tokens=tokens_array,
         )
-        print("Cache collection complete. Checking cache contents...")
+        logging.info("Cache collection complete. Checking cache contents...")
         total_entries = 0
         for hookpoint, locations in cache.cache.latent_locations.items():
             num_entries = int(locations.shape[0]) if locations is not None else 0
             total_entries += num_entries
-            print(f"  {hookpoint}: {num_entries} non-zero activations")
+            logging.info(f"  {hookpoint}: {num_entries} non-zero activations")
         if total_entries == 0:
-            print("WARNING: No latent activations were recorded.")
+            logging.info("WARNING: No latent activations were recorded.")
         out_dir = Path(
-            f"delphi_cache/{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_layer{cfg.model.layer}_toks{exp_cfg.n_tokens}"
+            f"delphi_cache/{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_layer{cfg.model.layer}"
         )
         out_dir.mkdir(parents=True, exist_ok=True)
         cache.save_splits(n_splits=4, save_dir=out_dir)
@@ -545,74 +710,88 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
         _write_jsonl(str(latent_stats_path), latent_stats)
         _write_jsonl(str(top_prompts_path), top_prompt_records)
 
-        selected_latents, selection_records = _select_latents_from_stats(
-            cfg,
-            latent_stats,
-        )
-        latent_selection_path = getattr(
-            cfg, "latent_selection_path", str(stats_dir / "latent_selection.jsonl")
-        )
-        if selection_records:
-            _write_jsonl(str(latent_selection_path), selection_records)
-            print(
-                f"Selected {len(selected_latents)} latents; wrote selection to {latent_selection_path}"
+        # Compute and save co-occurrence if enabled
+        compute_co_occurrence = bool(getattr(exp_cfg, "compute_co_occurrence", False))
+        if compute_co_occurrence:
+            logging.info("Computing co-occurrence from cache...")
+            co_occurrence, hookpoint_meta = compute_co_occurrence_from_cache(
+                cache, wrapped_modules
             )
+            save_co_occurrence(co_occurrence, hookpoint_meta, stats_dir)
     finally:
         for module, original in original_modes.items():
             module.is_topk_experiment = original
 
+    if bool(cfg.evals.auto_interp.latent_selection.enabled):
+        delphi_select_latents(cfg)
+
+
+def delphi_select_latents(cfg):
+    stats_dir = Path(
+        f"delphi_cache/{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_layer{cfg.model.layer}/stats"
+    )
+    if not os.path.exists(stats_dir):
+        raise ValueError(f"Stats dir not found: {stats_dir}")
+
+    latent_stats_path = stats_dir / "latent_stats.jsonl"
+    if not os.path.exists(latent_stats_path):
+        raise ValueError(f"Latent stats file not found: {latent_stats_path}")
+
+    latent_stats = _read_jsonl(latent_stats_path)
+    selected_latents, selection_records = _select_latents_from_stats(
+        cfg,
+        latent_stats,
+    )
+    latent_selection_path = getattr(
+        cfg, "latent_selection_path", str(stats_dir / "latent_selection.jsonl")
+    )
+    if selection_records:
+        _write_jsonl(str(latent_selection_path), selection_records)
+        logging.info(
+            f"Selected {len(selected_latents)} latents; wrote selection to {latent_selection_path}"
+        )
+
 
 def delphi_score(cfg, model, tokenizer, wrapped_modules):
-    config = (
-        cfg.evals.causal_auto_interp
-        if hasattr(cfg.evals, "causal_auto_interp")
-        else cfg.evals.topk_lora_autointerp
-    )
-
+    cfg_exp = cfg.evals.auto_interp.delphi_scoring
     # Create model-specific identifier string based on config
-    # Format: {model_type}_{r}_{k}
-    model_type = getattr(cfg.model, "type", "unknown")
-    r_val = getattr(cfg.model, "r", config.r)
-    k_val = getattr(cfg.model, "k", config.k)
-    model_str = f"{model_type}_{r_val}_{k_val}"
+    model_str = f"{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_layer{cfg.model.layer}"
 
-    topk_modules = [
-        # filter out query projections -- these have already been analyzed
-        f"{name}.topk"
-        for name, _ in wrapped_modules.items()
-        if "q_proj" not in name
-    ]
-    print(topk_modules)
-    topk_modules = [elem for elem in topk_modules if "18" in elem]
-    print(f"Filtered to layer 18 modules: {topk_modules}")
-    # assert False, "Debug stop"
+    topk_modules = [f"{name}.topk" for name, _ in wrapped_modules.items()]
+
+    logging.info(f"Initial topk modules: {topk_modules}")
+    topk_modules = [elem for elem in topk_modules if str(cfg.model.layer) in elem]
+    logging.info(f"Filtered to layer {cfg.model.layer} modules: {topk_modules}")
+
     model.cpu()
     del model
     del wrapped_modules
 
-    # Load interpretability rankings and get priority latents
-    print("\n" + "=" * 60)
-    print("ENHANCED INTERPRETABILITY-FOCUSED ANALYSIS")
-    print("=" * 60)
+    selection_path = f"delphi_cache/{model_str}/stats/latent_selection.jsonl"
 
-    selection_records = _read_jsonl(cfg.latent_selection_path)
+    # Load interpretability rankings and get priority latents
+    selection_records = _read_jsonl(selection_path)
     priority_latents = {}
+    selected_latents_counter = 0
     for entry in selection_records:
         if entry.get("selected") == 1:
-            priority_latents.setdefault(entry["adapter_name"], []).append(
+            # make sure to add ".topk" suffix
+            priority_latents.setdefault(entry["adapter_name"] + ".topk", []).append(
                 entry["feature_idx"]
             )
+            selected_latents_counter += 1
 
     topk_modules = [name for name in topk_modules if name in priority_latents]
-    print(
-        f"Loaded priority latents for {len(topk_modules)} modules from {cfg.latent_selection_path}"
+    logging.info(
+        f"Loaded {selected_latents_counter} priority latents for {len(topk_modules)} modules from {selection_path}"
     )
 
-    model_type = getattr(cfg.model, "type", "sft_model")
-
+    logging.info(f"Topk modules after filtering: {topk_modules}")
     # 1) Load the raw cache you saved
     dataset = LatentDataset(
-        raw_dir=Path(f"cache/{model_type}/layer_full/{config.r}_{config.k}"),
+        raw_dir=Path(
+            f"delphi_cache/{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_layer{cfg.model.layer}"
+        ),
         modules=topk_modules,
         latents={
             # Focus on most interpretable latents only
@@ -620,8 +799,9 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
             for name in topk_modules
         },
         tokenizer=tokenizer,
+        # TODO: Figure out what is the optimal config here.
         sampler_cfg=SamplerConfig(
-            n_examples_train=30,  # Increased training examples for better analysis
+            n_examples_train=50,  # Increased training examples for better analysis
             n_examples_test=40,  # More test examples for robust evaluation
             n_quantiles=10,  # Standard quantile analysis
             train_type="mix",  # Mixed sampling for diverse training examples
@@ -635,7 +815,7 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
             # faiss_embedding_cache_enabled=True,
             # faiss_embedding_cache_dir=".embedding_cache",
             # example_ctx_len=32,      # Context length for examples
-            # min_examples=200,        # Minimum examples for robust analysis
+            # min_examples=200,  # Minimum examples for robust analysis
             # n_non_activating=20,     # Non-activating examples for contrast
             # center_examples=True,    # Center examples for better analysis
             # non_activating_source="FAISS",  # Use FAISS for better negative examples
@@ -643,69 +823,111 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
         ),
     )
 
-    # 2) Build your explainer client + explainer
-    # class OpenRouter(Client):
-    # def __init__(
-    #     self,
-    #     model: str,
-    #     api_key: str | None = None,
-    #     base_url="https://openrouter.ai/api/v1/chat/completions",
-    #     max_tokens: int = 3000,
-    #     temperature: float = 1.0,
-    # ):
-    # client = OpenRouter(
-    #     "Qwen/Qwen2.5-32B-Instruct-AWQ",
-    #     max_tokens=25_768, base_url="http://127.0.0.1:8081/v1/chat/completions"
-    # )
-
-    # GPU Memory Management Configuration
-
-    # Clear any existing CUDA cache
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # Based on testing, the optimal configuration is:
-    # - Single GPU (GPU 0, 3, or 4 are all free)
-    # - Conservative memory settings to avoid OOM errors
-    # - Reduced context length to fit in memory
-
-    # Use GPUs 0 and 3 (both completely free)
-    # os.environ["CUDA_VISIBLE_DEVICES"] = "0,3"
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
-    print(
-        f"🔧 Using GPUs: {os.environ['CUDA_VISIBLE_DEVICES']} (multi-GPU with tensor parallelism)"
+    scoring_cfg = getattr(cfg_exp, "scoring_client", None)
+    provider = (
+        str(getattr(scoring_cfg, "provider", "offline")).strip().lower()
+        if scoring_cfg is not None
+        else "offline"
     )
 
-    # Set PyTorch CUDA memory management for fragmentation
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    if provider == "offline":
+        # GPU Memory Management Configuration
+        num_gpus = 1
+        # Clear any existing CUDA cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            # Set PyTorch CUDA memory management for fragmentation
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+            visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+            num_gpus = len(visible_devices.split(","))
 
-    num_gpus = len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
+            logging.info(
+                f"🔧 Using GPUs: {visible_devices} (multi-GPU with tensor parallelism)"
+            )
 
-    client = Offline(
-        "Qwen/Qwen3-30B-A3B-Thinking-2507",
-        num_gpus=4,  # TP=2
-        max_model_len=18000,  # smaller KV → faster & safer
-        max_memory=0.65,
-        prefix_caching=False,
-        batch_size=1,
-        enforce_eager=False,  # allow CUDA graphs
-        number_tokens_to_generate=14_500,
-        # max_num_batched_tokens=3072,
-    )
+        explainer_config = scoring_cfg.offline_config
 
-    # Add device attribute for SurprisalScorer compatibility
-    client.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        client = Offline(
+            explainer_config.model_name,
+            num_gpus=num_gpus,
+            max_model_len=explainer_config.max_model_len,  # smaller KV → faster & safer
+            max_memory=explainer_config.max_memory,  # GB per GPU
+            prefix_caching=explainer_config.prefix_caching,
+            batch_size=explainer_config.batch_size,
+            enforce_eager=explainer_config.enforce_eager,  # allow CUDA graphs
+            number_tokens_to_generate=explainer_config.number_tokens_to_generate,
+            # max_num_batched_tokens=3072,
+        )
 
-    print("✅ Model loaded successfully with multi-GPU tensor parallelism!")
-    print(f"   - GPUs: {os.environ['CUDA_VISIBLE_DEVICES']} (tensor parallelism)")
+        # Add device attribute for SurprisalScorer compatibility
+        client.device = torch.device(
+            "cuda"
+            if torch.cuda.is_available()
+            else "mps"
+            if torch.backends.mps.is_available()
+            else "cpu"
+        )
 
-    openai_run = False
-    if not openai_run:
+        if torch.cuda.is_available():
+            logging.info(
+                "✅ Model loaded successfully with multi-GPU tensor parallelism!"
+            )
+            logging.info(
+                f"   - GPUs: {os.environ.get('CUDA_VISIBLE_DEVICES', '0')} (tensor parallelism)"
+            )
+        else:
+            logging.info(f"✅ Model loaded successfully on {client.device}!")
+    elif provider == "openai":
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "OPENAI_API_KEY is not set. Add it to your .env file or environment."
+            )
+
+        explainer_config = scoring_cfg.openai_config
+        openai_model = getattr(explainer_config, "openai_model", "gpt-4o-mini")
+        openai_base_url = getattr(explainer_config, "openai_base_url", None)
+        openai_temperature = float(getattr(explainer_config, "openai_temperature", 0.0))
+        openai_max_tokens = int(getattr(explainer_config, "openai_max_tokens", 3000))
+        openai_timeout = float(getattr(explainer_config, "openai_timeout", 60.0))
+        cost_monitor_enabled = bool(
+            getattr(explainer_config, "cost_monitor_enabled", False)
+        )
+        cost_monitor_every_n_requests = int(
+            getattr(explainer_config, "cost_monitor_every_n_requests", 10)
+        )
+        input_cost_per_1m = getattr(explainer_config, "input_cost_per_1m", None)
+        output_cost_per_1m = getattr(explainer_config, "output_cost_per_1m", None)
+        if input_cost_per_1m is not None:
+            input_cost_per_1m = float(input_cost_per_1m)
+        if output_cost_per_1m is not None:
+            output_cost_per_1m = float(output_cost_per_1m)
+
+        client = OpenAIClient(
+            openai_model,
+            api_key=api_key,
+            base_url=openai_base_url,
+            max_tokens=openai_max_tokens,
+            temperature=openai_temperature,
+            timeout=openai_timeout,
+            tokenizer=tokenizer,
+            cost_monitor_enabled=cost_monitor_enabled,
+            cost_monitor_every_n_requests=cost_monitor_every_n_requests,
+            input_cost_per_1m=input_cost_per_1m,
+            output_cost_per_1m=output_cost_per_1m,
+        )
+
+        client.device = torch.device("cpu")
+        logging.info(f"✅ Using OpenAI API model: {openai_model}")
+    else:
+        raise ValueError(
+            f"Unknown scoring client provider '{provider}'. Use 'offline' or 'openai'."
+        )
+
+    if not cfg_exp.use_openai_simulator:
         # TODO may have to modify to adapt for cot (not originally implemented)
         explainer = DefaultExplainer(client, cot=True)
-        # explainer = CachedExplainer(
-        # base_explainer, cache=llm_cache, tokenizer=tokenizer)
+        # explainer = DefaultExplainer(client)
         explainer_pipe = process_wrapper(
             explainer,
             postprocess=lambda x: save_explanation(x, model_str, "enhanced_default"),
@@ -714,28 +936,10 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
         detection_scorer = DetectionScorer(
             client, tokenizer=tokenizer, n_examples_shown=5
         )
-        # detection_scorer = CachedDetectionScorer(
-        #     base_detection_scorer, cache=llm_cache)
-
-        # Enhanced preprocessing and scoring
-        def preprocess(explained):
-            rec = explained.record
-            rec.explanation = explained.explanation
-            rec.extra_examples = rec.not_active
-            return rec
-
-        detection_pipe = process_wrapper(
-            detection_scorer,
-            preprocess=preprocess,
-            postprocess=lambda x: save_score(x, model_str, "enhanced_detection"),
-        )
 
         # Enhanced pipeline with multiple scoring methods
-        print(
+        logging.info(
             f"Running enhanced interpretability analysis on {len(priority_latents)} latents"
-        )
-        print(
-            f"Analysis includes: explanations, detection scoring, and surprisal analysis"
         )
 
         # Multi-stage pipeline
@@ -753,7 +957,7 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
                 det_result = await detection_scorer(rec)
                 save_score(det_result, _model_str, "enhanced_detection")
             except Exception as e:
-                print(f"Detection scoring failed for {rec.latent}: {e}")
+                logging.error(f"Detection scoring failed for {rec.latent}: {e}")
 
             return explained
 
@@ -788,21 +992,26 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
             sim_pipe,  # runs simulation scoring in one stage
         )
 
-    # Reduce concurrency to prevent memory issues
-    # With the 32B model, we need to be very conservative with parallel processing
-    max_concurrent = 3  # Process one at a time to avoid memory pressure
+    max_concurrent = int(getattr(cfg_exp, "max_concurrent", 1))
 
     asyncio.run(pipeline.run(max_concurrent=max_concurrent))
 
-    print(f"✅ Pipeline completed with max_concurrent={max_concurrent} (memory-safe)")
-
+    logging.info(
+        f"✅ Pipeline completed with max_concurrent={max_concurrent} (memory-safe)"
+    )
     # Generate summary after analysis
-    print(f"\n{'=' * 60}")
-    print("ENHANCED INTERPRETABILITY ANALYSIS COMPLETE")
-    print(f"{'=' * 60}")
-    print(f"Analyzed {len(priority_latents)} most interpretable latents")
-    print(f"Model identifier: {model_str}")
-    print(f"Results saved to:")
-    print(f"  - Explanations: autointerp/{model_str}/explanations/enhanced_default/")
-    print(f"  - Detection scores: autointerp/{model_str}/scores/enhanced_detection/")
-    print(f"{'=' * 60}\n")
+    logging.info(f"\n{'=' * 60}")
+    logging.info("ENHANCED INTERPRETABILITY ANALYSIS COMPLETE")
+    logging.info("Results saved to:")
+    if cfg_exp.use_openai_simulator:
+        logging.info(
+            f"  - Simulation scores: autointerp/{model_str}/scores/OpenAISimulator/"
+        )
+    else:
+        logging.info(
+            f"  - Explanations: autointerp/{model_str}/explanations/enhanced_default/"
+        )
+        logging.info(
+            f"  - Detection scores: autointerp/{model_str}/scores/enhanced_detection/"
+        )
+    logging.info(f"{'=' * 60}\n")
