@@ -35,13 +35,18 @@ defaults:
 dump_trained_model: True
 dump_path: "models/dpo_topk_sweep/${training.model.model_name}/r${training.dpo_experiment.lora.r}_k${training.dpo_experiment.lora.k}_kf${training.dpo_experiment.lora.k_final}_${training.dpo_experiment.lora.module_type}"
 
+# Experiment naming for WandB: includes all sweep parameters
+# Format: dpo_r{r}_k{k}_kf{k_final}_{module_type}_L{layer}
+experiment_name: "dpo_r${training.dpo_experiment.lora.r}_k${training.dpo_experiment.lora.k}_kf${training.dpo_experiment.lora.k_final}_${training.dpo_experiment.lora.module_type}_L${training.dpo_experiment.lora.layer}"
+
 sft:
   enabled: False
 
 dpo:
   enabled: True
-  max_prompt_length: 256
-  max_completion_length: 256
+  # Match SFT max_seq_length of 2048 (1024 + 1024)
+  max_prompt_length: 1024
+  max_completion_length: 1024
   beta: 0.1
   loss_type: 'sigmoid'
   num_train_epochs: 1
@@ -55,7 +60,10 @@ dpo:
   warmup_ratio: 0.05
   bf16: True
   fp16: False
-  max_grad_norm: 0.5
+  # Match SFT's stricter gradient clipping
+  max_grad_norm: 0.3
+  # Match SFT's weight decay for regularization
+  weight_decay: 0.02
   save_strategy: 'steps'
   save_steps: 500
   save_total_limit: 2

@@ -215,3 +215,4 @@ repofromgh/
 .vscode/settings.json
 sweep_scripts/
 test_model.py
+heretic/
