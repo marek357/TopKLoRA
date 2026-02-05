@@ -19,9 +19,10 @@ from peft import PeftModel
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from src.autointerp_framework_hh import run_autointerp_framework
 from src.delphi_autointerp import (
     delphi_collect_activations,
-    delphi_collect_activations_causal,
+    delphi_select_latents,
     delphi_score,
 )
 from src.models import TopKLoRALinearSTE
@@ -31,10 +32,11 @@ from src.utils import (
     configure_eos_eot,
     ensure_chat_template_and_special_tokens,
     format_adapter_suffix,
+    generate_completions_from_prompts,
     preprocess_to_perspective_message,
+    wikitext_detokenizer,
     wrap_topk_lora_modules,
     write_json,
-    wikitext_detokenizer,
 )
 
 device = (
@@ -55,7 +57,7 @@ def init_model_tokenizer_fixed(model_cfg):
     )
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_cfg.base_model, torch_dtype="auto", device_map="cpu"
+        model_cfg.base_model.path, torch_dtype="auto", device_map="cpu"
     )
 
     # Load the PEFT adapter (this should work now!)
@@ -90,58 +92,21 @@ def init_model_tokenizer_fixed(model_cfg):
             assert a_max != 0, f"lora_A weights in {name} are all zero!"
             print(f"{name}: B max = {b_max:.6f};  A max = {a_max:.6f}")
 
+    # Ensure chat template and special tokens are set. Technically we assume that
+    # all topklora-tuned models will have it, but it is good to have a check, as
+    # it doesn't cost us anything.
+    ensure_chat_template_and_special_tokens(
+        tokenizer,
+        model,
+        model_cfg.base_model.model_it_name,
+    )
+    eot_token, eot_token_id = configure_eos_eot(tokenizer, model)
+
+    # Log the configuration
+    print(f"EOT token: '{eot_token}' (ID: {eot_token_id})")
+    print(f"EOS token ID(s): {model.generation_config.eos_token_id}")
+
     return model, tokenizer, wrapped_modules
-
-
-def generate_completions_from_prompts(
-    model,
-    tokenizer,
-    prompts,
-    *,
-    device: str,
-    max_length=None,
-    truncation: bool = True,
-    gen_kwargs=None,
-    end_of_turn_id=None,
-):
-    """Tokenize prompts, generate, and return decoded completions."""
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    pad_id = tokenizer.pad_token_id
-
-    enc = tokenizer(
-        prompts,
-        return_tensors="pt",
-        padding=True,
-        truncation=truncation,
-        max_length=max_length,
-    ).to(device)
-
-    # ── Autoregressive generation
-    with torch.no_grad():
-        generated = model.generate(**enc, **(gen_kwargs or {}))
-
-    # ── Extract only the newly generated continuation
-    # Precompute prompt lengths for the batch (excluding pad tokens)
-    prompt_lengths = (enc["input_ids"] != pad_id).sum(dim=1)
-    completions = []
-    for i, output_ids in enumerate(generated):
-        if end_of_turn_id is not None:
-            # Locate the first END‑OF‑TURN token in the *generated* sequence
-            eot_positions = (output_ids == end_of_turn_id).nonzero(as_tuple=True)[0]
-            if len(eot_positions) > 0:
-                # after the EOT
-                completion_ids = output_ids[eot_positions[0].item() + 1 :]
-            else:
-                # Fallback: trim the prompt length, using precomputed length
-                completion_ids = output_ids[prompt_lengths[i].item() :]
-        else:
-            completion_ids = output_ids[prompt_lengths[i].item() :]
-        completions.append(
-            tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
-        )
-
-    return completions
 
 
 def load_base_model_for_eval(cfg):
@@ -274,43 +239,26 @@ def metrics():
 def auto_interp():
     def eval_auto_interp(cfg):
         model, tokenizer, wrapped_modules = init_model_tokenizer_fixed(cfg.model)
-        if cfg.evals.auto_interp.collect_activations:
+        if bool(cfg.evals.auto_interp.activation_collection.enabled):
             print("Collecting activations...")
-            torch.set_float32_matmul_precision("high")
+            torch.backends.cudnn.conv.fp32_precision = "tf32"
             delphi_collect_activations(cfg, model, tokenizer, wrapped_modules)
-        delphi_score(cfg, model, tokenizer, wrapped_modules)
+        elif bool(cfg.evals.auto_interp.latent_selection.enabled):
+            delphi_select_latents(cfg)
+        if bool(cfg.evals.auto_interp.delphi_scoring.enabled):
+            delphi_score(cfg, model, tokenizer, wrapped_modules)
         return
 
     return eval_auto_interp
 
 
-def causal_auto_interp():
-    def eval_causal_auto_interp(cfg):
-        model, tokenizer, wrapped_modules = init_model_tokenizer_fixed(cfg.model)
-        # sanity check below -- PEFT has a weird bug
-        # where it doesn't load the weights sometimes
-        # and initialises them to random (matrix_A)
-        # and zeros (matrix_B) instead
-        print("Sanity checking LoRA B weights...")
-        for name, module in model.named_modules():
-            if isinstance(module, TopKLoRALinearSTE):
-                b_max = module.B_module.weight.detach().abs().max()
-                a_max = module.A_module.weight.detach().abs().max()
-                assert b_max != 0, f"lora_B weights in {name} are all zero!"
-                assert a_max != 0, f"lora_A weights in {name} are all zero!"
-                print(f"{name}: B max = {b_max:.6f};  A max = {a_max:.6f}")
-
-        if cfg.evals.causal_auto_interp.collect_activations:
-            print("Collecting activations...")
-            torch.set_float32_matmul_precision("high")
-            delphi_collect_activations_causal(cfg, model, tokenizer, wrapped_modules)
-
-        if cfg.evals.causal_auto_interp.score_activations:
-            print("Scoring activations...")
-            delphi_score(cfg, model, tokenizer, wrapped_modules)
+def causal_autointerp_framework():
+    def eval_causal_autointerp_framework(cfg):
+        model, tokenizer, _ = init_model_tokenizer_fixed(cfg.model)
+        run_autointerp_framework(cfg, model, tokenizer)
         return
 
-    return eval_causal_auto_interp
+    return eval_causal_autointerp_framework
 
 
 def toxicity():

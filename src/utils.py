@@ -2498,3 +2498,41 @@ def wikitext_detokenizer(string):
     string = string.replace(" 's", "'s")
 
     return string
+
+
+def generate_completions_from_prompts(
+    model,
+    tokenizer,
+    prompts,
+    *,
+    device: str,
+    max_length=None,
+    truncation: bool = True,
+    gen_kwargs=None,
+    end_of_turn_id=None,  # Unused (deprecated)
+):
+    """Tokenize prompts, generate, and return decoded completions."""
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    enc = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=truncation,
+        max_length=max_length,
+    ).to(device)
+
+    with torch.no_grad():
+        generated = model.generate(**enc, **(gen_kwargs or {}))
+
+    prompt_length = enc["input_ids"].shape[1]
+
+    completions = []
+    for output_ids in generated:
+        completion_ids = output_ids[prompt_length:]
+        completions.append(
+            tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
+        )
+
+    return completions

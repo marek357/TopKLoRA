@@ -1,28 +1,58 @@
 name: auto-interpret
-layer_idx: 11
-# k_heap: 50
-# k: 32
-# r: 4096
-k: ${model.k}
-r: ${model.r}
-ablation_study: False
-activations_study: True
-collect_activations: True
-train_steps: 5000
-batch_size: 10
-max_new_tokens: 125
-hook_type: "disable"
-max_examples_per_latent: 250
-latent_interp_batch_size: 10
-max_length: 512
-max_rows: 10
-context_size_each_side: 10
-dump_generated: True
-dump_analysis: True
-dataset_name: "Anthropic/hh-rlhf"
-sleep_sec: 0.5
-chat_model: "gpt-4o"
-chat_model_temperature: 0.0
-chat_system_prompt: "You are a helpful assistant."
+
+activation_collection:
+  enabled: false
+  n_tokens: 1000000
+  seq_len: 256
+  top_prompt_count: 1000
+  max_batches: 500000
+  batch_size: 8
+  dataset_name: "Anthropic/hh-rlhf"
+  dataset_split: train
+  dataset_continuation: rejected # or "chosen" or "null" for randomly selected
+  dataset_config_name: null
+  compute_co_occurrence: true # compute latent co-occurrence statistics across all hookpoints
+
+# selection of top latents to analyse
+latent_selection:
+  enabled: true
+  max_latents: 128
+  p_active_min: 0.01
+  p_active_max: 0.9
+
+# delphi scoring
+delphi_scoring:
+  enabled: false
+  max_concurrent: 1 # Maximum concurrent pipeline tasks (applies to all providers)
+
+  use_openai_simulator: false
+
+  scoring_client:
+    provider: openai # offline | openai
+    openai_config:
+      # openai config
+      openai_model: "gpt-4o-mini"
+      openai_base_url: null
+      openai_temperature: 0.0
+      openai_max_tokens: 3000
+      openai_timeout: 60
+      cost_monitor_enabled: true
+      cost_monitor_every_n_requests: 10
+      # Set costs per 1M tokens for estimated spend
+      input_cost_per_1m: 0.15
+      output_cost_per_1m: 0.6
+
+    offline_config:
+      # model_name: Qwen/Qwen3-30B-A3B-Thinking-2507
+      model_name: /Users/aszab/repos/models/OLMo-2-0425-1B-DPO
+      max_model_len: 4096
+      # max_model_len: 18000
+      max_memory: 0.65
+      prefix_caching: false
+      batch_size: 1
+      number_tokens_to_generate: 14500
+      enforce_eager: true
+
+seed: 42
 build_eval_function:
   _target_: src.evals.auto_interp
