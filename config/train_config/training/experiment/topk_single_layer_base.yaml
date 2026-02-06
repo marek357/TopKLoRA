@@ -37,7 +37,7 @@ lora:
 
   # Top-k schedule
   k_schedule: cubic
-  k_warmup_frac: 0.2
+  k_warmup_frac: 0.15
   
   # Temperature schedule for soft gate
   temperature: 0.1

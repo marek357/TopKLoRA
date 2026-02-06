@@ -1666,6 +1666,21 @@ def run_dpo(cfg, quant_cfg):
         except Exception as e:
             logging.warning(f"Could not create 'latest' symlink: {e}")
 
+        # Also create a human-friendly symlink using experiment_name so runs are easy to find
+        try:
+            friendly_name = getattr(cfg, "experiment_name", None) or os.path.basename(output_dir)
+            friendly_link = os.path.join(cfg.training.dump_path, friendly_name)
+            if os.path.islink(friendly_link) or os.path.exists(friendly_link):
+                try:
+                    os.remove(friendly_link)
+                except Exception as e:
+                    logging.warning(
+                        f"Could not remove existing friendly link '{friendly_link}': {e}"
+                    )
+            os.symlink(output_dir, friendly_link)
+        except Exception as e:
+            logging.warning(f"Could not create friendly symlink: {e}")
+
         save_cfg_yaml(output_dir, cfg)
         capture_env_snapshot(output_dir)
 

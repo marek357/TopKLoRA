@@ -23,8 +23,9 @@ sft:
 
 dpo:
   enabled: True
-  max_prompt_length: 256
-  max_completion_length: 256
+  # Match SFT max_seq_length of 2048 (1024 + 1024)
+  max_prompt_length: 1024
+  max_completion_length: 1024
   beta: 0.2
   loss_type: 'sigmoid'
   num_train_epochs: 1
@@ -38,7 +39,10 @@ dpo:
   warmup_ratio: 0.03
   bf16: True
   fp16: False
-  max_grad_norm: 1.0
+  # Match SFT's stricter gradient clipping
+  max_grad_norm: 0.3
+  # Match SFT's weight decay for regularization
+  weight_decay: 0.02
   save_strategy: 'steps'
   save_steps: 500
   save_total_limit: 2
