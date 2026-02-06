@@ -39,16 +39,18 @@ def _stable_hash(text: str) -> str:
 
 
 def _extract_prompt_from_example(example) -> str:
+    # Handle LMSYS format with "conversation" field
+    if "conversation" in example and example["conversation"]:
+        msgs = example["conversation"]
+        if isinstance(msgs, list):
+            for msg in msgs:
+                if msg.get("role") == "user":
+                    return msg.get("content", "").strip()
+    # Fallback to other formats
     if "prompt" in example and example["prompt"]:
         return example["prompt"].strip()
     if "text" in example and example["text"]:
         return example["text"].strip()
-    for key in ("chosen", "rejected"):
-        if key in example and example[key]:
-            msgs = hh_string_to_messages(example[key])
-            for msg in msgs:
-                if msg.get("role") == "user":
-                    return msg.get("content", "").strip()
     return ""
 
 
@@ -60,6 +62,15 @@ def _extract_first_user(msgs) -> str:
 
 
 def _extract_continuation_messages(example, choice, rng):
+    # Handle LMSYS format with "conversation" field
+    if "conversation" in example and example["conversation"]:
+        msgs = example["conversation"]
+        if isinstance(msgs, list) and len(msgs) > 0:
+            # Convert to JSON string for continuation_text
+            convo_text = json.dumps(msgs, ensure_ascii=False)
+            return msgs, convo_text, "conversation"
+
+    # Fallback to HH-RLHF format if available
     selected = choice
     if selected is None:
         if "chosen" in example and "rejected" in example:
@@ -70,7 +81,7 @@ def _extract_continuation_messages(example, choice, rng):
         msgs = hh_string_to_messages(convo_text)
         return msgs, convo_text, selected
 
-    return None, "", selected
+    return None, "", "none"
 
 
 def _stream_and_format_dataset(
@@ -471,9 +482,9 @@ class ChatTemplateCollator:
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        # For generation tasks, left padding is typically better
+        # For activation collection, use right padding to keep token positions consistent
         self.original_padding_side = tokenizer.padding_side
-        self.tokenizer.padding_side = "left"
+        self.tokenizer.padding_side = "right"
 
     def __call__(self, examples):
         texts = []
@@ -612,6 +623,17 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
             "Skipped %d examples with empty continuation.",
             stats["skipped_empty_continuation"],
         )
+
+    # Print example samples with applied chat template
+    logging.info("\nExample samples with chat template applied:")
+    for i in range(min(3, len(flat_ds))):
+        formatted_text = tokenizer.apply_chat_template(
+            flat_ds[i].get("input", []),
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        logging.info(f"\n--- Example {i + 1} ---\n{formatted_text}\n")
+
     chat_collate = ChatTemplateCollator(
         tokenizer,
         device,

@@ -24,6 +24,9 @@ def main(cfg: DictConfig):
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y‑%m‑%d %H:%M:%S",
     )
+    # Suppress httpx info messages
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
     logging.info("Loaded configuration:")
     logging.info(cfg)
 
