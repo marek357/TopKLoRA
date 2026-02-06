@@ -83,6 +83,9 @@ def main():
     for child in sorted(base.iterdir()):
         if child.name == "latest":
             continue
+        # Skip existing symlinks so we only treat real run directories as sources
+        if child.is_symlink():
+            continue
         if not child.is_dir():
             continue
         hparams_path = child / "hparams.json"
