@@ -482,9 +482,9 @@ class ChatTemplateCollator:
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        # For generation tasks, left padding is typically better
+        # For activation collection, use right padding to keep token positions consistent
         self.original_padding_side = tokenizer.padding_side
-        self.tokenizer.padding_side = "left"
+        self.tokenizer.padding_side = "right"
 
     def __call__(self, examples):
         texts = []
@@ -591,6 +591,7 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
         exp_cfg.dataset_name,
         name=dataset_config,
         split=dataset_split,
+        streaming=True,
     )
 
     continuation_choice = getattr(exp_cfg, "dataset_continuation")
