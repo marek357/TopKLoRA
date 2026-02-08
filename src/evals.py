@@ -19,11 +19,11 @@ from peft import PeftModel
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from src.autointerp_framework_hh import run_autointerp_framework
-from src.delphi_autointerp import (
+from src.autointerp import (
     delphi_collect_activations,
-    delphi_select_latents,
     delphi_score,
+    delphi_select_latents,
+    run_autointerp_framework,
 )
 from src.models import TopKLoRALinearSTE
 from src.utils import (
@@ -241,7 +241,25 @@ def auto_interp():
         model, tokenizer, wrapped_modules = init_model_tokenizer_fixed(cfg.model)
         if bool(cfg.evals.auto_interp.activation_collection.enabled):
             print("Collecting activations...")
-            torch.backends.cudnn.conv.fp32_precision = "tf32"
+            if torch.cuda.is_available():
+                torch.backends.cuda.matmul.allow_tf32 = True
+
+            if hasattr(torch.backends, "cudnn"):
+                if hasattr(torch.backends.cudnn, "conv") and hasattr(
+                    torch.backends.cudnn.conv, "fp32_precision"
+                ):
+                    # Newer PyTorch API
+                    print(
+                        "Enabling cuDNN TF32 for convolution operations. Newer PyTorch version detected."
+                    )
+                    torch.backends.cudnn.conv.fp32_precision = "tf32"
+                elif hasattr(torch.backends.cudnn, "allow_tf32"):
+                    # Older/common API
+                    print(
+                        "Enabling cuDNN TF32 for convolution operations. Older PyTorch version detected."
+                    )
+                    torch.backends.cudnn.allow_tf32 = True
+
             delphi_collect_activations(cfg, model, tokenizer, wrapped_modules)
         elif bool(cfg.evals.auto_interp.latent_selection.enabled):
             delphi_select_latents(cfg)

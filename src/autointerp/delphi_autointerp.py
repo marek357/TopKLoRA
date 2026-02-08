@@ -24,10 +24,11 @@ from delphi.scorers import (
     SurprisalScorer,
 )
 from torch.utils.data import DataLoader
-from src.autointerp_utils import _read_jsonl, _write_jsonl, build_latent_index
+from .autointerp_utils import _read_jsonl, _write_jsonl, build_latent_index
 from src.utils import hh_string_to_messages, autointerp_violates_alternation
 import logging
-from src.openai_client import OpenAIClient
+from .openai_client import OpenAIClient
+from .streaming_latent_cache import make_latent_cache
 
 # Add path for our improvements
 
@@ -185,10 +186,20 @@ def _collect_latent_stats_from_cache(
     # Walk cached non-zero activations and compute per-sequence max for each latent
     for name, module in wrapped_modules.items():
         hookpoint = f"{name}.topk"
-        if hookpoint not in cache.cache.latent_locations:
-            continue
-        locations_tensor = cache.cache.latent_locations[hookpoint]
-        activations_tensor = cache.cache.latent_activations[hookpoint]
+
+        # Prefer materialized tensors; fall back to per-batch buffers (streaming mode)
+        locations_tensor = cache.cache.latent_locations.get(hookpoint)
+        activations_tensor = cache.cache.latent_activations.get(hookpoint)
+
+        if (locations_tensor is None or activations_tensor is None) and hasattr(
+            cache.cache, "latent_locations_batches"
+        ):
+            loc_batches = cache.cache.latent_locations_batches.get(hookpoint, [])
+            act_batches = cache.cache.latent_activations_batches.get(hookpoint, [])
+            if loc_batches and act_batches:
+                locations_tensor = torch.cat(loc_batches, dim=0)
+                activations_tensor = torch.cat(act_batches, dim=0)
+
         if locations_tensor is None or activations_tensor is None:
             continue
         if locations_tensor.numel() == 0:
@@ -679,18 +690,58 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
             original_modes[module] = module.is_topk_experiment
             module.is_topk_experiment = True
 
-    cache = LatentCache(
-        model=model,
-        hookpoint_to_sparse_encode=topk_modules,
-        batch_size=exp_cfg.batch_size,
-        transcode=False,
-    )
+    streaming_cache = bool(getattr(exp_cfg, "streaming_cache", False))
+    retry_enabled = bool(getattr(exp_cfg, "retry_on_oom", False))
+    batch_size_min = int(getattr(exp_cfg, "batch_size_min", 1))
+    backoff = float(getattr(exp_cfg, "batch_backoff", 0.5))
+    max_retries = int(getattr(exp_cfg, "batch_max_retries", 2))
+
+    current_batch_size = int(getattr(exp_cfg, "batch_size"))
+    attempt = 0
+
+    while True:
+        cache = make_latent_cache(
+            model=model,
+            hookpoint_to_sparse_encode=topk_modules,
+            batch_size=current_batch_size,
+            transcode=False,
+            streaming=streaming_cache,
+        )
+
+        try:
+            cache.run(
+                n_tokens=n_tokens,
+                tokens=tokens_array,
+            )
+            break
+        except RuntimeError as e:
+            oom = "out of memory" in str(e).lower()
+            if not (retry_enabled and oom):
+                raise
+
+            attempt += 1
+            if attempt > max_retries or current_batch_size <= batch_size_min:
+                logging.error(
+                    "OOM even after retries (attempt %d, batch_size=%d). Re-raising.",
+                    attempt,
+                    current_batch_size,
+                )
+                raise
+
+            next_bs = max(batch_size_min, max(1, int(current_batch_size * backoff)))
+            logging.warning(
+                "CUDA OOM at batch_size=%d; retrying with batch_size=%d (attempt %d/%d)",
+                current_batch_size,
+                next_bs,
+                attempt,
+                max_retries,
+            )
+            current_batch_size = next_bs
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            continue
 
     try:
-        cache.run(
-            n_tokens=n_tokens,
-            tokens=tokens_array,
-        )
         logging.info("Cache collection complete. Checking cache contents...")
         total_entries = 0
         for hookpoint, locations in cache.cache.latent_locations.items():

@@ -183,43 +183,80 @@ def ensure_chat_template_and_special_tokens(tokenizer, model, model_it_name: str
 
 
 def configure_eos_eot(tokenizer, model):
-    """Configure generation EOS/EOT handling and ensure pad_token is set."""
-    eot_token = (
-        tokenizer.special_tokens_map.get(
-            "additional_special_tokens", [tokenizer.eos_token]
-        )[1]
-        if len(tokenizer.special_tokens_map.get("additional_special_tokens", [])) > 1
-        else tokenizer.eos_token
-    )
+    """Configure generation EOS/EOT handling and ensure pad_token is set.
 
-    # Convert to ID
-    eot_token_id = tokenizer.convert_tokens_to_ids(eot_token)
+    Priority for EOT:
+    1) tokenizer.eot_token / tokenizer.eot_token_id if present (many chat models expose this)
+    2) special_tokens_map['eot_token'] if present
+    3) second entry of additional_special_tokens (common for some chat templates)
+    4) fallback to eos_token
+    """
 
-    # Get the base EOS token ID
+    logging.info("special_tokens_map=%s", tokenizer.special_tokens_map)
+    logging.info("eos_token=%s id=%s", tokenizer.eos_token, tokenizer.eos_token_id)
+    # Collect candidates
+    eot_token = getattr(tokenizer, "eot_token", None)
+    eot_token_id = getattr(tokenizer, "eot_token_id", None)
+
+    if eot_token is None:
+        eot_token = tokenizer.special_tokens_map.get("eot_token")
+    if eot_token_id is None:
+        eot_token_id = tokenizer.special_tokens_map.get("eot_token_id")
+
+    if eot_token is None and eot_token_id is None:
+        extra = tokenizer.special_tokens_map.get("additional_special_tokens", [])
+        if len(extra) > 1:
+            eot_token = extra[1]
+            eot_token_id = tokenizer.convert_tokens_to_ids(eot_token)
+            if eot_token_id is None or eot_token_id == tokenizer.unk_token_id:
+                logging.warning(
+                    "EOT candidate %s not in vocab (id=%s); will fall back to EOS",
+                    eot_token,
+                    eot_token_id,
+                )
+                eot_token = None
+                eot_token_id = None
+
+    # Try well-known literal candidates if still unresolved
+    if eot_token is None and eot_token_id is None:
+        for candidate in ("<end_of_turn>", "<|eot_id|>"):
+            cand_id = tokenizer.convert_tokens_to_ids(candidate)
+            if (
+                cand_id is not None
+                and cand_id != tokenizer.unk_token_id
+                and cand_id != -1
+            ):
+                eot_token = candidate
+                eot_token_id = cand_id
+                logging.info(
+                    "Resolved EOT via literal candidate %s -> id %s", candidate, cand_id
+                )
+                break
+
+    # Final fallback to EOS
+    if eot_token is None:
+        eot_token = tokenizer.eos_token
+    if eot_token_id is None:
+        eot_token_id = tokenizer.convert_tokens_to_ids(eot_token)
+
     base_eos_token_id = tokenizer.eos_token_id
 
     # Update generation config with both EOS and EOT tokens
-    if hasattr(model.generation_config, "eos_token_id"):
-        # Create a list of both tokens
-        eos_token_ids = []
-
-        # Add base EOS token
-        if isinstance(base_eos_token_id, list):
-            eos_token_ids.extend(base_eos_token_id)
-        else:
-            eos_token_ids.append(base_eos_token_id)
-
-        # Add EOT token if it's different
-        if eot_token_id not in eos_token_ids:
-            eos_token_ids.append(eot_token_id)
-
-        model.generation_config.eos_token_id = eos_token_ids
+    eos_token_ids = []
+    if isinstance(base_eos_token_id, list):
+        eos_token_ids.extend(base_eos_token_id)
     else:
-        model.generation_config.eos_token_id = [base_eos_token_id, eot_token_id]
+        eos_token_ids.append(base_eos_token_id)
+
+    if eot_token_id not in eos_token_ids:
+        eos_token_ids.append(eot_token_id)
+
+    model.generation_config.eos_token_id = eos_token_ids
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    logging.info("Configured EOT token: %s (ID: %s)", eot_token, eot_token_id)
     return eot_token, eot_token_id
 
 
