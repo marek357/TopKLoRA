@@ -96,12 +96,14 @@ def discover_adapters() -> list[dict]:
                     k_final = int(part[1:])
                     break
 
-        results.append({
-            "path": str(adapter_dir),
-            "display": display,
-            "r": r,
-            "k_final": k_final,
-        })
+        results.append(
+            {
+                "path": str(adapter_dir),
+                "display": display,
+                "r": r,
+                "k_final": k_final,
+            }
+        )
     return results
 
 
@@ -109,7 +111,11 @@ def discover_cached_adapters() -> list[str]:
     """Return paths to adapters with cached activations in delphi_cache/."""
     if not CACHE_DIR.is_dir():
         return []
-    return [str(p.name) for p in sorted(CACHE_DIR.iterdir()) if p.is_dir() and not p.name.startswith(".")]
+    return [
+        str(p.name)
+        for p in sorted(CACHE_DIR.iterdir())
+        if p.is_dir() and not p.name.startswith(".")
+    ]
 
 
 def get_cached_hookpoints(adapter_name: str) -> list[str]:
@@ -146,7 +152,9 @@ def get_cached_hookpoint_config(adapter_name: str, hookpoint: str) -> dict:
         return {}
 
 
-def get_cached_latent_choices(adapter_name: str, hookpoint: str) -> list[tuple[str, int]]:
+def get_cached_latent_choices(
+    adapter_name: str, hookpoint: str
+) -> list[tuple[str, int]]:
     """Get list of (display_name, latent_id) tuples for a hookpoint with p_active from stats.
 
     Returns:
@@ -290,8 +298,7 @@ def load_model(
 
         # Build hookpoint configuration HTML
         hookpoint_items = "".join(
-            f"<li><code>{name}</code></li>"
-            for name in sorted(wrapped_modules.keys())
+            f"<li><code>{name}</code></li>" for name in sorted(wrapped_modules.keys())
         )
         hookpoint_html = (
             f"<div style='font-family: system-ui; padding: 12px;'>"
@@ -330,7 +337,9 @@ def get_adapter_info(hookpoint: str) -> dict:
 # ---------------------------------------------------------------------------
 # Activation visualisation
 # ---------------------------------------------------------------------------
-def _render_activation_html(tokens: list, activations: torch.Tensor, hookpoint: str, latent_idx: int) -> str:
+def _render_activation_html(
+    tokens: list, activations: torch.Tensor, hookpoint: str, latent_idx: int
+) -> str:
     """Render activation heatmap HTML from pre-computed activations.
 
     Args:
@@ -365,7 +374,9 @@ def _render_activation_html(tokens: list, activations: torch.Tensor, hookpoint: 
         # Render as gray with warning
         spans = []
         for tok in tokens:
-            display_tok = tok.replace("<", "&lt;").replace(">", "&gt;").replace(" ", "&nbsp;")
+            display_tok = (
+                tok.replace("<", "&lt;").replace(">", "&gt;").replace(" ", "&nbsp;")
+            )
             spans.append(
                 f'<span class="token-span" data-activation="0.0000 (dead)" '
                 f'style="background:#f0f0f0;padding:2px 4px;margin:1px;'
@@ -374,17 +385,17 @@ def _render_activation_html(tokens: list, activations: torch.Tensor, hookpoint: 
             )
 
         html = (
-            '<style>'
-            '.token-span::after { content: attr(data-activation); position: absolute; bottom: 100%; left: 50%; '
-            'transform: translateX(-50%); background: #1f2937; color: #fff; padding: 4px 8px; border-radius: 4px; '
-            'font-size: 11px; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity 0.2s; '
-            'margin-bottom: 4px; z-index: 1000; }'
-            '.token-span:hover::after { opacity: 1; }'
+            "<style>"
+            ".token-span::after { content: attr(data-activation); position: absolute; bottom: 100%; left: 50%; "
+            "transform: translateX(-50%); background: #1f2937; color: #fff; padding: 4px 8px; border-radius: 4px; "
+            "font-size: 11px; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity 0.2s; "
+            "margin-bottom: 4px; z-index: 1000; }"
+            ".token-span:hover::after { opacity: 1; }"
             '.token-span::before { content: ""; position: absolute; bottom: 100%; left: 50%; '
-            'transform: translateX(-50%); border: 4px solid transparent; border-top-color: #1f2937; '
-            'opacity: 0; pointer-events: none; transition: opacity 0.2s; z-index: 1000; }'
-            '.token-span:hover::before { opacity: 1; }'
-            '</style>'
+            "transform: translateX(-50%); border: 4px solid transparent; border-top-color: #1f2937; "
+            "opacity: 0; pointer-events: none; transition: opacity 0.2s; z-index: 1000; }"
+            ".token-span:hover::before { opacity: 1; }"
+            "</style>"
             '<div style="line-height:2.2;padding:8px;">'
             + " ".join(spans)
             + "</div>"
@@ -407,7 +418,9 @@ def _render_activation_html(tokens: list, activations: torch.Tensor, hookpoint: 
         bg = f"rgb({r_col},{g_col},{b_col})"
         # Use white text for high intensity (dark backgrounds), dark text for low intensity
         text_color = "#fff" if val > 0.5 else "#1f2937"
-        display_tok = tok.replace("<", "&lt;").replace(">", "&gt;").replace(" ", "&nbsp;")
+        display_tok = (
+            tok.replace("<", "&lt;").replace(">", "&gt;").replace(" ", "&nbsp;")
+        )
         spans.append(
             f'<span class="token-span" data-activation="{raw:.4f}" '
             f'style="background:{bg};color:{text_color};padding:2px 4px;margin:1px;'
@@ -416,17 +429,17 @@ def _render_activation_html(tokens: list, activations: torch.Tensor, hookpoint: 
         )
 
     html = (
-        '<style>'
-        '.token-span::after { content: attr(data-activation); position: absolute; bottom: 100%; left: 50%; '
-        'transform: translateX(-50%); background: #1f2937; color: #fff; padding: 4px 8px; border-radius: 4px; '
-        'font-size: 11px; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity 0.2s; '
-        'margin-bottom: 4px; z-index: 1000; }'
-        '.token-span:hover::after { opacity: 1; }'
+        "<style>"
+        ".token-span::after { content: attr(data-activation); position: absolute; bottom: 100%; left: 50%; "
+        "transform: translateX(-50%); background: #1f2937; color: #fff; padding: 4px 8px; border-radius: 4px; "
+        "font-size: 11px; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity 0.2s; "
+        "margin-bottom: 4px; z-index: 1000; }"
+        ".token-span:hover::after { opacity: 1; }"
         '.token-span::before { content: ""; position: absolute; bottom: 100%; left: 50%; '
-        'transform: translateX(-50%); border: 4px solid transparent; border-top-color: #1f2937; '
-        'opacity: 0; pointer-events: none; transition: opacity 0.2s; z-index: 1000; }'
-        '.token-span:hover::before { opacity: 1; }'
-        '</style>'
+        "transform: translateX(-50%); border: 4px solid transparent; border-top-color: #1f2937; "
+        "opacity: 0; pointer-events: none; transition: opacity 0.2s; z-index: 1000; }"
+        ".token-span:hover::before { opacity: 1; }"
+        "</style>"
         '<div style="line-height:2.2;padding:8px;">'
         + " ".join(spans)
         + "</div>"
@@ -471,20 +484,21 @@ def compute_token_activations(
         )
 
     # Run forward pass and cache
-    # Apply chat template to match steering behavior
+    # Use tokenize=True to get correct token IDs directly (avoids double BOS)
     messages = [{"role": "user", "content": text}]
-    chat_text = state.tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+    input_ids = state.tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
     )
-    enc = state.tokenizer(chat_text, return_tensors="pt").to(state.device)
-    tokens = state.tokenizer.convert_ids_to_tokens(enc["input_ids"][0])
+    if not isinstance(input_ids, torch.Tensor):
+        input_ids = torch.tensor([input_ids]) if isinstance(input_ids, list) else input_ids["input_ids"]
+    input_ids = input_ids.to(state.device)
+    enc = {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)}
+    tokens = state.tokenizer.convert_ids_to_tokens(input_ids[0])
 
-    was_training = module.training
-    module.train()  # ensure _last_z is written
+    # _last_z is written in both train and eval mode (models.py:292)
+    # Keep eval mode to disable dropout and ensure determinism
     with torch.no_grad():
         state.model(**enc)
-    if not was_training:
-        module.eval()
 
     z = module._last_z  # [batch, seq_len, r]
     if z is None:
@@ -515,7 +529,9 @@ def render_latent_from_cache(latent_idx: int) -> str:
     if latent_idx < 0 or latent_idx >= activations.shape[1]:
         return f"<p>Latent index must be in [0, {activations.shape[1] - 1}].</p>"
 
-    return _render_activation_html(tokens, activations[:, latent_idx], hookpoint, latent_idx)
+    return _render_activation_html(
+        tokens, activations[:, latent_idx], hookpoint, latent_idx
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -551,9 +567,13 @@ def load_top_activating_examples(
             layer_part = next((p for p in adapter_parts if p.startswith("layer")), None)
 
             if k_part and r_part and layer_part:
-                adapter_path = MODELS_DIR / "dpo" / module_type / k_part / r_part / layer_part
+                adapter_path = (
+                    MODELS_DIR / "dpo" / module_type / k_part / r_part / layer_part
+                )
                 if adapter_path.exists():
-                    tokenizer = AutoTokenizer.from_pretrained(str(adapter_path), use_fast=True)
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        str(adapter_path), use_fast=True
+                    )
     except Exception:
         pass
 
@@ -601,11 +621,14 @@ def load_top_activating_examples(
 
     # Sort by activation (descending)
     sorted_indices = torch.argsort(latent_acts, descending=True)
-    top_indices = sorted_indices[:n_examples * 3]  # Get more to account for duplicates
+    top_indices = sorted_indices[: n_examples * 3]  # Get more to account for duplicates
 
     # Group activations by batch_idx to avoid duplicate prompts
     from collections import defaultdict
-    batch_activations = defaultdict(list)  # batch_idx -> [(seq_idx, activation_val), ...]
+
+    batch_activations = defaultdict(
+        list
+    )  # batch_idx -> [(seq_idx, activation_val), ...]
 
     for idx in top_indices:
         batch_idx, seq_idx, _ = latent_locs[idx].tolist()
@@ -616,23 +639,27 @@ def load_top_activating_examples(
     sorted_batches = sorted(
         batch_activations.items(),
         key=lambda x: max(act for _, act in x[1]),
-        reverse=True
+        reverse=True,
     )[:n_examples]  # Take top N unique prompts
 
     # Build HTML for top examples
-    tokenizer_status = "✓ Tokenizer loaded" if tokenizer else "⚠ Showing token IDs (tokenizer not found)"
+    tokenizer_status = (
+        "✓ Tokenizer loaded"
+        if tokenizer
+        else "⚠ Showing token IDs (tokenizer not found)"
+    )
     html_parts = [
-        '<style>'
-        '.token-span::after { content: attr(data-activation); position: absolute; bottom: 100%; left: 50%; '
-        'transform: translateX(-50%); background: #1f2937; color: #fff; padding: 4px 8px; border-radius: 4px; '
-        'font-size: 11px; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity 0.2s; '
-        'margin-bottom: 4px; z-index: 1000; }'
-        '.token-span:hover::after { opacity: 1; }'
+        "<style>"
+        ".token-span::after { content: attr(data-activation); position: absolute; bottom: 100%; left: 50%; "
+        "transform: translateX(-50%); background: #1f2937; color: #fff; padding: 4px 8px; border-radius: 4px; "
+        "font-size: 11px; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity 0.2s; "
+        "margin-bottom: 4px; z-index: 1000; }"
+        ".token-span:hover::after { opacity: 1; }"
         '.token-span::before { content: ""; position: absolute; bottom: 100%; left: 50%; '
-        'transform: translateX(-50%); border: 4px solid transparent; border-top-color: #1f2937; '
-        'opacity: 0; pointer-events: none; transition: opacity 0.2s; z-index: 1000; }'
-        '.token-span:hover::before { opacity: 1; }'
-        '</style>'
+        "transform: translateX(-50%); border: 4px solid transparent; border-top-color: #1f2937; "
+        "opacity: 0; pointer-events: none; transition: opacity 0.2s; z-index: 1000; }"
+        ".token-span:hover::before { opacity: 1; }"
+        "</style>"
         f"<div style='font-family: system-ui; padding: 12px;'>"
         f"<h3 style='margin-top: 0;'>Top {len(sorted_batches)} Activating Examples</h3>"
         f"<p style='color: #666; font-size: 0.9em;'>Adapter: {adapter_name} | Hookpoint: {hookpoint} | "
@@ -657,7 +684,12 @@ def load_top_activating_examples(
         # Build highlighted HTML with all activating positions
         highlighted_seq = []
         for i, tok in enumerate(tokens):
-            display_tok = str(tok).replace("<", "&lt;").replace(">", "&gt;").replace(" ", "&nbsp;")
+            display_tok = (
+                str(tok)
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace(" ", "&nbsp;")
+            )
 
             if i in position_indices:
                 # Highlight this activating token
@@ -681,7 +713,9 @@ def load_top_activating_examples(
                 )
 
         # Create position summary
-        pos_summary = ", ".join([f"pos {seq_idx} ({act:.4f})" for seq_idx, act in positions])
+        pos_summary = ", ".join(
+            [f"pos {seq_idx} ({act:.4f})" for seq_idx, act in positions]
+        )
 
         html_parts.append(
             f"<div style='margin: 12px 0; padding: 8px; background: #f9f9f9; border-radius: 4px;'>"
@@ -720,12 +754,16 @@ def generate_steered(
     model = state.model
 
     # Format as chat and tokenize
+    # Use tokenize=True to get correct token IDs directly (avoids double BOS)
     messages = [{"role": "user", "content": prompt}]
-    chat_text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+    input_ids = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
     )
-    enc = tokenizer(chat_text, return_tensors="pt").to(state.device)
-    prompt_length = enc["input_ids"].shape[1]
+    if not isinstance(input_ids, torch.Tensor):
+        input_ids = torch.tensor([input_ids]) if isinstance(input_ids, list) else input_ids["input_ids"]
+    input_ids = input_ids.to(state.device)
+    enc = {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)}
+    prompt_length = input_ids.shape[1]
 
     gen_kwargs = dict(
         max_new_tokens=int(max_new_tokens),
@@ -736,7 +774,7 @@ def generate_steered(
     feature_dict: dict[str, list[tuple[int, str]]] = {}
     has_data = False
     if steering_data is not None:
-        if hasattr(steering_data, 'empty'):
+        if hasattr(steering_data, "empty"):
             has_data = not steering_data.empty
             if has_data:
                 steering_data = steering_data.values.tolist()
@@ -767,16 +805,17 @@ def generate_steered(
         return (
             f"<div style='font-family:monospace;white-space:pre-wrap;padding:12px;'>{full_text}</div>",
             "<div style='color:#999;padding:12px;'>No steering rows provided</div>",
-            ""
+            "",
         )
 
     # --- Baseline generation (no activation tracking during generation) ---
     with torch.no_grad():
         baseline_ids = model.generate(**enc, **gen_kwargs)
 
-    # --- Steered generation ---
-    enc = tokenizer(chat_text, return_tensors="pt").to(state.device)
-    with FeatureSteeringContext(model, feature_dict, verbose=False, amplification=amplification):
+    # --- Steered generation (re-use same enc from above) ---
+    with FeatureSteeringContext(
+        model, feature_dict, verbose=False, amplification=amplification
+    ):
         with torch.no_grad():
             steered_ids = model.generate(**enc, **gen_kwargs)
 
@@ -786,49 +825,51 @@ def generate_steered(
     steered_activations = {}
 
     # Baseline activations: forward pass on baseline output
-    baseline_input = {"input_ids": baseline_ids, "attention_mask": torch.ones_like(baseline_ids)}
+    # _last_z is written in both train and eval mode (models.py:292)
+    # Keep eval mode to disable dropout and ensure determinism
+    baseline_input = {
+        "input_ids": baseline_ids,
+        "attention_mask": torch.ones_like(baseline_ids),
+    }
+
+    with torch.no_grad():
+        model(**baseline_input)
 
     for hp, latent_list in feature_dict.items():
         if hp not in state.wrapped_modules:
             continue
         module = state.wrapped_modules[hp]
-        was_training = module.training
-        module.train()  # ensure _last_z is written
-
-        with torch.no_grad():
-            model(**baseline_input)
-
         if module._last_z is not None:
             if hp not in baseline_activations:
                 baseline_activations[hp] = {}
             for latent_idx, _ in latent_list:
-                baseline_activations[hp][latent_idx] = module._last_z[0, :, latent_idx].cpu().clone()
-
-        if not was_training:
-            module.eval()
+                baseline_activations[hp][latent_idx] = (
+                    module._last_z[0, :, latent_idx].cpu().clone()
+                )
 
     # Steered activations: forward pass on steered output
-    steered_input = {"input_ids": steered_ids, "attention_mask": torch.ones_like(steered_ids)}
+    # Run WITHOUT steering context — we want to see the model's natural
+    # activations on the steered text (what does the model "see"?)
+    # _last_z records pre-gate z, so steering hooks wouldn't change it anyway.
+    steered_input = {
+        "input_ids": steered_ids,
+        "attention_mask": torch.ones_like(steered_ids),
+    }
+
+    with torch.no_grad():
+        model(**steered_input)
 
     for hp, latent_list in feature_dict.items():
         if hp not in state.wrapped_modules:
             continue
         module = state.wrapped_modules[hp]
-        was_training = module.training
-        module.train()  # ensure _last_z is written
-
-        with FeatureSteeringContext(model, feature_dict, verbose=False, amplification=amplification):
-            with torch.no_grad():
-                model(**steered_input)
-
         if module._last_z is not None:
             if hp not in steered_activations:
                 steered_activations[hp] = {}
             for latent_idx, _ in latent_list:
-                steered_activations[hp][latent_idx] = module._last_z[0, :, latent_idx].cpu().clone()
-
-        if not was_training:
-            module.eval()
+                steered_activations[hp][latent_idx] = (
+                    module._last_z[0, :, latent_idx].cpu().clone()
+                )
 
     # Generate HTML outputs
     baseline_html = _render_generation_with_activations(
@@ -837,7 +878,9 @@ def generate_steered(
     steered_html = _render_generation_with_activations(
         tokenizer, steered_ids[0], prompt_length, steered_activations, "Steered"
     )
-    stats_html = _render_activation_stats(baseline_activations, steered_activations, amplification)
+    stats_html = _render_activation_stats(
+        baseline_activations, steered_activations, amplification
+    )
 
     return baseline_html, steered_html, stats_html
 
@@ -861,8 +904,7 @@ def _render_generation_with_activations(
         for latent_acts in hp_acts.values():
             if len(latent_acts) >= len(tokens):
                 token_activations = torch.maximum(
-                    token_activations,
-                    latent_acts[:len(tokens)]
+                    token_activations, latent_acts[: len(tokens)]
                 )
 
     # Mask out special tokens
@@ -873,7 +915,9 @@ def _render_generation_with_activations(
     # Render HTML
     spans = []
     for i, (tok, act) in enumerate(zip(tokens, token_activations)):
-        display_tok = str(tok).replace("<", "&lt;").replace(">", "&gt;").replace(" ", "&nbsp;")
+        display_tok = (
+            str(tok).replace("<", "&lt;").replace(">", "&gt;").replace(" ", "&nbsp;")
+        )
 
         # Color based on activation
         if act > 1e-4:
@@ -900,21 +944,21 @@ def _render_generation_with_activations(
             f'<span class="token-span" data-activation="{act:.4f}{title_extra}" '
             f'style="background:{bg};color:{text_color};padding:2px 4px;margin:1px;{border}'
             f'border-radius:3px;display:inline-block;font-family:monospace;position:relative;cursor:help;">'
-            f'{display_tok}</span>'
+            f"{display_tok}</span>"
         )
 
     return (
-        '<style>'
-        '.token-span::after { content: attr(data-activation); position: absolute; bottom: 100%; left: 50%; '
-        'transform: translateX(-50%); background: #1f2937; color: #fff; padding: 4px 8px; border-radius: 4px; '
-        'font-size: 11px; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity 0.2s; '
-        'margin-bottom: 4px; z-index: 1000; }'
-        '.token-span:hover::after { opacity: 1; }'
+        "<style>"
+        ".token-span::after { content: attr(data-activation); position: absolute; bottom: 100%; left: 50%; "
+        "transform: translateX(-50%); background: #1f2937; color: #fff; padding: 4px 8px; border-radius: 4px; "
+        "font-size: 11px; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity 0.2s; "
+        "margin-bottom: 4px; z-index: 1000; }"
+        ".token-span:hover::after { opacity: 1; }"
         '.token-span::before { content: ""; position: absolute; bottom: 100%; left: 50%; '
-        'transform: translateX(-50%); border: 4px solid transparent; border-top-color: #1f2937; '
-        'opacity: 0; pointer-events: none; transition: opacity 0.2s; z-index: 1000; }'
-        '.token-span:hover::before { opacity: 1; }'
-        '</style>'
+        "transform: translateX(-50%); border: 4px solid transparent; border-top-color: #1f2937; "
+        "opacity: 0; pointer-events: none; transition: opacity 0.2s; z-index: 1000; }"
+        ".token-span:hover::before { opacity: 1; }"
+        "</style>"
         f"<div style='padding:8px;'>"
         f"<div style='font-weight:bold;margin-bottom:8px;color:#666;'>{label}</div>"
         f"<div style='line-height:2.2;'>{' '.join(spans)}</div>"
@@ -943,11 +987,17 @@ def _render_activation_stats(
             baseline_vals = baseline_latents.get(latent_idx)
             steered_vals = steered_latents.get(latent_idx)
 
-            baseline_mean = baseline_vals.mean().item() if baseline_vals is not None else 0.0
-            steered_mean = steered_vals.mean().item() if steered_vals is not None else 0.0
+            baseline_mean = (
+                baseline_vals.mean().item() if baseline_vals is not None else 0.0
+            )
+            steered_mean = (
+                steered_vals.mean().item() if steered_vals is not None else 0.0
+            )
 
             delta = steered_mean - baseline_mean
-            delta_pct = (delta / (baseline_mean + 1e-8)) * 100 if baseline_mean > 1e-8 else 0
+            delta_pct = (
+                (delta / (baseline_mean + 1e-8)) * 100 if baseline_mean > 1e-8 else 0
+            )
 
             stats_rows.append(
                 f"<tr>"
