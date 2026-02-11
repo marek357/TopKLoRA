@@ -19,6 +19,10 @@
 # Size uses absolute paths for interpolation
 size: "topk_single_layer_r${.r}_k${.k}_${.k_final}_${.module_type}"
 
+# Optional override for TopK regularization mode (off | z_only | z_plus_ortho)
+reg_mode: null
+reg_mode_tag: ${oc.select:reg_mode,"auto"}
+
 lora:
   # === SWEEP PARAMETERS (override these) ===
   r: 4096

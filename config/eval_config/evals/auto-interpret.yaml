@@ -2,6 +2,7 @@ name: auto-interpret
 
 activation_collection:
   enabled: true
+  # n_tokens: 500000
   n_tokens: 50000000
   seq_len: 2048 # max sequence length (longer prompts are truncated by the collator)
   top_prompt_count: 1000

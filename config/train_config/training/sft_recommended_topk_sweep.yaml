@@ -26,7 +26,7 @@ defaults:
   - experiment/topk_single_layer_base@sft_experiment
 
 dump_trained_model: True
-dump_path: "models/sft_topk_sweep/${training.model.model_name}/r${training.sft_experiment.lora.r}_k${training.sft_experiment.lora.k}_kf${training.sft_experiment.lora.k_final}_${training.sft_experiment.lora.module_type}"
+dump_path: "models/sft_topk_sweep/${training.model.model_name}/r${training.sft_experiment.lora.r}_k${training.sft_experiment.lora.k}_kf${training.sft_experiment.lora.k_final}_${training.sft_experiment.lora.module_type}_reg${training.sft_experiment.reg_mode_tag}"
 
 sft:
   save_steps: 500

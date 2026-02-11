@@ -164,16 +164,32 @@ def ensure_chat_template_and_special_tokens(tokenizer, model, model_it_name: str
         if getattr(toks_it, "chat_template", None):
             tokenizer.chat_template = toks_it.chat_template
             logging.info("chat_template copied successfully")
-        # Merge additional special tokens if needed
-        extra = toks_it.special_tokens_map.get("additional_special_tokens", [])
-        new_tokens = []
-        if extra:
-            new_tokens = [t for t in extra if t not in tokenizer.get_vocab()]
-            if new_tokens:
-                tokenizer.add_special_tokens({"additional_special_tokens": new_tokens})
+
+        # Merge additional special tokens from the -it tokenizer
+        extra = toks_it.special_tokens_map.get("additional_special_tokens", []) or []
+        configured_extra = (
+            tokenizer.init_kwargs.get("additional_special_tokens")
+            or tokenizer.init_kwargs.get("extra_special_tokens")
+            or []
+        )
+
+        # Union while preserving order
+        merged_extra = []
+        for tok in list(extra) + list(configured_extra):
+            if tok not in merged_extra:
+                merged_extra.append(tok)
+
+        if merged_extra:
+            added = tokenizer.add_special_tokens(
+                {"additional_special_tokens": merged_extra}
+            )
+            if added:
                 model.resize_token_embeddings(len(tokenizer))
-                logging.info("Added %d extra special tokens", len(new_tokens))
-        return new_tokens
+                logging.info("Registered %d additional special tokens", added)
+            else:
+                logging.info("Additional special tokens already registered")
+
+        return merged_extra
     except OSError as exc:
         logging.error("Failed to copy -it tokenizer: %s", exc)
         raise exc
@@ -182,76 +198,115 @@ def ensure_chat_template_and_special_tokens(tokenizer, model, model_it_name: str
     return []
 
 
+def _resolve_eot_token(tokenizer):
+    """Resolve the EOT token string and ID from the tokenizer.
+
+    Search order:
+    1. tokenizer.eot_token / tokenizer.eot_token_id attributes
+    2. special_tokens_map['eot_token'] / ['eot_token_id']
+    3. second entry of additional_special_tokens
+    4. tokenizer.init_kwargs['extra_special_tokens'] (fallback)
+
+    Returns (eot_token, eot_token_id) or raises if unresolvable.
+    """
+    # --- 1 & 2: direct attribute / special_tokens_map ---
+    for source in (
+        lambda: (
+            getattr(tokenizer, "eot_token", None),
+            getattr(tokenizer, "eot_token_id", None),
+        ),
+        lambda: (
+            tokenizer.special_tokens_map.get("eot_token"),
+            tokenizer.special_tokens_map.get("eot_token_id"),
+        ),
+    ):
+        token, token_id = source()
+        if token is not None or token_id is not None:
+            # Ensure both sides are filled in
+            if token is not None and token_id is None:
+                token_id = tokenizer.convert_tokens_to_ids(token)
+            if token_id is not None and token is None:
+                token = tokenizer.convert_ids_to_tokens(token_id)
+            return token, token_id
+
+    # --- 3: additional_special_tokens ---
+    # GemmaTokenizer (slow) does not expose `additional_special_tokens` as an
+    # attribute/property (getattr returns None even though the tokens exist in
+    # the vocab), and `special_tokens_map` may also omit them depending on the
+    # transformers version.  Gather candidates from every available source.
+    extra_sources = [
+        # all_special_tokens is the most reliable aggregator; it reads the
+        # internal added-tokens map and always works across tokenizer types.
+        getattr(tokenizer, "all_special_tokens", None) or [],
+        getattr(tokenizer, "additional_special_tokens", None) or [],
+        tokenizer.special_tokens_map.get("additional_special_tokens", []),
+        tokenizer.init_kwargs.get("additional_special_tokens", []),
+        tokenizer.init_kwargs.get("extra_special_tokens", []),
+    ]
+    # Flatten, normalise (AddedToken → str), deduplicate preserving order.
+    seen = set()
+    extra = []
+    for src in extra_sources:
+        if not src:
+            continue
+        if isinstance(src, dict):
+            src = list(src.values())
+        for t in src:
+            s = str(t)
+            if s not in seen:
+                seen.add(s)
+                extra.append(s)
+
+    # Remove standard special tokens so only "additional" ones remain,
+    # preserving the expected [SOT, EOT, …] ordering.
+    standard = {
+        str(getattr(tokenizer, attr, None))
+        for attr in ("bos_token", "eos_token", "unk_token", "pad_token", "mask_token")
+        if getattr(tokenizer, attr, None) is not None
+    }
+    extra = [t for t in extra if t not in standard]
+
+    logging.debug("additional_special_tokens resolved to: %s", extra)
+
+    if len(extra) > 1:
+        candidate = extra[1]
+        candidate_id = tokenizer.convert_tokens_to_ids(candidate)
+        if candidate_id is not None and candidate_id != tokenizer.unk_token_id:
+            return candidate, candidate_id
+        logging.warning(
+            "EOT candidate %s not in vocab (id=%s); skipping", candidate, candidate_id
+        )
+
+    # Last resort: look up well-known EOT tokens directly in the vocab.
+    for eot_name in ("<end_of_turn>", "<|eot_id|>", "<eot>"):
+        eot_id = tokenizer.convert_tokens_to_ids(eot_name)
+        if eot_id is not None and eot_id != tokenizer.unk_token_id:
+            return eot_name, eot_id
+
+    raise RuntimeError(
+        "Could not resolve EOT token from tokenizer attributes or special tokens. "
+        f"additional_special_tokens={extra}. "
+        "Please ensure your tokenizer has an EOT token defined."
+    )
+
+
 def configure_eos_eot(tokenizer, model):
     """Configure generation EOS/EOT handling and ensure pad_token is set.
 
-    Priority for EOT:
-    1) tokenizer.eot_token / tokenizer.eot_token_id if present (many chat models expose this)
-    2) special_tokens_map['eot_token'] if present
-    3) second entry of additional_special_tokens (common for some chat templates)
-    4) fallback to eos_token
+    Resolves the EOT token, merges it into the model's eos_token_id list
+    so generation stops on either EOS or EOT, and sets pad_token if missing.
     """
-
     logging.info("special_tokens_map=%s", tokenizer.special_tokens_map)
     logging.info("eos_token=%s id=%s", tokenizer.eos_token, tokenizer.eos_token_id)
-    # Collect candidates
-    eot_token = getattr(tokenizer, "eot_token", None)
-    eot_token_id = getattr(tokenizer, "eot_token_id", None)
 
-    if eot_token is None:
-        eot_token = tokenizer.special_tokens_map.get("eot_token")
-    if eot_token_id is None:
-        eot_token_id = tokenizer.special_tokens_map.get("eot_token_id")
+    eot_token, eot_token_id = _resolve_eot_token(tokenizer)
 
-    if eot_token is None and eot_token_id is None:
-        extra = tokenizer.special_tokens_map.get("additional_special_tokens", [])
-        if len(extra) > 1:
-            eot_token = extra[1]
-            eot_token_id = tokenizer.convert_tokens_to_ids(eot_token)
-            if eot_token_id is None or eot_token_id == tokenizer.unk_token_id:
-                logging.warning(
-                    "EOT candidate %s not in vocab (id=%s); will fall back to EOS",
-                    eot_token,
-                    eot_token_id,
-                )
-                eot_token = None
-                eot_token_id = None
-
-    # Try well-known literal candidates if still unresolved
-    if eot_token is None and eot_token_id is None:
-        for candidate in ("<end_of_turn>", "<|eot_id|>"):
-            cand_id = tokenizer.convert_tokens_to_ids(candidate)
-            if (
-                cand_id is not None
-                and cand_id != tokenizer.unk_token_id
-                and cand_id != -1
-            ):
-                eot_token = candidate
-                eot_token_id = cand_id
-                logging.info(
-                    "Resolved EOT via literal candidate %s -> id %s", candidate, cand_id
-                )
-                break
-
-    # Final fallback to EOS
-    if eot_token is None:
-        eot_token = tokenizer.eos_token
-    if eot_token_id is None:
-        eot_token_id = tokenizer.convert_tokens_to_ids(eot_token)
-
-    base_eos_token_id = tokenizer.eos_token_id
-
-    # Update generation config with both EOS and EOT tokens
-    eos_token_ids = []
-    if isinstance(base_eos_token_id, list):
-        eos_token_ids.extend(base_eos_token_id)
-    else:
-        eos_token_ids.append(base_eos_token_id)
-
-    if eot_token_id not in eos_token_ids:
-        eos_token_ids.append(eot_token_id)
-
-    model.generation_config.eos_token_id = eos_token_ids
+    # Build deduplicated list of stop-token IDs
+    base = tokenizer.eos_token_id
+    eos_ids = list(base) if isinstance(base, list) else [base]
+    if eot_token_id not in eos_ids:
+        eos_ids.append(eot_token_id)
+    model.generation_config.eos_token_id = eos_ids
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

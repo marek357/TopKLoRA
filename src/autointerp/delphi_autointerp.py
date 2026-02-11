@@ -183,13 +183,63 @@ def _collect_latent_stats_from_cache(
                 elif score > heap[0][0]:
                     heapq.heapreplace(heap, (score, prompt_id))
 
+    def _vectorized_per_seq_max(locations_np, activations_np, adapter_offset):
+        """Vectorised: compute per-(sequence, feature) max and update stats."""
+        if locations_np.shape[0] == 0:
+            return
+
+        seq_ids = locations_np[:, 0].astype(np.int64)
+        feat_ids = locations_np[:, 2].astype(np.int64)
+        act_vals = activations_np.ravel().astype(np.float64)
+
+        global_ids = feat_ids + adapter_offset
+
+        # Build composite key = seq_id * total_latents + global_id
+        # to reduce to per-(seq, latent) max in one vectorised pass
+        composite = seq_ids * total_latents + global_ids
+
+        # np.maximum.at is O(n) — no sorting needed
+        # First pass: find the max activation for each (seq, latent) pair
+        unique_composites, inverse = np.unique(composite, return_inverse=True)
+        max_vals = np.full(len(unique_composites), -np.inf, dtype=np.float64)
+        np.maximum.at(max_vals, inverse, act_vals)
+
+        # Recover seq_idx and global_latent_id from composite keys
+        u_seq = unique_composites // total_latents
+        u_global = unique_composites % total_latents
+
+        # Bulk-update sums, sums_sq, active_counts
+        np.add.at(sums, u_global, max_vals)
+        np.add.at(sums_sq, u_global, max_vals * max_vals)
+        np.add.at(active_counts, u_global, 1)
+
+        # Top-prompt tracking (only needed for non-dead latents with prompt_ids)
+        if top_prompts is not None and len(prompt_ids) > 0:
+            for i in range(len(unique_composites)):
+                s_idx = int(u_seq[i])
+                g_id = int(u_global[i])
+                score = float(max_vals[i])
+                prompt_id = prompt_ids[s_idx] if s_idx < len(prompt_ids) else None
+                if prompt_id is None:
+                    continue
+                heap = top_prompts[g_id]
+                if len(heap) < top_prompt_count:
+                    heapq.heappush(heap, (score, prompt_id))
+                elif score > heap[0][0]:
+                    heapq.heapreplace(heap, (score, prompt_id))
+
     # Walk cached non-zero activations and compute per-sequence max for each latent
     for name, module in wrapped_modules.items():
         hookpoint = f"{name}.topk"
+        adapter_offset = adapter_offsets[name]
 
         # Prefer materialized tensors; fall back to per-batch buffers (streaming mode)
         locations_tensor = cache.cache.latent_locations.get(hookpoint)
         activations_tensor = cache.cache.latent_activations.get(hookpoint)
+
+        use_batches = False
+        loc_batches = None
+        act_batches = None
 
         if (locations_tensor is None or activations_tensor is None) and hasattr(
             cache.cache, "latent_locations_batches"
@@ -197,32 +247,49 @@ def _collect_latent_stats_from_cache(
             loc_batches = cache.cache.latent_locations_batches.get(hookpoint, [])
             act_batches = cache.cache.latent_activations_batches.get(hookpoint, [])
             if loc_batches and act_batches:
-                locations_tensor = torch.cat(loc_batches, dim=0)
-                activations_tensor = torch.cat(act_batches, dim=0)
+                use_batches = True
 
-        if locations_tensor is None or activations_tensor is None:
-            continue
-        if locations_tensor.numel() == 0:
-            continue
-        adapter_offset = adapter_offsets[name]
-        locations = locations_tensor.numpy()
-        activations = activations_tensor.numpy()
-        order = np.argsort(locations[:, 0])
-        loc_sorted = locations[order]
-        act_sorted = activations[order]
-        current_seq = int(loc_sorted[0, 0])
-        max_by_latent = {}
-        for loc, act in zip(loc_sorted, act_sorted):
-            seq_idx = int(loc[0])
-            if seq_idx != current_seq:
-                _update_from_sequence(current_seq, max_by_latent, adapter_offset)
-                max_by_latent = {}
-                current_seq = seq_idx
-            feature_idx = int(loc[2])
-            prev = max_by_latent.get(feature_idx)
-            if prev is None or act > prev:
-                max_by_latent[feature_idx] = act
-        _update_from_sequence(current_seq, max_by_latent, adapter_offset)
+        if use_batches:
+            # Process batches incrementally — vectorised per batch.
+            # Each batch is processed independently which is safe because
+            # _vectorized_per_seq_max uses np.maximum.at / np.add.at which
+            # correctly accumulate across multiple calls for the same seq/latent.
+            #
+            # NOTE: a sequence appearing in multiple batches will have its max
+            # computed separately per batch, then both maxima contribute to sums.
+            # This is the same semantics as the original code which sorted globally
+            # and only flushed on seq_idx change — *provided* each batch contains
+            # complete sequences. The upstream InMemoryCache.add() processes one
+            # model-forward batch at a time with all its token positions, so each
+            # batch already contains all positions for the sequences it covers.
+            logging.info(
+                f"  Processing {len(loc_batches)} batches for {hookpoint} (vectorised)..."
+            )
+            for batch_idx, (loc_batch, act_batch) in enumerate(
+                zip(loc_batches, act_batches)
+            ):
+                if loc_batch.numel() == 0:
+                    continue
+                _vectorized_per_seq_max(
+                    loc_batch.cpu().numpy(),
+                    act_batch.cpu().numpy(),
+                    adapter_offset,
+                )
+                if (batch_idx + 1) % 500 == 0:
+                    logging.info(
+                        f"    ... processed {batch_idx + 1}/{len(loc_batches)} batches"
+                    )
+        else:
+            # Original path: use materialized tensors
+            if locations_tensor is None or activations_tensor is None:
+                continue
+            if locations_tensor.numel() == 0:
+                continue
+            _vectorized_per_seq_max(
+                locations_tensor.numpy(),
+                activations_tensor.numpy(),
+                adapter_offset,
+            )
 
     # Convert aggregated buffers into summary records
     counts = max(len(prompt_ids), 1)
@@ -356,70 +423,195 @@ def compute_co_occurrence_from_cache(cache, wrapped_modules):
     For each position (batch_idx, seq_idx), finds all latents that fired
     and increments co-occurrence counts for each pair.
 
+    Uses vectorised NumPy/scipy operations instead of Python loops for
+    significant speed-up on large caches.  Processes data in chunks to
+    avoid OOM on very large caches (billions of activations).
+
     Args:
         cache: LatentCache object with populated cache.latent_locations
         wrapped_modules: Dictionary of module name -> TopKLoRALinearSTE module
 
     Returns:
-        tuple: (co_occurrence, hookpoint_meta)
-            - co_occurrence: dict[int, dict[int, int]] where
-                co_occurrence[latent_a][latent_b] = count of positions
-                where both latents fired together
+        tuple: (co_occurrence_coo, hookpoint_meta)
+            - co_occurrence_coo: dict with keys 'row', 'col', 'count'
+                (int32 numpy arrays, upper-triangle only, row < col)
             - hookpoint_meta: dict with offsets, widths, total_latents
     """
-    from collections import defaultdict
-    from tqdm import tqdm
+    import gc
+
+    from scipy import sparse
 
     hookpoint_offsets, hookpoint_widths, total_latents = build_hookpoint_offsets(
         wrapped_modules
     )
 
-    # Group all active latents by position (batch_idx, seq_idx)
-    position_to_latents = defaultdict(list)
+    # ------------------------------------------------------------------
+    # Helper: iterate (position_key, global_latent_id) pairs without
+    # materializing everything into one giant array.
+    # ------------------------------------------------------------------
+    def _iter_location_chunks():
+        """Yield (loc_np,) chunks — one per materialized tensor or batch."""
+        resolved = cache.cache.latent_locations
+        if resolved:
+            for hookpoint, locations in resolved.items():
+                if locations is None or locations.numel() == 0:
+                    continue
+                yield hookpoint, locations.numpy()
+        elif hasattr(cache.cache, "latent_locations_batches"):
+            for hookpoint, batches in cache.cache.latent_locations_batches.items():
+                if not batches:
+                    continue
+                for batch in batches:
+                    if batch.numel() == 0:
+                        continue
+                    yield hookpoint, batch.cpu().numpy()
 
-    for hookpoint, locations in cache.cache.latent_locations.items():
-        if locations is None or locations.numel() == 0:
-            continue
+    # Find max seq_idx for composite key stride
+    max_seq = 0
+    for _, loc_np in _iter_location_chunks():
+        chunk_max = int(loc_np[:, 1].max())
+        if chunk_max > max_seq:
+            max_seq = chunk_max
+    stride = max_seq + 1
 
-        offset = hookpoint_offsets.get(hookpoint, 0)
-        locations_np = locations.numpy()
+    # ------------------------------------------------------------------
+    # Build the global position-key mapping incrementally.
+    # We need a consistent dense row index for each unique (batch, seq)
+    # position across all chunks.  Do a two-pass approach:
+    #   Pass 1: collect unique position keys (just int64 scalars, not rows)
+    #   Pass 2: build sparse indicator columns chunk-by-chunk
+    # ------------------------------------------------------------------
+    logging.info("Co-occurrence pass 1: collecting unique position keys...")
+    unique_keys_set: set[int] = set()
+    total_activations = 0
 
-        for i in range(locations_np.shape[0]):
-            batch_idx = int(locations_np[i, 0])
-            seq_idx = int(locations_np[i, 1])
-            local_latent_idx = int(locations_np[i, 2])
-            global_latent_id = offset + local_latent_idx
+    for _, loc_np in _iter_location_chunks():
+        keys = loc_np[:, 0].astype(np.int64) * stride + loc_np[:, 1].astype(np.int64)
+        unique_keys_set.update(keys.tolist())
+        total_activations += len(keys)
 
-            position_to_latents[(batch_idx, seq_idx)].append(global_latent_id)
+    if not unique_keys_set:
+        logging.warning("No latent activations found for co-occurrence.")
+        hookpoint_meta = {
+            "offsets": hookpoint_offsets,
+            "widths": hookpoint_widths,
+            "total_latents": total_latents,
+        }
+        return {}, hookpoint_meta
 
-    # Compute co-occurrence counts
-    co_occurrence = defaultdict(lambda: defaultdict(int))
+    # Build key→row mapping
+    sorted_keys = np.array(sorted(unique_keys_set), dtype=np.int64)
+    key_to_row = {int(k): i for i, k in enumerate(sorted_keys)}
+    n_positions = len(sorted_keys)
+    del unique_keys_set, sorted_keys
+    gc.collect()
 
-    n_positions = len(position_to_latents)
-    logging.info(f"Computing co-occurrence across {n_positions} positions...")
-
-    for position, latent_ids in tqdm(
-        position_to_latents.items(), desc="Computing co-occurrence"
-    ):
-        # For each pair of latents at this position, increment co-occurrence
-        latent_ids_sorted = sorted(set(latent_ids))  # dedupe within position
-        n = len(latent_ids_sorted)
-        for i in range(n):
-            latent_a = latent_ids_sorted[i]
-            for j in range(i + 1, n):
-                latent_b = latent_ids_sorted[j]
-                # Store bidirectionally for easy lookup
-                co_occurrence[latent_a][latent_b] += 1
-                co_occurrence[latent_b][latent_a] += 1
-
-    # Convert to regular dicts for serialization
-    co_occurrence = {k: dict(v) for k, v in co_occurrence.items()}
-
-    total_pairs = sum(len(v) for v in co_occurrence.values()) // 2
     logging.info(
-        f"Co-occurrence computed: {len(co_occurrence)} latents with "
+        f"Co-occurrence pass 2: building sparse indicator "
+        f"({n_positions:,} positions × {total_latents} latents "
+        f"from {total_activations:,} activations)..."
+    )
+
+    # ------------------------------------------------------------------
+    # Pass 2: accumulate the sparse indicator matrix chunk by chunk.
+    # We accumulate directly into the co-occurrence matrix (latents × latents)
+    # to avoid ever materializing the full (positions × latents) indicator.
+    # For each chunk we build a small indicator, compute chunk_co = ind.T @ ind
+    # and add it to a running total.
+    # ------------------------------------------------------------------
+    co_matrix = None  # will be (total_latents × total_latents) sparse
+
+    # Process in larger chunks to amortize scipy overhead.  Group batches
+    # until we hit a target chunk size.
+    CHUNK_TARGET = 50_000_000  # ~50M activations per chunk ≈ 400MB RAM
+
+    chunk_rows = []
+    chunk_cols = []
+    chunk_n = 0
+    chunks_processed = 0
+
+    def _flush_chunk():
+        nonlocal co_matrix, chunk_rows, chunk_cols, chunk_n, chunks_processed
+        if chunk_n == 0:
+            return
+        row_arr = np.concatenate(chunk_rows)
+        col_arr = np.concatenate(chunk_cols)
+        chunk_rows.clear()
+        chunk_cols.clear()
+
+        indicator = sparse.csr_matrix(
+            (np.ones(len(row_arr), dtype=np.float32), (row_arr, col_arr)),
+            shape=(n_positions, total_latents),
+        )
+        indicator.data = np.minimum(indicator.data, 1.0)
+
+        chunk_co = (indicator.T @ indicator).tocsr()
+        del indicator, row_arr, col_arr
+        gc.collect()
+
+        if co_matrix is None:
+            co_matrix = chunk_co
+        else:
+            co_matrix = co_matrix + chunk_co
+        del chunk_co
+        gc.collect()
+
+        chunks_processed += 1
+        chunk_n = 0
+        if chunks_processed % 5 == 0:
+            logging.info(f"  ... processed {chunks_processed} co-occurrence chunks")
+
+    for hookpoint, loc_np in _iter_location_chunks():
+        offset = hookpoint_offsets.get(hookpoint, 0)
+
+        keys = loc_np[:, 0].astype(np.int64) * stride + loc_np[:, 1].astype(np.int64)
+        rows = np.array([key_to_row[int(k)] for k in keys], dtype=np.int32)
+        cols = (loc_np[:, 2].astype(np.int64) + offset).astype(np.int32)
+
+        chunk_rows.append(rows)
+        chunk_cols.append(cols)
+        chunk_n += len(rows)
+
+        if chunk_n >= CHUNK_TARGET:
+            _flush_chunk()
+
+    _flush_chunk()
+
+    if co_matrix is None:
+        logging.warning("No co-occurrence data computed.")
+        hookpoint_meta = {
+            "offsets": hookpoint_offsets,
+            "widths": hookpoint_widths,
+            "total_latents": total_latents,
+        }
+        return {}, hookpoint_meta
+
+    # Extract upper triangle
+    co_coo = co_matrix.tocoo()
+    del co_matrix
+    gc.collect()
+
+    mask = co_coo.row < co_coo.col
+    rows_ut = co_coo.row[mask].astype(np.int32)
+    cols_ut = co_coo.col[mask].astype(np.int32)
+    vals_ut = co_coo.data[mask].astype(np.int32)
+    del co_coo, mask
+    gc.collect()
+
+    total_pairs = len(vals_ut)
+    n_latents_with_pairs = (
+        len(np.unique(np.concatenate([rows_ut, cols_ut]))) if total_pairs > 0 else 0
+    )
+    logging.info(
+        f"Co-occurrence computed: {n_latents_with_pairs} latents with "
         f"{total_pairs} unique co-occurring pairs"
     )
+
+    co_occurrence_coo = {
+        "row": rows_ut,
+        "col": cols_ut,
+        "count": vals_ut,
+    }
 
     hookpoint_meta = {
         "offsets": hookpoint_offsets,
@@ -427,7 +619,7 @@ def compute_co_occurrence_from_cache(cache, wrapped_modules):
         "total_latents": total_latents,
     }
 
-    return co_occurrence, hookpoint_meta
+    return co_occurrence_coo, hookpoint_meta
 
 
 def get_latent_info(global_latent_id, hookpoint_offsets, hookpoint_widths):
@@ -453,34 +645,89 @@ def get_latent_info(global_latent_id, hookpoint_offsets, hookpoint_widths):
     return {"hookpoint": None, "local_idx": None, "global_id": global_latent_id}
 
 
-def save_co_occurrence(co_occurrence, hookpoint_meta, save_dir):
+def save_co_occurrence(co_occurrence_coo, hookpoint_meta, save_dir):
     """
-    Save co-occurrence data to disk.
+    Save co-occurrence data to disk as a compressed .npz file.
+
+    The .npz stores three int32 arrays (row, col, count) representing the
+    upper triangle of the symmetric co-occurrence matrix.  This is
+    typically 50-100× smaller than the previous indented-JSON format.
 
     Args:
-        co_occurrence: dict[int, dict[int, int]] co-occurrence counts
+        co_occurrence_coo: dict with 'row', 'col', 'count' int32 arrays
+            (upper-triangle only, row < col)
         hookpoint_meta: dict with offsets, widths, total_latents
         save_dir: Path to directory where data will be saved
     """
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save co-occurrence as JSON
-    co_occurrence_path = save_dir / "co_occurrence.json"
-    with open(co_occurrence_path, "w") as f:
-        # Convert int keys to strings for JSON compatibility
-        json_compatible = {
-            str(k): {str(k2): v2 for k2, v2 in v.items()}
-            for k, v in co_occurrence.items()
-        }
-        json.dump(json_compatible, f, indent=2)
+    # Save co-occurrence as compressed numpy arrays
+    co_occurrence_path = save_dir / "co_occurrence.npz"
+    np.savez_compressed(
+        co_occurrence_path,
+        row=co_occurrence_coo["row"],
+        col=co_occurrence_coo["col"],
+        count=co_occurrence_coo["count"],
+    )
 
     # Save hookpoint offsets for ID resolution
     offsets_path = save_dir / "hookpoint_offsets.json"
     with open(offsets_path, "w") as f:
         json.dump(hookpoint_meta, f, indent=2)
 
-    logging.info(f"Saved co-occurrence data to {save_dir}")
+    nbytes = co_occurrence_path.stat().st_size
+    logging.info(
+        f"Saved co-occurrence data to {save_dir} "
+        f"({len(co_occurrence_coo['row'])} pairs, {nbytes / 1e6:.1f} MB)"
+    )
+
+
+def load_co_occurrence(save_dir, as_sparse=False):
+    """
+    Load co-occurrence data from disk.
+
+    Args:
+        save_dir: Path to directory containing co_occurrence.npz and
+            hookpoint_offsets.json.
+        as_sparse: If True, return a scipy.sparse.coo_matrix.
+            If False (default), return a nested dict
+            ``{latent_a: {latent_b: count, ...}, ...}`` (bidirectional).
+
+    Returns:
+        tuple: (co_occurrence, hookpoint_meta)
+    """
+    save_dir = Path(save_dir)
+
+    with open(save_dir / "hookpoint_offsets.json") as f:
+        hookpoint_meta = json.load(f)
+
+    data = np.load(save_dir / "co_occurrence.npz")
+    rows = data["row"]
+    cols = data["col"]
+    counts = data["count"]
+
+    if as_sparse:
+        from scipy import sparse
+
+        total = hookpoint_meta["total_latents"]
+        # Build symmetric matrix from upper triangle
+        all_rows = np.concatenate([rows, cols])
+        all_cols = np.concatenate([cols, rows])
+        all_vals = np.concatenate([counts, counts])
+        co_matrix = sparse.coo_matrix(
+            (all_vals, (all_rows, all_cols)),
+            shape=(total, total),
+        )
+        return co_matrix, hookpoint_meta
+
+    # Build bidirectional nested dict
+    co_occurrence = {}
+    for r, c, v in zip(rows, cols, counts):
+        r_int, c_int, v_int = int(r), int(c), int(v)
+        co_occurrence.setdefault(r_int, {})[c_int] = v_int
+        co_occurrence.setdefault(c_int, {})[r_int] = v_int
+    return co_occurrence, hookpoint_meta
 
 
 class ChatTemplateCollator:
@@ -744,17 +991,30 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
     try:
         logging.info("Cache collection complete. Checking cache contents...")
         total_entries = 0
-        for hookpoint, locations in cache.cache.latent_locations.items():
-            num_entries = int(locations.shape[0]) if locations is not None else 0
-            total_entries += num_entries
-            logging.info(f"  {hookpoint}: {num_entries} non-zero activations")
+
+        # In streaming mode the data lives in *_batches dicts, not the
+        # materialized latent_locations / latent_activations dicts.
+        # Count entries WITHOUT concatenating to avoid OOM on large caches.
+        _loc_src = cache.cache.latent_locations
+        if _loc_src:
+            for hookpoint, locations in _loc_src.items():
+                num_entries = int(locations.shape[0]) if locations is not None else 0
+                total_entries += num_entries
+                logging.info(f"  {hookpoint}: {num_entries} non-zero activations")
+        elif hasattr(cache.cache, "latent_locations_batches"):
+            for hp, batches in cache.cache.latent_locations_batches.items():
+                if not batches:
+                    continue
+                num_entries = sum(b.shape[0] for b in batches)
+                total_entries += num_entries
+                logging.info(f"  {hp}: {num_entries} non-zero activations")
         if total_entries == 0:
-            logging.info("WARNING: No latent activations were recorded.")
+            logging.warning("No latent activations were recorded.")
         out_dir = Path(
-            f"delphi_cache/{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_layer{cfg.model.layer}"
+            f"delphi_cache/{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_reg{cfg.model.reg}_layer{cfg.model.layer}"
         )
         out_dir.mkdir(parents=True, exist_ok=True)
-        cache.save_splits(n_splits=4, save_dir=out_dir)
+        cache.save_splits(n_splits=84, save_dir=out_dir)
         widths = {f"{name}.topk": wrapped_modules[name].r for name in wrapped_modules}
 
         for hookpoint in widths:
@@ -801,7 +1061,7 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
 
 def delphi_select_latents(cfg):
     stats_dir = Path(
-        f"delphi_cache/{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_layer{cfg.model.layer}/stats"
+        f"delphi_cache/{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_reg{cfg.model.reg}_layer{cfg.model.layer}/stats"
     )
     if not os.path.exists(stats_dir):
         raise ValueError(f"Stats dir not found: {stats_dir}")
@@ -828,7 +1088,7 @@ def delphi_select_latents(cfg):
 def delphi_score(cfg, model, tokenizer, wrapped_modules):
     cfg_exp = cfg.evals.auto_interp.delphi_scoring
     # Create model-specific identifier string based on config
-    model_str = f"{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_layer{cfg.model.layer}"
+    model_str = f"{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_reg{cfg.model.reg}_layer{cfg.model.layer}"
 
     topk_modules = [f"{name}.topk" for name, _ in wrapped_modules.items()]
 
@@ -863,7 +1123,7 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
     # 1) Load the raw cache you saved
     dataset = LatentDataset(
         raw_dir=Path(
-            f"delphi_cache/{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_layer{cfg.model.layer}"
+            f"delphi_cache/{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_reg{cfg.model.reg}_layer{cfg.model.layer}"
         ),
         modules=topk_modules,
         latents={
