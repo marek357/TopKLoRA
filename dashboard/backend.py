@@ -8,6 +8,7 @@ in app.py only calls these functions.
 
 import glob
 import json
+import logging
 from pathlib import Path
 
 import torch
@@ -16,6 +17,8 @@ from peft import PeftModel
 
 from src.utils import wrap_topk_lora_modules
 from src.steering import FeatureSteeringContext, list_available_adapters
+
+logger = logging.getLogger(__name__)
 
 MODELS_DIR = Path("models")
 CACHE_DIR = Path("delphi_cache")
@@ -53,8 +56,7 @@ def discover_base_models() -> list[str]:
     if not MODELS_DIR.is_dir():
         return []
     return sorted(
-        str(Path(p).parent)
-        for p in glob.glob(str(MODELS_DIR / "*/config.json"))
+        str(Path(p).parent) for p in glob.glob(str(MODELS_DIR / "*/config.json"))
     )
 
 
@@ -70,7 +72,8 @@ def discover_adapters() -> list[dict]:
 
     results = []
     for adapter_cfg_path in sorted(
-        Path(p) for p in glob.glob(str(MODELS_DIR / "**/adapter_config.json"), recursive=True)
+        Path(p)
+        for p in glob.glob(str(MODELS_DIR / "**/adapter_config.json"), recursive=True)
     ):
         adapter_dir = adapter_cfg_path.parent
         # Build a human-friendly display name from relative path
@@ -82,6 +85,7 @@ def discover_adapters() -> list[dict]:
             cfg = json.loads(adapter_cfg_path.read_text())
             r = cfg.get("r", None)
         except Exception:
+            logger.warning("Failed to read %s", adapter_cfg_path, exc_info=True)
             r = None
 
         # Try to read k_final from hparams.json (more accurate than dir name)
@@ -92,7 +96,7 @@ def discover_adapters() -> list[dict]:
                 hp = json.loads(hparams_path.read_text())
                 k_final = hp.get("lora_topk", {}).get("k_final", None)
             except Exception:
-                pass
+                logger.warning("Failed to read %s", hparams_path, exc_info=True)
 
         # Fallback: parse k from directory path (e.g. "dpo/mlp/k64/...")
         if k_final is None:
@@ -130,9 +134,7 @@ def get_cached_hookpoints(adapter_name: str) -> list[str]:
         return []
 
     hookpoints = []
-    for child in sorted(
-        Path(p) for p in glob.glob(str(adapter_dir / "*/"))
-    ):
+    for child in sorted(Path(p) for p in glob.glob(str(adapter_dir / "*/"))):
         if not child.name.startswith(".") and child.name != "stats":
             config_path = child / "config.json"
             if config_path.exists():
@@ -142,20 +144,19 @@ def get_cached_hookpoints(adapter_name: str) -> list[str]:
                     if isinstance(config, dict):
                         hookpoints.append(child.name)
                 except Exception:
-                    # Skip directories with invalid config.json
-                    pass
+                    logger.warning("Failed to read %s", config_path, exc_info=True)
     return hookpoints
 
 
 def get_cached_hookpoint_config(adapter_name: str, hookpoint: str) -> dict:
-    """Read config.json for a cached hookpoint."""
+    """Read config.json for a cached hookpoint.
+
+    Raises:
+        FileNotFoundError: If config.json does not exist.
+        json.JSONDecodeError: If config.json is not valid JSON.
+    """
     config_path = CACHE_DIR / adapter_name / hookpoint / "config.json"
-    if not config_path.exists():
-        return {}
-    try:
-        return json.loads(config_path.read_text())
-    except Exception:
-        return {}
+    return json.loads(config_path.read_text())
 
 
 def get_cached_latent_choices(
@@ -172,32 +173,29 @@ def get_cached_latent_choices(
     if not stats_path.exists() or not offsets_path.exists():
         return []
 
-    try:
-        # Load hookpoint offsets to determine latent_id range
-        offsets_data = json.loads(offsets_path.read_text())
-        if hookpoint not in offsets_data["offsets"]:
-            return []
-
-        start_id = offsets_data["offsets"][hookpoint]
-        width = offsets_data["widths"][hookpoint]
-        end_id = start_id + width
-
-        # Read latent stats and filter by latent_id range
-        choices = []
-        with open(stats_path, "r") as f:
-            for line in f:
-                stat = json.loads(line)
-                latent_id = stat["latent_id"]
-                if start_id <= latent_id < end_id:
-                    p_active = stat["p_active"]
-                    # Convert to local index (relative to this hookpoint)
-                    local_idx = latent_id - start_id
-                    display = f"Latent {local_idx} (p_active={p_active:.3f})"
-                    choices.append((display, local_idx))
-
-        return choices
-    except Exception:
+    # Load hookpoint offsets to determine latent_id range
+    offsets_data = json.loads(offsets_path.read_text())
+    if hookpoint not in offsets_data["offsets"]:
         return []
+
+    start_id = offsets_data["offsets"][hookpoint]
+    width = offsets_data["widths"][hookpoint]
+    end_id = start_id + width
+
+    # Read latent stats and filter by latent_id range
+    choices = []
+    with open(stats_path, "r") as f:
+        for line in f:
+            stat = json.loads(line)
+            latent_id = stat["latent_id"]
+            if start_id <= latent_id < end_id:
+                p_active = stat["p_active"]
+                # Convert to local index (relative to this hookpoint)
+                local_idx = latent_id - start_id
+                display = f"Latent {local_idx} (p_active={p_active:.3f})"
+                choices.append((display, local_idx))
+
+    return choices
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +220,7 @@ def _infer_k(adapter_path: str) -> int:
             if k is not None:
                 return int(k)
         except Exception:
-            pass
+            logger.warning("Failed to read %s", hparams_path, exc_info=True)
 
     # 2. Directory name convention (e.g. ".../k64/...")
     for part in adapter_dir.parts:
@@ -235,7 +233,7 @@ def _infer_k(adapter_path: str) -> int:
         try:
             return int(json.loads(cfg_path.read_text())["r"])
         except Exception:
-            pass
+            logger.warning("Failed to read %s", cfg_path, exc_info=True)
 
     return 4  # last-resort default
 
@@ -318,6 +316,7 @@ def load_model(
         return status, hookpoint_html
 
     except Exception as exc:
+        logger.error("Error loading model: %s", exc, exc_info=True)
         return f"❌ Error loading model: {exc}", ""
 
 
@@ -601,7 +600,11 @@ def load_top_activating_examples(
                         str(adapter_path), use_fast=True
                     )
     except Exception:
-        pass
+        logger.warning(
+            "Failed to load tokenizer for cached adapter %s",
+            adapter_name,
+            exc_info=True,
+        )
 
     # Find which safetensors file contains this latent
     safetensors_files = sorted(cache_dir.glob("*.safetensors"))
