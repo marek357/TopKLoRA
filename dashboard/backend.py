@@ -208,7 +208,6 @@ def _infer_k(adapter_path: str) -> int:
     Checks (in order):
       1. ``hparams.json`` → ``lora_topk.k_final``
       2. Directory path components matching ``k<digits>``
-    Falls back to the adapter's ``r`` (i.e. no sparsity) if nothing found.
     """
     adapter_dir = Path(adapter_path)
 
@@ -228,15 +227,7 @@ def _infer_k(adapter_path: str) -> int:
         if part.startswith("k") and part[1:].isdigit():
             return int(part[1:])
 
-    # 3. Fallback: read r from adapter_config.json
-    cfg_path = adapter_dir / "adapter_config.json"
-    if cfg_path.exists():
-        try:
-            return int(json.loads(cfg_path.read_text())["r"])
-        except Exception:
-            logger.warning("Failed to read %s", cfg_path, exc_info=True)
-
-    return 4  # last-resort default
+    raise Exception("Couldn't infer k_final")
 
 
 def load_model(
@@ -336,7 +327,7 @@ def get_adapter_info(hookpoint: str) -> dict:
     """Return ``{"r": int, "k": int}`` for *hookpoint*."""
     if hookpoint in state.wrapped_modules:
         m = state.wrapped_modules[hookpoint]
-        return {"r": m.r, "k": m._current_k()}
+        return {"r": m.r, "k": m.topk.k}
     return {"r": 0, "k": 0}
 
 
@@ -515,7 +506,7 @@ def compute_token_activations(
         return "<p>No activations captured (try a different hookpoint).</p>"
 
     # Apply hard TopK mask so only the k active latents are non-zero
-    k = module._current_k()
+    k = module.topk.k
     z_masked = z * _hard_topk_mask(z, k)  # [batch, seq_len, r]
 
     # Cache the full activation tensor [seq_len, r]
@@ -579,7 +570,14 @@ def load_top_activating_examples(
         if len(adapter_parts) >= 4:
             module_type = adapter_parts[0]  # e.g., "mlp"
             k_part = next((p for p in adapter_parts if p.startswith("k")), None)
-            r_part = next((p for p in adapter_parts if p.startswith("r")), None)
+            r_part = next(
+                (
+                    p
+                    for p in adapter_parts
+                    if p.startswith("r") and not p.startswith("reg")
+                ),
+                None,
+            )
             layer_part = next((p for p in adapter_parts if p.startswith("layer")), None)
 
             if k_part and r_part and layer_part:
@@ -733,7 +731,7 @@ def load_top_activating_examples(
             if i in position_indices:
                 # Highlight this activating token
                 activation_val = position_indices[i]
-                intensity = min(activation_val / 10.0, 1.0)
+                intensity = min(activation_val / 5.0, 1.0)
                 r = 255
                 g = int(255 * (1 - intensity))
                 b = int(255 * (1 - intensity))
@@ -883,7 +881,7 @@ def generate_steered(
             continue
         module = state.wrapped_modules[hp]
         if module._last_z is not None:
-            k = module._current_k()
+            k = module.topk.k
             z_masked = module._last_z * _hard_topk_mask(module._last_z, k)
             if hp not in baseline_activations:
                 baseline_activations[hp] = {}
@@ -908,7 +906,7 @@ def generate_steered(
             continue
         module = state.wrapped_modules[hp]
         if module._last_z is not None:
-            k = module._current_k()
+            k = module.topk.k
             z_masked = module._last_z * _hard_topk_mask(module._last_z, k)
             if hp not in steered_activations:
                 steered_activations[hp] = {}
