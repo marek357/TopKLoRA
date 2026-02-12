@@ -6,6 +6,7 @@ too large for gr.State).  All heavy lifting lives here; the Gradio UI
 in app.py only calls these functions.
 """
 
+import glob
 import json
 from pathlib import Path
 
@@ -45,14 +46,16 @@ state = ModelState()
 # ---------------------------------------------------------------------------
 def discover_base_models() -> list[str]:
     """Return paths to local base models (directories containing config.json
-    directly under ``models/``, excluding adapter-only dirs)."""
+    directly under ``models/``, excluding adapter-only dirs).
+
+    Uses ``glob.glob`` instead of ``Path.iterdir`` to follow symlinks.
+    """
     if not MODELS_DIR.is_dir():
         return []
-    results = []
-    for child in sorted(MODELS_DIR.iterdir()):
-        if child.is_dir() and (child / "config.json").exists():
-            results.append(str(child))
-    return results
+    return sorted(
+        str(Path(p).parent)
+        for p in glob.glob(str(MODELS_DIR / "*/config.json"))
+    )
 
 
 def discover_adapters() -> list[dict]:
@@ -66,7 +69,9 @@ def discover_adapters() -> list[dict]:
         return []
 
     results = []
-    for adapter_cfg_path in sorted(MODELS_DIR.rglob("adapter_config.json")):
+    for adapter_cfg_path in sorted(
+        Path(p) for p in glob.glob(str(MODELS_DIR / "**/adapter_config.json"), recursive=True)
+    ):
         adapter_dir = adapter_cfg_path.parent
         # Build a human-friendly display name from relative path
         rel = adapter_dir.relative_to(MODELS_DIR)
@@ -111,11 +116,11 @@ def discover_cached_adapters() -> list[str]:
     """Return paths to adapters with cached activations in delphi_cache/."""
     if not CACHE_DIR.is_dir():
         return []
-    return [
-        str(p.name)
-        for p in sorted(CACHE_DIR.iterdir())
-        if p.is_dir() and not p.name.startswith(".")
-    ]
+    return sorted(
+        Path(p).name
+        for p in glob.glob(str(CACHE_DIR / "*/"))
+        if not Path(p).name.startswith(".")
+    )
 
 
 def get_cached_hookpoints(adapter_name: str) -> list[str]:
@@ -125,9 +130,10 @@ def get_cached_hookpoints(adapter_name: str) -> list[str]:
         return []
 
     hookpoints = []
-    for child in sorted(adapter_dir.iterdir()):
-        if child.is_dir() and not child.name.startswith(".") and child.name != "stats":
-            # Check if it has a config.json
+    for child in sorted(
+        Path(p) for p in glob.glob(str(adapter_dir / "*/"))
+    ):
+        if not child.name.startswith(".") and child.name != "stats":
             config_path = child / "config.json"
             if config_path.exists():
                 try:
@@ -490,7 +496,11 @@ def compute_token_activations(
         messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
     )
     if not isinstance(input_ids, torch.Tensor):
-        input_ids = torch.tensor([input_ids]) if isinstance(input_ids, list) else input_ids["input_ids"]
+        input_ids = (
+            torch.tensor([input_ids])
+            if isinstance(input_ids, list)
+            else input_ids["input_ids"]
+        )
     input_ids = input_ids.to(state.device)
     enc = {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)}
     tokens = state.tokenizer.convert_ids_to_tokens(input_ids[0])
@@ -567,9 +577,25 @@ def load_top_activating_examples(
             layer_part = next((p for p in adapter_parts if p.startswith("layer")), None)
 
             if k_part and r_part and layer_part:
-                adapter_path = (
-                    MODELS_DIR / "dpo" / module_type / k_part / r_part / layer_part
+                # Check for optional reg mode directory (regon/regoff)
+                reg_part = next(
+                    (p for p in adapter_parts if p in ("regon", "regoff")),
+                    None,
                 )
+                if reg_part:
+                    adapter_path = (
+                        MODELS_DIR
+                        / "dpo"
+                        / module_type
+                        / k_part
+                        / r_part
+                        / reg_part
+                        / layer_part
+                    )
+                else:
+                    adapter_path = (
+                        MODELS_DIR / "dpo" / module_type / k_part / r_part / layer_part
+                    )
                 if adapter_path.exists():
                     tokenizer = AutoTokenizer.from_pretrained(
                         str(adapter_path), use_fast=True
@@ -760,7 +786,11 @@ def generate_steered(
         messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
     )
     if not isinstance(input_ids, torch.Tensor):
-        input_ids = torch.tensor([input_ids]) if isinstance(input_ids, list) else input_ids["input_ids"]
+        input_ids = (
+            torch.tensor([input_ids])
+            if isinstance(input_ids, list)
+            else input_ids["input_ids"]
+        )
     input_ids = input_ids.to(state.device)
     enc = {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)}
     prompt_length = input_ids.shape[1]
