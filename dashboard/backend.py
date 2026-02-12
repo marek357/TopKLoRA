@@ -16,6 +16,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
 from src.utils import wrap_topk_lora_modules
+from src.models import _hard_topk_mask
 from src.steering import FeatureSteeringContext, list_available_adapters
 
 logger = logging.getLogger(__name__)
@@ -492,7 +493,7 @@ def compute_token_activations(
     # Use tokenize=True to get correct token IDs directly (avoids double BOS)
     messages = [{"role": "user", "content": text}]
     input_ids = state.tokenizer.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
+        messages, tokenize=True, add_generation_prompt=False, return_tensors="pt"
     )
     if not isinstance(input_ids, torch.Tensor):
         input_ids = (
@@ -504,23 +505,29 @@ def compute_token_activations(
     enc = {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)}
     tokens = state.tokenizer.convert_ids_to_tokens(input_ids[0])
 
-    # _last_z is written in both train and eval mode (models.py:292)
-    # Keep eval mode to disable dropout and ensure determinism
+    # _last_z stores pre-TopK activations (models.py:292); we apply the
+    # hard TopK mask here so the dashboard only shows the k active latents.
     with torch.no_grad():
         state.model(**enc)
 
-    z = module._last_z  # [batch, seq_len, r]
+    z = module._last_z  # [batch, seq_len, r]  (pre-TopK)
     if z is None:
         return "<p>No activations captured (try a different hookpoint).</p>"
+
+    # Apply hard TopK mask so only the k active latents are non-zero
+    k = module._current_k()
+    z_masked = z * _hard_topk_mask(z, k)  # [batch, seq_len, r]
 
     # Cache the full activation tensor [seq_len, r]
     state.viz_cache["text"] = text
     state.viz_cache["hookpoint"] = hookpoint
     state.viz_cache["tokens"] = tokens
-    state.viz_cache["activations"] = z[0].cpu()  # [seq_len, r]
+    state.viz_cache["activations"] = z_masked[0].cpu()  # [seq_len, r]
 
     # Render for the selected latent
-    return _render_activation_html(tokens, z[0, :, latent_idx], hookpoint, latent_idx)
+    return _render_activation_html(
+        tokens, z_masked[0, :, latent_idx], hookpoint, latent_idx
+    )
 
 
 def render_latent_from_cache(latent_idx: int) -> str:
@@ -612,6 +619,9 @@ def load_top_activating_examples(
         return f"<p>No safetensors files found in {cache_dir}</p>"
 
     # Determine which file contains the latent
+    # TODO: This needs to be fixed to allow loading from split_xxxx.safetensors files.
+    # Note, that the StreamingLatentCache's implementation of saving cache files may be
+    # inconsistent with the origin LatentCache.save_splits() method.
     target_file = None
     for f in safetensors_files:
         parts = f.stem.split("_")
@@ -858,8 +868,8 @@ def generate_steered(
     steered_activations = {}
 
     # Baseline activations: forward pass on baseline output
-    # _last_z is written in both train and eval mode (models.py:292)
-    # Keep eval mode to disable dropout and ensure determinism
+    # _last_z stores pre-TopK activations; apply hard TopK mask to extract
+    # only the k active latents.
     baseline_input = {
         "input_ids": baseline_ids,
         "attention_mask": torch.ones_like(baseline_ids),
@@ -873,17 +883,18 @@ def generate_steered(
             continue
         module = state.wrapped_modules[hp]
         if module._last_z is not None:
+            k = module._current_k()
+            z_masked = module._last_z * _hard_topk_mask(module._last_z, k)
             if hp not in baseline_activations:
                 baseline_activations[hp] = {}
             for latent_idx, _ in latent_list:
                 baseline_activations[hp][latent_idx] = (
-                    module._last_z[0, :, latent_idx].cpu().clone()
+                    z_masked[0, :, latent_idx].cpu().clone()
                 )
 
     # Steered activations: forward pass on steered output
     # Run WITHOUT steering context — we want to see the model's natural
     # activations on the steered text (what does the model "see"?)
-    # _last_z records pre-gate z, so steering hooks wouldn't change it anyway.
     steered_input = {
         "input_ids": steered_ids,
         "attention_mask": torch.ones_like(steered_ids),
@@ -897,11 +908,13 @@ def generate_steered(
             continue
         module = state.wrapped_modules[hp]
         if module._last_z is not None:
+            k = module._current_k()
+            z_masked = module._last_z * _hard_topk_mask(module._last_z, k)
             if hp not in steered_activations:
                 steered_activations[hp] = {}
             for latent_idx, _ in latent_list:
                 steered_activations[hp][latent_idx] = (
-                    module._last_z[0, :, latent_idx].cpu().clone()
+                    z_masked[0, :, latent_idx].cpu().clone()
                 )
 
     # Generate HTML outputs
