@@ -150,14 +150,15 @@ def get_cached_hookpoints(adapter_name: str) -> list[str]:
 
 
 def get_cached_hookpoint_config(adapter_name: str, hookpoint: str) -> dict:
-    """Read config.json for a cached hookpoint.
-
-    Raises:
-        FileNotFoundError: If config.json does not exist.
-        json.JSONDecodeError: If config.json is not valid JSON.
-    """
+    """Read config.json for a cached hookpoint."""
     config_path = CACHE_DIR / adapter_name / hookpoint / "config.json"
-    return json.loads(config_path.read_text())
+    if not config_path.exists():
+        return {}
+    try:
+        return json.loads(config_path.read_text())
+    except Exception:
+        logger.warning("Failed to read %s", config_path, exc_info=True)
+        return {}
 
 
 def get_cached_latent_choices(
@@ -174,29 +175,38 @@ def get_cached_latent_choices(
     if not stats_path.exists() or not offsets_path.exists():
         return []
 
-    # Load hookpoint offsets to determine latent_id range
-    offsets_data = json.loads(offsets_path.read_text())
-    if hookpoint not in offsets_data["offsets"]:
+    try:
+        # Load hookpoint offsets to determine latent_id range
+        offsets_data = json.loads(offsets_path.read_text())
+        if hookpoint not in offsets_data["offsets"]:
+            return []
+
+        start_id = offsets_data["offsets"][hookpoint]
+        width = offsets_data["widths"][hookpoint]
+        end_id = start_id + width
+
+        # Read latent stats and filter by latent_id range
+        choices = []
+        with open(stats_path, "r") as f:
+            for line in f:
+                stat = json.loads(line)
+                latent_id = stat["latent_id"]
+                if start_id <= latent_id < end_id:
+                    p_active = stat["p_active"]
+                    # Convert to local index (relative to this hookpoint)
+                    local_idx = latent_id - start_id
+                    display = f"Latent {local_idx} (p_active={p_active:.3f})"
+                    choices.append((display, local_idx))
+
+        return choices
+    except Exception:
+        logger.warning(
+            "Failed to load latent choices for %s/%s",
+            adapter_name,
+            hookpoint,
+            exc_info=True,
+        )
         return []
-
-    start_id = offsets_data["offsets"][hookpoint]
-    width = offsets_data["widths"][hookpoint]
-    end_id = start_id + width
-
-    # Read latent stats and filter by latent_id range
-    choices = []
-    with open(stats_path, "r") as f:
-        for line in f:
-            stat = json.loads(line)
-            latent_id = stat["latent_id"]
-            if start_id <= latent_id < end_id:
-                p_active = stat["p_active"]
-                # Convert to local index (relative to this hookpoint)
-                local_idx = latent_id - start_id
-                display = f"Latent {local_idx} (p_active={p_active:.3f})"
-                choices.append((display, local_idx))
-
-    return choices
 
 
 # ---------------------------------------------------------------------------
@@ -617,9 +627,6 @@ def load_top_activating_examples(
         return f"<p>No safetensors files found in {cache_dir}</p>"
 
     # Determine which file contains the latent
-    # TODO: This needs to be fixed to allow loading from split_xxxx.safetensors files.
-    # Note, that the StreamingLatentCache's implementation of saving cache files may be
-    # inconsistent with the origin LatentCache.save_splits() method.
     target_file = None
     for f in safetensors_files:
         parts = f.stem.split("_")
