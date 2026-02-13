@@ -150,6 +150,13 @@ class StreamingLatentCache(LatentCache):
                 # Rebase latent index (column 2) relative to split start
                 masked_locations[:, 2] = masked_locations[:, 2] - start_int
 
+                if masked_locations.shape[0] > 0 and (masked_locations[:, 2] < 0).any():
+                    raise ValueError(
+                        f"Rebased latent indices must be non-negative, but got "
+                        f"minimum {masked_locations[:, 2].min()} for split "
+                        f"[{start_int}, {end_int}]."
+                    )
+
                 # Dtype optimization to reduce file size (matches parent class)
                 if masked_locations.shape[0] > 0:
                     if (
