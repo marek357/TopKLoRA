@@ -5,7 +5,11 @@ from typing import Callable
 
 import numpy as np
 import torch
+from tqdm import tqdm
+
 from delphi.latents.cache import LatentCache
+from delphi.latents.collect_activations import collect_activations
+
 from jaxtyping import Float
 from torch import Tensor
 from transformers import PreTrainedModel
@@ -25,7 +29,7 @@ class StreamingLatentCache(LatentCache):
         hookpoint_to_sparse_encode: dict[str, Callable],
         batch_size: int,
         transcode: bool = False,
-        filters: dict[str, Float[Tensor, "indices"]] | None = None,
+        filters: dict[str, Float[Tensor, "indices"]] | None = None,  # noqa: F821
         log_path: Path | None = None,
         streaming: bool = False,
     ):
@@ -48,15 +52,10 @@ class StreamingLatentCache(LatentCache):
             logging.info("No token batches to process; skipping caching")
             return
 
-        tokens_per_batch = token_batches[0].numel()
-        from delphi.latents.collect_activations import collect_activations
-
         with torch.no_grad():
-            from tqdm import tqdm
-
             with tqdm(total=total_batches, desc="Caching latents") as pbar:
                 for batch_number, batch in enumerate(token_batches):
-                    total_tokens += tokens_per_batch
+                    total_tokens += batch.numel()
 
                     with collect_activations(
                         self.model,
@@ -97,7 +96,6 @@ class StreamingLatentCache(LatentCache):
         n_splits: int,
         save_dir: Path,
         save_tokens: bool = True,
-        max_split_bytes: int = 2 * 1024**3,  # 2 GiB target per split file
     ):
         if not self.streaming:
             return super().save_splits(
@@ -108,116 +106,79 @@ class StreamingLatentCache(LatentCache):
 
         from safetensors.numpy import save_file
 
+        split_indices = self._generate_split_indices(n_splits)
+
         for module_path in list(self.cache.latent_locations_batches.keys()):
-            locations_batches = self.cache.latent_locations_batches[module_path]
-            activations_batches = self.cache.latent_activations_batches[module_path]
-            tokens_batches = self.cache.tokens_batches[module_path]
+            loc_batches = self.cache.latent_locations_batches[module_path]
+            act_batches = self.cache.latent_activations_batches[module_path]
+            tok_batches = self.cache.tokens_batches[module_path]
 
             module_dir = save_dir / module_path
             module_dir.mkdir(parents=True, exist_ok=True)
 
-            # Write tokens once to a shared file instead of duplicating in
-            # every split.  Concatenate one batch at a time to cap peak memory.
-            if save_tokens and tokens_batches:
-                tokens_file = module_dir / "tokens.safetensors"
-                token_arrays = [b.cpu().numpy() for b in tokens_batches]
-                tokens_np = np.concatenate(token_arrays, axis=0)
-                save_file({"tokens": tokens_np}, tokens_file)
-                del token_arrays, tokens_np
-                gc.collect()
-
-            # Compute total number of examples (rows across all batches)
-            total_examples = sum(loc.shape[0] for loc in locations_batches)
-            if total_examples == 0:
-                continue
-
-            # Estimate bytes per row to auto-compute a safe number of splits.
-            # locations: typically int64 × ncols;  activations: typically float32 × 1
-            sample_loc = locations_batches[0]
-            sample_act = activations_batches[0]
-            loc_row_bytes = (
-                sample_loc.element_size() * sample_loc.shape[1]
-                if sample_loc.dim() > 1
-                else sample_loc.element_size()
-            )
-            act_row_bytes = (
-                sample_act.element_size() * sample_act.shape[1]
-                if sample_act.dim() > 1
-                else sample_act.element_size()
-            )
-            bytes_per_row = loc_row_bytes + act_row_bytes
-            # safetensors _tobytes() needs ~2× the array size (array + serialized copy)
-            effective_bytes_per_row = bytes_per_row * 2
-
-            total_bytes_est = total_examples * effective_bytes_per_row
-            min_splits_for_memory = max(
-                1, int(np.ceil(total_bytes_est / max_split_bytes))
-            )
-            actual_splits = max(n_splits, min_splits_for_memory)
-
-            if actual_splits > n_splits:
-                logging.info(
-                    f"  {module_path}: auto-increased splits from {n_splits} to "
-                    f"{actual_splits} ({total_examples:,} rows × {bytes_per_row} B/row "
-                    f"≈ {total_bytes_est / 1024**3:.1f} GiB, target {max_split_bytes / 1024**3:.1f} GiB/split)"
+            # Concatenate tokens once (small relative to locations/activations)
+            tokens_np = None
+            if save_tokens and tok_batches:
+                tokens_np = np.concatenate(
+                    [b.cpu().numpy() for b in tok_batches], axis=0
                 )
 
-            examples_per_split = max(1, total_examples // actual_splits)
+            # One pass per latent range — only the matching rows are
+            # concatenated, keeping peak memory at ~data_size/n_splits.
+            for start, end in split_indices:
+                start_int, end_int = start.item(), end.item()
+                parts_loc: list[np.ndarray] = []
+                parts_act: list[np.ndarray] = []
 
-            split_num = 0
-            cumulative_examples = 0
-            split_loc_parts: list[np.ndarray] = []
-            split_act_parts: list[np.ndarray] = []
+                for loc_batch, act_batch in zip(loc_batches, act_batches):
+                    mask = (loc_batch[:, 2] >= start_int) & (loc_batch[:, 2] <= end_int)
+                    if mask.any():
+                        parts_loc.append(loc_batch[mask].cpu().numpy())
+                        parts_act.append(act_batch[mask].cpu().numpy())
 
-            def _flush_split():
-                nonlocal split_num, split_loc_parts, split_act_parts
-                if not split_loc_parts:
-                    return
-                masked_locations = np.concatenate(split_loc_parts, axis=0)
-                masked_activations = np.concatenate(split_act_parts, axis=0)
-                split_loc_parts.clear()
-                split_act_parts.clear()
+                if parts_loc:
+                    masked_locations = np.concatenate(parts_loc, axis=0)
+                    masked_activations = np.concatenate(parts_act, axis=0).astype(
+                        np.float16
+                    )
+                else:
+                    masked_locations = np.empty((0, 3), dtype=np.uint16)
+                    masked_activations = np.empty((0,), dtype=np.float16)
 
-                output_file = module_dir / f"split_{split_num:04d}.safetensors"
-                split_data = {
+                del parts_loc, parts_act
+
+                # Rebase latent index (column 2) relative to split start
+                masked_locations[:, 2] = masked_locations[:, 2] - start_int
+
+                # Dtype optimization to reduce file size (matches parent class)
+                if masked_locations.shape[0] > 0:
+                    if (
+                        masked_locations[:, 2].max() < 2**16
+                        and masked_locations[:, 0].max() < 2**16
+                    ):
+                        masked_locations = masked_locations.astype(np.uint16)
+                    else:
+                        masked_locations = masked_locations.astype(np.uint32)
+                        logging.warning(
+                            "Increasing the number of splits might reduce the "
+                            "memory usage of the cache."
+                        )
+                else:
+                    masked_locations = masked_locations.astype(np.uint16)
+
+                split_data: dict[str, np.ndarray] = {
                     "locations": masked_locations,
                     "activations": masked_activations,
                 }
-                save_file(split_data, output_file)
+                if save_tokens and tokens_np is not None:
+                    split_data["tokens"] = tokens_np
+
+                save_file(split_data, module_dir / f"{start_int}_{end_int}.safetensors")
                 del masked_locations, masked_activations, split_data
                 gc.collect()
-                split_num += 1
 
-            for loc_batch, act_batch in zip(locations_batches, activations_batches):
-                batch_size = loc_batch.shape[0]
-                batch_start = 0
-
-                while batch_start < batch_size:
-                    # How many examples can we take from this batch before hitting the limit?
-                    space_in_split = examples_per_split - (
-                        cumulative_examples % examples_per_split
-                    )
-                    batch_end = min(batch_start + space_in_split, batch_size)
-
-                    split_loc_parts.append(
-                        loc_batch[batch_start:batch_end].cpu().numpy()
-                    )
-                    split_act_parts.append(
-                        act_batch[batch_start:batch_end].cpu().numpy()
-                    )
-
-                    cumulative_examples += batch_end - batch_start
-                    batch_start = batch_end
-
-                    # If we've hit the split size, save and reset
-                    if (
-                        cumulative_examples % examples_per_split == 0
-                        and split_loc_parts
-                    ):
-                        _flush_split()
-
-            # Save any remaining examples
-            _flush_split()
+            del tokens_np
+            gc.collect()
 
 
 def make_latent_cache(
@@ -225,7 +186,7 @@ def make_latent_cache(
     hookpoint_to_sparse_encode: dict[str, Callable],
     batch_size: int,
     transcode: bool = False,
-    filters: dict[str, Float[Tensor, "indices"]] | None = None,
+    filters: dict[str, Float[Tensor, "indices"]] | None = None,  # noqa: F821
     log_path: Path | None = None,
     streaming: bool = False,
 ) -> LatentCache:
