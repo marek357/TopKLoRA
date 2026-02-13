@@ -1184,8 +1184,6 @@ def _collect_hparams(
         "r": int(lora.r),
         "k": int(lora.k),
         "k_final": int(getattr(lora, "k_final", lora.k) or lora.k),
-        "reg_mode": getattr(experiment_args, "reg_mode", None) or "z_only",
-        "reg_mode_tag": getattr(experiment_args, "reg_mode_tag", "auto"),
         "temperature": float(getattr(lora, "temperature", 1.0)),
         "temperature_final": float(
             getattr(lora, "temperature_final", 0.1 * getattr(lora, "temperature", 1.0))

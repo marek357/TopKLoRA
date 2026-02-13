@@ -785,10 +785,6 @@ def run_sft(cfg):
             "dropout": cfg.training.sft_experiment.lora.dropout,
             "target_modules": target_modules,
             "use_topk": getattr(cfg.training.sft_experiment.lora, "use_topk", False),
-            "reg_mode": reg_mode,
-            "reg_mode_tag": getattr(
-                cfg.training.sft_experiment, "reg_mode_tag", "auto"
-            ),
         },
     }
 
@@ -800,10 +796,6 @@ def run_sft(cfg):
                 cfg.training.sft_experiment.lora,
                 "k_final",
                 cfg.training.sft_experiment.lora.k,
-            ),
-            "reg_mode": reg_mode,
-            "reg_mode_tag": getattr(
-                cfg.training.sft_experiment, "reg_mode_tag", "auto"
             ),
             "temperature": getattr(
                 cfg.training.sft_experiment.lora, "temperature", 1.0

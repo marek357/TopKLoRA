@@ -51,7 +51,7 @@ device = (
 def init_model_tokenizer_fixed(model_cfg):
     """Load model with PEFT-compatible TopK wrappers"""
 
-    print(model_cfg.adapter_checkpoint_dir)
+    logging.info(model_cfg.adapter_checkpoint_dir)
     # Load base model and tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         model_cfg.adapter_checkpoint_dir, use_fast=True
