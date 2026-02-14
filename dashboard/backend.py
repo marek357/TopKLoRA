@@ -6,6 +6,7 @@ too large for gr.State).  All heavy lifting lives here; the Gradio UI
 in app.py only calls these functions.
 """
 
+import gc
 import glob
 import json
 import logging
@@ -33,6 +34,8 @@ class ModelState:
     tokenizer = None
     wrapped_modules: dict = {}
     device: str = "cpu"
+    base_model_name: str = ""
+    adapter_name: str = ""
     # Cache for visualization (avoid re-computing activations)
     viz_cache: dict = {
         "text": None,
@@ -41,6 +44,51 @@ class ModelState:
         "activations": None,  # [seq_len, r]
         "turn_boundaries": None,  # [(start, end, role), ...]
     }
+
+    def flush(self):
+        """Release the current model and free GPU/CPU memory.
+
+        Must be called before loading a new model so the old weights
+        don't linger in memory alongside the new ones.
+        """
+        prev_device = self.device
+
+        # Drop references to wrapped modules first (they hold refs to model layers)
+        self.wrapped_modules = {}
+
+        # Delete model and tokenizer
+        if self.model is not None:
+            self.model.cpu()  # move off GPU before deleting
+            del self.model
+            self.model = None
+
+        if self.tokenizer is not None:
+            del self.tokenizer
+            self.tokenizer = None
+
+        # Invalidate visualization cache (stale data from old model)
+        self.viz_cache = {
+            "text": None,
+            "hookpoint": None,
+            "tokens": None,
+            "activations": None,
+            "turn_boundaries": None,
+        }
+
+        self.device = "cpu"
+        self.base_model_name = ""
+        self.adapter_name = ""
+
+        # Force garbage collection and free GPU memory
+        gc.collect()
+        if prev_device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif (
+            prev_device == "mps"
+            and hasattr(torch, "mps")
+            and hasattr(torch.mps, "empty_cache")
+        ):
+            torch.mps.empty_cache()
 
 
 state = ModelState()
@@ -253,6 +301,9 @@ def load_model(
     Returns (status_message, hookpoint_config_html).
     """
     try:
+        # Flush the old model so it doesn't coexist with the new one in memory
+        state.flush()
+
         k = _infer_k(adapter_path)
 
         # 1. Tokenizer from the adapter checkpoint (has chat template)
@@ -294,6 +345,12 @@ def load_model(
         state.tokenizer = tokenizer
         state.wrapped_modules = wrapped_modules
         state.device = device_str
+        state.base_model_name = Path(base_model_path).name
+        state.adapter_name = (
+            str(Path(adapter_path).relative_to(MODELS_DIR))
+            if Path(adapter_path).is_relative_to(MODELS_DIR)
+            else Path(adapter_path).name
+        )
 
         # Build status message
         r_val = list(wrapped_modules.values())[0].r if wrapped_modules else "N/A"
@@ -497,15 +554,21 @@ def _render_activation_html(
         body = f'<div style="line-height:2.2;padding:8px;">{" ".join(spans)}</div>'
 
     # Footer
+    model_info = ""
+    if state.base_model_name:
+        model_info += f" | base={state.base_model_name}"
+    if state.adapter_name:
+        model_info += f" | adapter={state.adapter_name}"
+
     if is_dead:
         footer = (
             f"<p style='margin-top:8px;font-size:0.85em;color:#f59e0b;'>"
-            f"<strong>Dead latent</strong> — all activations ≈ 0 | hookpoint={hookpoint} | latent={latent_idx}</p>"
+            f"<strong>Dead latent</strong> — all activations ≈ 0 | hookpoint={hookpoint} | latent={latent_idx}{model_info}</p>"
         )
     else:
         footer = (
             f"<p style='margin-top:8px;font-size:0.85em;color:#666;'>"
-            f"min={a_min:.4f}, max={a_max:.4f}, mean={a_mean:.4f} | hookpoint={hookpoint} | latent={latent_idx}</p>"
+            f"min={a_min:.4f}, max={a_max:.4f}, mean={a_mean:.4f} | hookpoint={hookpoint} | latent={latent_idx}{model_info}</p>"
         )
 
     return _TOOLTIP_CSS + f'<div style="padding:8px;">{body}</div>' + footer
@@ -1143,10 +1206,24 @@ def _render_generation_with_activations(
     else:
         body = f"<div style='line-height:2.2;'>{' '.join(all_spans)}</div>"
 
+    # Model info footer
+    model_parts = []
+    if state.base_model_name:
+        model_parts.append(f"base={state.base_model_name}")
+    if state.adapter_name:
+        model_parts.append(f"adapter={state.adapter_name}")
+    model_footer = ""
+    if model_parts:
+        model_footer = (
+            f"<p style='margin-top:8px;font-size:0.85em;color:#666;'>"
+            f"{' | '.join(model_parts)}</p>"
+        )
+
     return (
         _TOOLTIP_CSS + f"<div style='padding:8px;'>"
         f"<div style='font-weight:bold;margin-bottom:8px;color:#666;'>{label}</div>"
         f"{body}"
+        f"{model_footer}"
         f"</div>"
     )
 
@@ -1198,7 +1275,11 @@ def _render_activation_stats(
     return (
         f"<div style='padding:8px;'>"
         f"<div style='font-weight:bold;margin-bottom:8px;color:#666;'>Activation Statistics</div>"
-        f"<div style='font-size:0.85em;color:#999;margin-bottom:8px;'>Amplification: {amplification}×</div>"
+        f"<div style='font-size:0.85em;color:#999;margin-bottom:8px;'>"
+        f"Amplification: {amplification}×"
+        f"{f' | base={state.base_model_name}' if state.base_model_name else ''}"
+        f"{f' | adapter={state.adapter_name}' if state.adapter_name else ''}"
+        f"</div>"
         f"<table style='width:100%;border-collapse:collapse;font-size:0.9em;'>"
         f"<thead><tr style='background:#f3f4f6;'>"
         f"<th style='padding:6px 8px;text-align:left;color:#1f2937;font-weight:600;'>Hookpoint</th>"
