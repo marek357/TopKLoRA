@@ -89,10 +89,22 @@ def _on_latent_change(latent_idx):
     return render_latent_from_cache(int(latent_idx))
 
 
-def _on_generate(prompt, steering_data, amplification, max_new_tokens):
+def _on_generate(*args):
+    """Build messages list from dynamic textboxes and run steered generation.
+
+    ``args`` layout: (text_0, ..., text_{n-1}, steering_data, amplification, max_new_tokens)
+    """
+    *texts, steering_data, amplification, max_new_tokens = args
+    messages = []
+    for i, text in enumerate(texts):
+        role = "user" if i % 2 == 0 else "assistant"
+        if text and text.strip():
+            messages.append({"role": role, "content": text.strip()})
+    if not messages:
+        return "<p>Enter at least one message.</p>", "", ""
     rows = steering_data if steering_data is not None else []
     baseline_html, steered_html, stats_html = generate_steered(
-        prompt, rows, float(amplification), int(max_new_tokens)
+        messages, rows, float(amplification), int(max_new_tokens)
     )
     return baseline_html, steered_html, stats_html
 
@@ -258,50 +270,53 @@ with gr.Blocks(title="TopKLoRA Dashboard", css=_chat_css) as demo:
 
         n_turns = gr.State(1)
 
-        @gr.render(inputs=[n_turns])
-        def _render_chat(n):
-            textboxes = []
-            for i in range(n):
-                is_user = i % 2 == 0
-                role = "User" if is_user else "Assistant"
-                tb = gr.Textbox(
-                    label=f"{role} (Turn {i + 1})",
-                    placeholder=f"Enter {role.lower()} message...",
-                    lines=2,
-                    elem_classes=["chat-user"] if is_user else ["chat-assistant"],
+        with gr.Row(equal_height=False):
+            with gr.Column(scale=1):
+
+                @gr.render(inputs=[n_turns])
+                def _render_chat(n):
+                    textboxes = []
+                    for i in range(n):
+                        is_user = i % 2 == 0
+                        role = "User" if is_user else "Assistant"
+                        tb = gr.Textbox(
+                            label=f"{role} (Turn {i + 1})",
+                            placeholder=f"Enter {role.lower()} message...",
+                            lines=2,
+                            elem_classes=["chat-user"]
+                            if is_user
+                            else ["chat-assistant"],
+                        )
+                        textboxes.append(tb)
+
+                    viz_btn = gr.Button("Visualize", variant="primary")
+                    viz_btn.click(
+                        fn=_on_visualize,
+                        inputs=textboxes + [viz_hookpoint, viz_latent],
+                        outputs=[viz_html],
+                    )
+
+                with gr.Row():
+                    add_turn_btn = gr.Button("Add Turn", size="sm")
+                    remove_turn_btn = gr.Button("Remove Turn", size="sm")
+
+                add_turn_btn.click(lambda n: n + 1, inputs=[n_turns], outputs=[n_turns])
+                remove_turn_btn.click(
+                    lambda n: max(1, n - 1), inputs=[n_turns], outputs=[n_turns]
                 )
-                textboxes.append(tb)
 
-            viz_btn = gr.Button("Visualize", variant="primary")
-            viz_btn.click(
-                fn=_on_visualize,
-                inputs=textboxes + [viz_hookpoint, viz_latent],
-                outputs=[viz_html],
-            )
-
-        with gr.Row():
-            add_turn_btn = gr.Button("Add Turn", size="sm")
-            remove_turn_btn = gr.Button("Remove Turn", size="sm")
-
-        add_turn_btn.click(lambda n: n + 1, inputs=[n_turns], outputs=[n_turns])
-        remove_turn_btn.click(
-            lambda n: max(1, n - 1), inputs=[n_turns], outputs=[n_turns]
-        )
-
-        viz_html = gr.HTML(label="Activation Heatmap")
+            with gr.Column(scale=1):
+                viz_html = gr.HTML(label="Activation Heatmap")
 
     # ---- Tab 3: Interactive Steering ----
     with gr.Tab("Interactive Steering"):
-        steer_prompt = gr.Textbox(
-            label="Prompt",
-            placeholder="Enter your prompt...",
-            lines=3,
-        )
         with gr.Row():
-            amp_num = gr.Number(label="Amplification", value=5.0)
-            tokens_num = gr.Number(label="Max new tokens", value=128, precision=0)
+            amp_num = gr.Number(label="Amplification", value=5.0, interactive=True)
+            tokens_num = gr.Number(
+                label="Max new tokens", value=128, precision=0, interactive=True
+            )
 
-        gr.Markdown("### Add Steering Rule")
+        gr.Markdown("### Steering Rules")
         with gr.Row():
             steer_hookpoint_dd = gr.Dropdown(
                 label="Hookpoint",
@@ -325,7 +340,40 @@ with gr.Blocks(title="TopKLoRA Dashboard", css=_chat_css) as demo:
             interactive=True,
         )
 
-        gen_btn = gr.Button("Generate", variant="primary")
+        gr.Markdown("### Conversation")
+        steer_n_turns = gr.State(1)
+
+        @gr.render(inputs=[steer_n_turns])
+        def _render_steer_chat(n):
+            textboxes = []
+            for i in range(n):
+                is_user = i % 2 == 0
+                role = "User" if is_user else "Assistant"
+                tb = gr.Textbox(
+                    label=f"{role} (Turn {i + 1})",
+                    placeholder=f"Enter {role.lower()} message...",
+                    lines=2,
+                    elem_classes=["chat-user"] if is_user else ["chat-assistant"],
+                )
+                textboxes.append(tb)
+
+            gen_btn = gr.Button("Generate", variant="primary")
+            gen_btn.click(
+                fn=_on_generate,
+                inputs=textboxes + [steer_df, amp_num, tokens_num],
+                outputs=[baseline_out, steered_out, steer_stats_html],
+            )
+
+        with gr.Row():
+            steer_add_turn_btn = gr.Button("Add Turn", size="sm")
+            steer_remove_turn_btn = gr.Button("Remove Turn", size="sm")
+
+        steer_add_turn_btn.click(
+            lambda n: n + 1, inputs=[steer_n_turns], outputs=[steer_n_turns]
+        )
+        steer_remove_turn_btn.click(
+            lambda n: max(1, n - 1), inputs=[steer_n_turns], outputs=[steer_n_turns]
+        )
 
         steer_stats_html = gr.HTML(label="Activation Statistics")
 
@@ -405,12 +453,6 @@ with gr.Blocks(title="TopKLoRA Dashboard", css=_chat_css) as demo:
         fn=_on_latent_change,
         inputs=[viz_latent],
         outputs=[viz_html],
-    )
-
-    gen_btn.click(
-        fn=_on_generate,
-        inputs=[steer_prompt, steer_df, amp_num, tokens_num],
-        outputs=[baseline_out, steered_out, steer_stats_html],
     )
 
     cached_adapter_dd.change(

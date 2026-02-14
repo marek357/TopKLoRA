@@ -849,12 +849,15 @@ def load_top_activating_examples(
 # Steered generation
 # ---------------------------------------------------------------------------
 def generate_steered(
-    prompt: str,
+    messages: list[dict],
     steering_data: list[list],
     amplification: float,
     max_new_tokens: int,
 ) -> tuple[str, str, str]:
     """Generate baseline vs steered completions with activation visualization.
+
+    *messages* is a list of ``{"role": ..., "content": ...}`` dicts
+    representing the conversation so far (built from the chat UI).
 
     *steering_data* is a list of rows ``[hookpoint, latent_idx, effect]``
     coming from the Gradio Dataframe component.
@@ -871,7 +874,6 @@ def generate_steered(
 
     # Format as chat and tokenize
     # Use tokenize=True to get correct token IDs directly (avoids double BOS)
-    messages = [{"role": "user", "content": prompt}]
     input_ids = tokenizer.apply_chat_template(
         messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
     )
@@ -921,9 +923,41 @@ def generate_steered(
         # No steering - just run baseline
         with torch.no_grad():
             baseline_ids = model.generate(**enc, **gen_kwargs)
-        full_text = tokenizer.decode(baseline_ids[0], skip_special_tokens=True)
+        gen_tokens = tokenizer.convert_ids_to_tokens(baseline_ids[0][prompt_length:])
+        gen_text = " ".join(
+            str(t).replace("<", "&lt;").replace(">", "&gt;").replace(" ", "&nbsp;")
+            for t in gen_tokens
+        )
+        turn_boundaries = _compute_turn_boundaries(messages, tokenizer)
+        parts = []
+        for start, end, role in turn_boundaries:
+            toks = tokenizer.convert_ids_to_tokens(baseline_ids[0][start:end])
+            tok_text = " ".join(
+                str(t).replace("<", "&lt;").replace(">", "&gt;").replace(" ", "&nbsp;")
+                for t in toks
+            )
+            if not tok_text.strip():
+                continue
+            style = _BUBBLE_STYLES.get(role, _BUBBLE_STYLES["user"])
+            label_style = _BUBBLE_LABEL_STYLES.get(role, _BUBBLE_LABEL_STYLES["user"])
+            parts.append(
+                f"<div style='{style}'>"
+                f"<div style='{label_style}'>{role}</div>"
+                f"<div style='font-family:monospace;white-space:pre-wrap;'>{tok_text}</div>"
+                f"</div>"
+            )
+        if gen_text.strip():
+            style = _BUBBLE_STYLES["assistant"]
+            label_style = _BUBBLE_LABEL_STYLES["assistant"]
+            parts.append(
+                f"<div style='{style}'>"
+                f"<div style='{label_style}'>assistant (generated)</div>"
+                f"<div style='font-family:monospace;white-space:pre-wrap;'>{gen_text}</div>"
+                f"</div>"
+            )
+        baseline_html = f"<div style='padding:8px;'>{''.join(parts)}</div>"
         return (
-            f"<div style='font-family:monospace;white-space:pre-wrap;padding:12px;'>{full_text}</div>",
+            baseline_html,
             "<div style='color:#999;padding:12px;'>No steering rows provided</div>",
             "",
         )
@@ -994,12 +1028,25 @@ def generate_steered(
                     z_masked[0, :, latent_idx].cpu().clone()
                 )
 
+    # Compute turn boundaries for chat-bubble rendering
+    turn_boundaries = _compute_turn_boundaries(messages, tokenizer)
+
     # Generate HTML outputs
     baseline_html = _render_generation_with_activations(
-        tokenizer, baseline_ids[0], prompt_length, baseline_activations, "Baseline"
+        tokenizer,
+        baseline_ids[0],
+        prompt_length,
+        baseline_activations,
+        "Baseline",
+        turn_boundaries=turn_boundaries,
     )
     steered_html = _render_generation_with_activations(
-        tokenizer, steered_ids[0], prompt_length, steered_activations, "Steered"
+        tokenizer,
+        steered_ids[0],
+        prompt_length,
+        steered_activations,
+        "Steered",
+        turn_boundaries=turn_boundaries,
     )
     stats_html = _render_activation_stats(
         baseline_activations, steered_activations, amplification
@@ -1014,8 +1061,14 @@ def _render_generation_with_activations(
     prompt_length: int,
     activations: dict,
     label: str,
+    turn_boundaries: list[tuple[int, int, str]] | None = None,
 ) -> str:
-    """Render generated tokens with color-coding based on activations."""
+    """Render generated tokens with color-coding based on activations.
+
+    When *turn_boundaries* is provided, prompt tokens are grouped into chat
+    bubbles matching the conversation turns, and generated tokens appear in a
+    new assistant bubble.
+    """
     tokens = tokenizer.convert_ids_to_tokens(token_ids)
 
     # Get special token IDs to mask them out
@@ -1035,56 +1088,65 @@ def _render_generation_with_activations(
         if token_id.item() in special_token_ids:
             token_activations[i] = 0.0
 
-    # Render HTML
-    spans = []
-    for i, (tok, act) in enumerate(zip(tokens, token_activations)):
+    # Build individual token spans
+    def _make_span(tok, act):
         display_tok = (
             str(tok).replace("<", "&lt;").replace(">", "&gt;").replace(" ", "&nbsp;")
         )
-
-        # Color based on activation
         if act > 1e-4:
             intensity = min(act.item() / 5.0, 1.0)
             r = 255
             g = int(255 * (1 - intensity))
             b = int(255 * (1 - intensity))
             bg = f"rgb({r},{g},{b})"
-            # Use white text for high intensity (dark backgrounds), dark text for low intensity
             text_color = "#fff" if intensity > 0.5 else "#1f2937"
         else:
             bg = "#fff"
             text_color = "#1f2937"
-
-        # Mark prompt vs completion
-        if i < prompt_length:
-            border = "border-left: 3px solid #3b82f6;"
-            title_extra = " (PROMPT)"
-        else:
-            border = ""
-            title_extra = ""
-
-        spans.append(
-            f'<span class="token-span" data-activation="{act:.4f}{title_extra}" '
-            f'style="background:{bg};color:{text_color};padding:2px 4px;margin:1px;{border}'
+        return (
+            f'<span class="token-span" data-activation="{act:.4f}" '
+            f'style="background:{bg};color:{text_color};padding:2px 4px;margin:1px;'
             f'border-radius:3px;display:inline-block;font-family:monospace;position:relative;cursor:help;">'
             f"{display_tok}</span>"
         )
 
+    all_spans = [_make_span(tok, act) for tok, act in zip(tokens, token_activations)]
+
+    # Build body with chat bubbles
+    if turn_boundaries:
+        body_parts = []
+        # Render each prompt turn in its own bubble
+        for start, end, role in turn_boundaries:
+            turn_spans = " ".join(all_spans[start:end])
+            if not turn_spans.strip():
+                continue
+            style = _BUBBLE_STYLES.get(role, _BUBBLE_STYLES["user"])
+            label_style = _BUBBLE_LABEL_STYLES.get(role, _BUBBLE_LABEL_STYLES["user"])
+            body_parts.append(
+                f"<div style='{style}'>"
+                f"<div style='{label_style}'>{role}</div>"
+                f"<div style='line-height:2.2;'>{turn_spans}</div>"
+                f"</div>"
+            )
+        # Render generated tokens in a new assistant bubble
+        gen_spans = " ".join(all_spans[prompt_length:])
+        if gen_spans.strip():
+            style = _BUBBLE_STYLES["assistant"]
+            label_style = _BUBBLE_LABEL_STYLES["assistant"]
+            body_parts.append(
+                f"<div style='{style}'>"
+                f"<div style='{label_style}'>assistant (generated)</div>"
+                f"<div style='line-height:2.2;'>{gen_spans}</div>"
+                f"</div>"
+            )
+        body = "\n".join(body_parts)
+    else:
+        body = f"<div style='line-height:2.2;'>{' '.join(all_spans)}</div>"
+
     return (
-        "<style>"
-        ".token-span::after { content: attr(data-activation); position: absolute; bottom: 100%; left: 50%; "
-        "transform: translateX(-50%); background: #1f2937; color: #fff; padding: 4px 8px; border-radius: 4px; "
-        "font-size: 11px; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity 0.2s; "
-        "margin-bottom: 4px; z-index: 1000; }"
-        ".token-span:hover::after { opacity: 1; }"
-        '.token-span::before { content: ""; position: absolute; bottom: 100%; left: 50%; '
-        "transform: translateX(-50%); border: 4px solid transparent; border-top-color: #1f2937; "
-        "opacity: 0; pointer-events: none; transition: opacity 0.2s; z-index: 1000; }"
-        ".token-span:hover::before { opacity: 1; }"
-        "</style>"
-        f"<div style='padding:8px;'>"
+        _TOOLTIP_CSS + f"<div style='padding:8px;'>"
         f"<div style='font-weight:bold;margin-bottom:8px;color:#666;'>{label}</div>"
-        f"<div style='line-height:2.2;'>{' '.join(spans)}</div>"
+        f"{body}"
         f"</div>"
     )
 
