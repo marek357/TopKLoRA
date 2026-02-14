@@ -39,6 +39,7 @@ class ModelState:
         "hookpoint": None,
         "tokens": None,
         "activations": None,  # [seq_len, r]
+        "turn_boundaries": None,  # [(start, end, role), ...]
     }
 
 
@@ -344,8 +345,72 @@ def get_adapter_info(hookpoint: str) -> dict:
 # ---------------------------------------------------------------------------
 # Activation visualisation
 # ---------------------------------------------------------------------------
+def _compute_turn_boundaries(
+    messages: list[dict], tokenizer
+) -> list[tuple[int, int, str]]:
+    """Compute token-level turn boundaries by tokenizing successive prefixes.
+
+    Returns a list of ``(start, end, role)`` tuples where *start* and *end*
+    are token indices (exclusive end) and *role* is ``"user"`` or
+    ``"assistant"``.
+    """
+    boundaries = []
+    prev_len = 0
+    for i in range(len(messages)):
+        prefix_ids = tokenizer.apply_chat_template(
+            messages[: i + 1],
+            tokenize=True,
+            add_generation_prompt=False,
+        )
+        if isinstance(prefix_ids, list):
+            curr_len = len(prefix_ids)
+        elif isinstance(prefix_ids, torch.Tensor):
+            curr_len = prefix_ids.shape[-1]
+        else:
+            # BatchEncoding / dict-like
+            curr_len = len(prefix_ids["input_ids"])
+        boundaries.append((prev_len, curr_len, messages[i]["role"]))
+        prev_len = curr_len
+    return boundaries
+
+
+_TOOLTIP_CSS = (
+    "<style>"
+    ".token-span::after { content: attr(data-activation); position: absolute; bottom: 100%; left: 50%; "
+    "transform: translateX(-50%); background: #1f2937; color: #fff; padding: 4px 8px; border-radius: 4px; "
+    "font-size: 11px; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity 0.2s; "
+    "margin-bottom: 4px; z-index: 1000; }"
+    ".token-span:hover::after { opacity: 1; }"
+    '.token-span::before { content: ""; position: absolute; bottom: 100%; left: 50%; '
+    "transform: translateX(-50%); border: 4px solid transparent; border-top-color: #1f2937; "
+    "opacity: 0; pointer-events: none; transition: opacity 0.2s; z-index: 1000; }"
+    ".token-span:hover::before { opacity: 1; }"
+    "</style>"
+)
+
+# Bubble styles matching the Gradio chat CSS in app.py
+_BUBBLE_STYLES = {
+    "user": (
+        "background:#1e3a5f;border:1px solid #2d5a8e;border-radius:16px;"
+        "padding:10px 14px;margin:6px 0;max-width:75%;margin-right:auto;margin-left:0;"
+    ),
+    "assistant": (
+        "background:#1c3a2a;border:1px solid #2d6e4a;border-radius:16px;"
+        "padding:10px 14px;margin:6px 0;max-width:75%;margin-left:auto;margin-right:0;"
+    ),
+}
+_BUBBLE_LABEL_STYLES = {
+    "user": "color:#60a5fa;font-weight:600;font-size:0.8em;text-transform:uppercase;letter-spacing:0.03em;margin-bottom:4px;",
+    "assistant": "color:#4ade80;font-weight:600;font-size:0.8em;text-transform:uppercase;letter-spacing:0.03em;margin-bottom:4px;",
+}
+
+
 def _render_activation_html(
-    tokens: list, activations: torch.Tensor, hookpoint: str, latent_idx: int
+    tokens: list,
+    activations: torch.Tensor,
+    hookpoint: str,
+    latent_idx: int,
+    turn_boundaries: list[tuple[int, int, str]] | None = None,
 ) -> str:
     """Render activation heatmap HTML from pre-computed activations.
 
@@ -354,20 +419,22 @@ def _render_activation_html(
         activations: [seq_len] tensor of activation values for one latent
         hookpoint: Hookpoint name (for display)
         latent_idx: Latent index (for display)
+        turn_boundaries: Optional list of (start, end, role) tuples to
+            render tokens grouped in chat bubbles.
     """
     # Validate inputs
     if len(tokens) == 0:
-        return "<p>⚠️ No tokens to display.</p>"
+        return "<p>No tokens to display.</p>"
 
     if activations is None or activations.numel() == 0:
-        return "<p>⚠️ No activations available for this latent.</p>"
+        return "<p>No activations available for this latent.</p>"
 
     acts = activations.float().cpu()
 
     # Check for mismatched lengths
     if len(acts) != len(tokens):
         return (
-            f"<p>⚠️ Length mismatch: {len(tokens)} tokens but {len(acts)} activations. "
+            f"<p>Length mismatch: {len(tokens)} tokens but {len(acts)} activations. "
             "This may indicate a model/tokenizer issue.</p>"
         )
 
@@ -375,94 +442,85 @@ def _render_activation_html(
     a_min = acts.min().item()
     a_max = acts.max().item()
     a_mean = acts.mean().item()
+    is_dead = abs(a_max) < 1e-6 and abs(a_min) < 1e-6
 
-    # Check if latent is effectively dead (all near-zero)
-    if abs(a_max) < 1e-6 and abs(a_min) < 1e-6:
-        # Render as gray with warning
-        spans = []
-        for tok in tokens:
-            display_tok = (
-                tok.replace("<", "&lt;").replace(">", "&gt;").replace(" ", "&nbsp;")
-            )
+    # Build per-token HTML spans
+    if is_dead:
+        normed = [0.0] * len(tokens)
+        raw_list = [0.0] * len(tokens)
+    else:
+        span = max(a_max - a_min, 1e-8)
+        normed = ((acts - a_min) / span).tolist()
+        raw_list = acts.tolist()
+
+    spans = []
+    for tok, val, raw in zip(tokens, normed, raw_list):
+        display_tok = (
+            tok.replace("<", "&lt;").replace(">", "&gt;").replace(" ", "&nbsp;")
+        )
+        if is_dead:
             spans.append(
                 f'<span class="token-span" data-activation="0.0000 (dead)" '
                 f'style="background:#f0f0f0;padding:2px 4px;margin:1px;'
                 f'border-radius:3px;display:inline-block;font-family:monospace;color:#999;position:relative;cursor:help;">'
                 f"{display_tok}</span>"
             )
+        else:
+            r_col = 255
+            g_col = int(255 * (1 - val))
+            b_col = int(255 * (1 - val))
+            bg = f"rgb({r_col},{g_col},{b_col})"
+            text_color = "#fff" if val > 0.5 else "#1f2937"
+            spans.append(
+                f'<span class="token-span" data-activation="{raw:.4f}" '
+                f'style="background:{bg};color:{text_color};padding:2px 4px;margin:1px;'
+                f'border-radius:3px;display:inline-block;font-family:monospace;position:relative;cursor:help;">'
+                f"{display_tok}</span>"
+            )
 
-        html = (
-            "<style>"
-            ".token-span::after { content: attr(data-activation); position: absolute; bottom: 100%; left: 50%; "
-            "transform: translateX(-50%); background: #1f2937; color: #fff; padding: 4px 8px; border-radius: 4px; "
-            "font-size: 11px; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity 0.2s; "
-            "margin-bottom: 4px; z-index: 1000; }"
-            ".token-span:hover::after { opacity: 1; }"
-            '.token-span::before { content: ""; position: absolute; bottom: 100%; left: 50%; '
-            "transform: translateX(-50%); border: 4px solid transparent; border-top-color: #1f2937; "
-            "opacity: 0; pointer-events: none; transition: opacity 0.2s; z-index: 1000; }"
-            ".token-span:hover::before { opacity: 1; }"
-            "</style>"
-            '<div style="line-height:2.2;padding:8px;">'
-            + " ".join(spans)
-            + "</div>"
-            + f"<p style='margin-top:8px;font-size:0.85em;color:#f59e0b;'>"
-            f"⚠️ <strong>Dead latent</strong> — all activations ≈ 0 | hookpoint={hookpoint} | latent={latent_idx}</p>"
+    # Wrap spans in chat bubbles or a flat div
+    if turn_boundaries:
+        body_parts = []
+        for turn_idx, (start, end, role) in enumerate(turn_boundaries):
+            turn_spans = " ".join(spans[start:end])
+            label = f"{role.capitalize()} (Turn {turn_idx + 1})"
+            style = _BUBBLE_STYLES.get(role, _BUBBLE_STYLES["user"])
+            label_style = _BUBBLE_LABEL_STYLES.get(role, _BUBBLE_LABEL_STYLES["user"])
+            body_parts.append(
+                f"<div style='{style}'>"
+                f"<div style='{label_style}'>{label}</div>"
+                f"<div style='line-height:2.2;'>{turn_spans}</div>"
+                f"</div>"
+            )
+        body = "\n".join(body_parts)
+    else:
+        body = f'<div style="line-height:2.2;padding:8px;">{" ".join(spans)}</div>'
+
+    # Footer
+    if is_dead:
+        footer = (
+            f"<p style='margin-top:8px;font-size:0.85em;color:#f59e0b;'>"
+            f"<strong>Dead latent</strong> — all activations ≈ 0 | hookpoint={hookpoint} | latent={latent_idx}</p>"
         )
-        return html
-
-    # Normalise to [0, 1] for colouring
-    span = max(a_max - a_min, 1e-8)
-    normed = ((acts - a_min) / span).tolist()
-
-    # Build HTML spans
-    spans = []
-    for tok, val, raw in zip(tokens, normed, acts.tolist()):
-        # white (0) → red (1)
-        r_col = 255
-        g_col = int(255 * (1 - val))
-        b_col = int(255 * (1 - val))
-        bg = f"rgb({r_col},{g_col},{b_col})"
-        # Use white text for high intensity (dark backgrounds), dark text for low intensity
-        text_color = "#fff" if val > 0.5 else "#1f2937"
-        display_tok = (
-            tok.replace("<", "&lt;").replace(">", "&gt;").replace(" ", "&nbsp;")
-        )
-        spans.append(
-            f'<span class="token-span" data-activation="{raw:.4f}" '
-            f'style="background:{bg};color:{text_color};padding:2px 4px;margin:1px;'
-            f'border-radius:3px;display:inline-block;font-family:monospace;position:relative;cursor:help;">'
-            f"{display_tok}</span>"
+    else:
+        footer = (
+            f"<p style='margin-top:8px;font-size:0.85em;color:#666;'>"
+            f"min={a_min:.4f}, max={a_max:.4f}, mean={a_mean:.4f} | hookpoint={hookpoint} | latent={latent_idx}</p>"
         )
 
-    html = (
-        "<style>"
-        ".token-span::after { content: attr(data-activation); position: absolute; bottom: 100%; left: 50%; "
-        "transform: translateX(-50%); background: #1f2937; color: #fff; padding: 4px 8px; border-radius: 4px; "
-        "font-size: 11px; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity 0.2s; "
-        "margin-bottom: 4px; z-index: 1000; }"
-        ".token-span:hover::after { opacity: 1; }"
-        '.token-span::before { content: ""; position: absolute; bottom: 100%; left: 50%; '
-        "transform: translateX(-50%); border: 4px solid transparent; border-top-color: #1f2937; "
-        "opacity: 0; pointer-events: none; transition: opacity 0.2s; z-index: 1000; }"
-        ".token-span:hover::before { opacity: 1; }"
-        "</style>"
-        '<div style="line-height:2.2;padding:8px;">'
-        + " ".join(spans)
-        + "</div>"
-        + f"<p style='margin-top:8px;font-size:0.85em;color:#666;'>"
-        f"min={a_min:.4f}, max={a_max:.4f}, mean={a_mean:.4f} | hookpoint={hookpoint} | latent={latent_idx}</p>"
-    )
-    return html
+    return _TOOLTIP_CSS + f'<div style="padding:8px;">{body}</div>' + footer
 
 
 def compute_token_activations(
-    text: str,
+    messages: list[dict],
     hookpoint: str,
     latent_idx: int,
 ) -> str:
     """Run a forward pass and cache activations for ALL latents, then render
     the heatmap for the selected latent.
+
+    *messages* is a list of ``{"role": ..., "content": ...}`` dicts
+    (alternating user/assistant turns).
 
     Subsequent calls to ``render_latent_from_cache`` can instantly switch
     latents without re-computing.
@@ -476,9 +534,10 @@ def compute_token_activations(
     if latent_idx < 0 or latent_idx >= module.r:
         return f"<p>Latent index must be in [0, {module.r - 1}].</p>"
 
-    # Check cache: if text + hookpoint match, skip forward pass
+    # Check cache: if messages + hookpoint match, skip forward pass
+    messages_key = json.dumps(messages)
     if (
-        state.viz_cache["text"] == text
+        state.viz_cache["text"] == messages_key
         and state.viz_cache["hookpoint"] == hookpoint
         and state.viz_cache["activations"] is not None
     ):
@@ -488,11 +547,11 @@ def compute_token_activations(
             state.viz_cache["activations"][:, latent_idx],
             hookpoint,
             latent_idx,
+            turn_boundaries=state.viz_cache["turn_boundaries"],
         )
 
     # Run forward pass and cache
     # Use tokenize=True to get correct token IDs directly (avoids double BOS)
-    messages = [{"role": "user", "content": text}]
     input_ids = state.tokenizer.apply_chat_template(
         messages, tokenize=True, add_generation_prompt=False, return_tensors="pt"
     )
@@ -519,15 +578,23 @@ def compute_token_activations(
     k = module.topk.k
     z_masked = z * _hard_topk_mask(z, k)  # [batch, seq_len, r]
 
+    # Compute turn boundaries for chat-bubble rendering
+    turn_boundaries = _compute_turn_boundaries(messages, state.tokenizer)
+
     # Cache the full activation tensor [seq_len, r]
-    state.viz_cache["text"] = text
+    state.viz_cache["text"] = messages_key
     state.viz_cache["hookpoint"] = hookpoint
     state.viz_cache["tokens"] = tokens
     state.viz_cache["activations"] = z_masked[0].cpu()  # [seq_len, r]
+    state.viz_cache["turn_boundaries"] = turn_boundaries
 
     # Render for the selected latent
     return _render_activation_html(
-        tokens, z_masked[0, :, latent_idx], hookpoint, latent_idx
+        tokens,
+        z_masked[0, :, latent_idx],
+        hookpoint,
+        latent_idx,
+        turn_boundaries=turn_boundaries,
     )
 
 
@@ -542,12 +609,17 @@ def render_latent_from_cache(latent_idx: int) -> str:
     tokens = state.viz_cache["tokens"]
     activations = state.viz_cache["activations"]  # [seq_len, r]
     hookpoint = state.viz_cache["hookpoint"]
+    turn_boundaries = state.viz_cache.get("turn_boundaries")
 
     if latent_idx < 0 or latent_idx >= activations.shape[1]:
         return f"<p>Latent index must be in [0, {activations.shape[1] - 1}].</p>"
 
     return _render_activation_html(
-        tokens, activations[:, latent_idx], hookpoint, latent_idx
+        tokens,
+        activations[:, latent_idx],
+        hookpoint,
+        latent_idx,
+        turn_boundaries=turn_boundaries,
     )
 
 

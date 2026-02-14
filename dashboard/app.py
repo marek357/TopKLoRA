@@ -64,10 +64,22 @@ def _on_hookpoint_change(hookpoint):
     return f"r = {info['r']},  k = {info['k']}"
 
 
-def _on_visualize(text, hookpoint, latent_idx):
+def _on_visualize(*args):
+    """Build messages list from dynamic textboxes and run activation viz.
+
+    ``args`` layout: (text_0, text_1, ..., text_{n-1}, hookpoint, latent_idx)
+    """
+    *texts, hookpoint, latent_idx = args
     if latent_idx is None:
         return "<p>Enter a latent index to visualize.</p>"
-    return compute_token_activations(text, hookpoint, int(latent_idx))
+    messages = []
+    for i, text in enumerate(texts):
+        role = "user" if i % 2 == 0 else "assistant"
+        if text and text.strip():
+            messages.append({"role": role, "content": text.strip()})
+    if not messages:
+        return "<p>Enter at least one message.</p>"
+    return compute_token_activations(messages, hookpoint, int(latent_idx))
 
 
 def _on_latent_change(latent_idx):
@@ -118,7 +130,7 @@ def _on_cached_adapter_select(adapter_name):
         choices_values = [idx for _, idx in latent_choices]
         latent_update = gr.update(
             choices=list(zip(choices_display, choices_values)),
-            value=choices_values[0] if choices_values else None
+            value=choices_values[0] if choices_values else None,
         )
     else:
         latent_update = gr.update(choices=[])
@@ -142,7 +154,7 @@ def _on_cached_hookpoint_select(adapter_name, hookpoint):
 
     return config_text, gr.update(
         choices=list(zip(choices_display, choices_values)),
-        value=choices_values[0] if choices_values else None
+        value=choices_values[0] if choices_values else None,
     )
 
 
@@ -160,7 +172,44 @@ def _on_show_cached_examples(adapter_name, hookpoint, latent_idx, n_examples):
 # ------------------------------------------------------------------
 # UI
 # ------------------------------------------------------------------
-with gr.Blocks(title="TopKLoRA Dashboard") as demo:
+_chat_css = """
+.chat-user, .chat-assistant {
+    max-width: 75% !important;
+    border-radius: 16px !important;
+    padding: 8px 12px !important;
+    margin-bottom: 4px !important;
+}
+.chat-user {
+    margin-right: auto !important;
+    margin-left: 0 !important;
+    background: #1e3a5f !important;
+    border: 1px solid #2d5a8e !important;
+}
+.chat-assistant {
+    margin-left: auto !important;
+    margin-right: 0 !important;
+    background: #1c3a2a !important;
+    border: 1px solid #2d6e4a !important;
+}
+.chat-user textarea, .chat-assistant textarea {
+    border: none !important;
+    background: transparent !important;
+    color: #e2e8f0 !important;
+}
+.chat-user textarea::placeholder, .chat-assistant textarea::placeholder {
+    color: #94a3b8 !important;
+}
+.chat-user label span, .chat-assistant label span {
+    font-weight: 600 !important;
+    font-size: 0.85em !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.03em !important;
+}
+.chat-user label span { color: #60a5fa !important; }
+.chat-assistant label span { color: #4ade80 !important; }
+"""
+
+with gr.Blocks(title="TopKLoRA Dashboard", css=_chat_css) as demo:
     gr.Markdown("# TopKLoRA Dashboard")
 
     # ---- Tab 1: Model Loading ----
@@ -203,16 +252,42 @@ with gr.Blocks(title="TopKLoRA Dashboard") as demo:
     # ---- Tab 2: Activation Visualization ----
     with gr.Tab("Activation Visualization"):
         with gr.Row():
-            viz_text = gr.Textbox(
-                label="Input text",
-                placeholder="Enter text to visualize activations for...",
-                lines=3,
-            )
-        with gr.Row():
             viz_hookpoint = gr.Dropdown(label="Hookpoint", choices=[])
             viz_latent = gr.Number(label="Latent index", value=0, precision=0)
         hookpoint_info = gr.Textbox(label="Adapter info", interactive=False)
-        viz_btn = gr.Button("Visualize", variant="primary")
+
+        n_turns = gr.State(1)
+
+        @gr.render(inputs=[n_turns])
+        def _render_chat(n):
+            textboxes = []
+            for i in range(n):
+                is_user = i % 2 == 0
+                role = "User" if is_user else "Assistant"
+                tb = gr.Textbox(
+                    label=f"{role} (Turn {i + 1})",
+                    placeholder=f"Enter {role.lower()} message...",
+                    lines=2,
+                    elem_classes=["chat-user"] if is_user else ["chat-assistant"],
+                )
+                textboxes.append(tb)
+
+            viz_btn = gr.Button("Visualize", variant="primary")
+            viz_btn.click(
+                fn=_on_visualize,
+                inputs=textboxes + [viz_hookpoint, viz_latent],
+                outputs=[viz_html],
+            )
+
+        with gr.Row():
+            add_turn_btn = gr.Button("Add Turn", size="sm")
+            remove_turn_btn = gr.Button("Remove Turn", size="sm")
+
+        add_turn_btn.click(lambda n: n + 1, inputs=[n_turns], outputs=[n_turns])
+        remove_turn_btn.click(
+            lambda n: max(1, n - 1), inputs=[n_turns], outputs=[n_turns]
+        )
+
         viz_html = gr.HTML(label="Activation Heatmap")
 
     # ---- Tab 3: Interactive Steering ----
@@ -288,12 +363,16 @@ with gr.Blocks(title="TopKLoRA Dashboard") as demo:
                 _initial_latent_choices = get_cached_latent_choices(
                     _cached_adapters[0], _initial_hookpoints[0]
                 )
-            _latent_choices_display = [display for display, _ in _initial_latent_choices]
+            _latent_choices_display = [
+                display for display, _ in _initial_latent_choices
+            ]
             _latent_choices_values = [idx for _, idx in _initial_latent_choices]
 
             cached_latent_dd = gr.Dropdown(
                 label="Latent",
-                choices=list(zip(_latent_choices_display, _latent_choices_values)) if _latent_choices_values else [],
+                choices=list(zip(_latent_choices_display, _latent_choices_values))
+                if _latent_choices_values
+                else [],
                 value=_latent_choices_values[0] if _latent_choices_values else None,
             )
             cached_n_examples = gr.Number(
@@ -320,12 +399,6 @@ with gr.Blocks(title="TopKLoRA Dashboard") as demo:
         fn=_on_hookpoint_change,
         inputs=[viz_hookpoint],
         outputs=[hookpoint_info],
-    )
-
-    viz_btn.click(
-        fn=_on_visualize,
-        inputs=[viz_text, viz_hookpoint, viz_latent],
-        outputs=[viz_html],
     )
 
     viz_latent.change(
