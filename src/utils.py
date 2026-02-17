@@ -164,16 +164,32 @@ def ensure_chat_template_and_special_tokens(tokenizer, model, model_it_name: str
         if getattr(toks_it, "chat_template", None):
             tokenizer.chat_template = toks_it.chat_template
             logging.info("chat_template copied successfully")
-        # Merge additional special tokens if needed
-        extra = toks_it.special_tokens_map.get("additional_special_tokens", [])
-        new_tokens = []
-        if extra:
-            new_tokens = [t for t in extra if t not in tokenizer.get_vocab()]
-            if new_tokens:
-                tokenizer.add_special_tokens({"additional_special_tokens": new_tokens})
+
+        # Merge additional special tokens from the -it tokenizer
+        extra = toks_it.special_tokens_map.get("additional_special_tokens", []) or []
+        configured_extra = (
+            tokenizer.init_kwargs.get("additional_special_tokens")
+            or tokenizer.init_kwargs.get("extra_special_tokens")
+            or []
+        )
+
+        # Union while preserving order
+        merged_extra = []
+        for tok in list(extra) + list(configured_extra):
+            if tok not in merged_extra:
+                merged_extra.append(tok)
+
+        if merged_extra:
+            added = tokenizer.add_special_tokens(
+                {"additional_special_tokens": merged_extra}
+            )
+            if added:
                 model.resize_token_embeddings(len(tokenizer))
-                logging.info("Added %d extra special tokens", len(new_tokens))
-        return new_tokens
+                logging.info("Registered %d additional special tokens", added)
+            else:
+                logging.info("Additional special tokens already registered")
+
+        return merged_extra
     except OSError as exc:
         logging.error("Failed to copy -it tokenizer: %s", exc)
         raise exc
@@ -182,44 +198,72 @@ def ensure_chat_template_and_special_tokens(tokenizer, model, model_it_name: str
     return []
 
 
-def configure_eos_eot(tokenizer, model):
-    """Configure generation EOS/EOT handling and ensure pad_token is set."""
-    eot_token = (
-        tokenizer.special_tokens_map.get(
-            "additional_special_tokens", [tokenizer.eos_token]
-        )[1]
-        if len(tokenizer.special_tokens_map.get("additional_special_tokens", [])) > 1
-        else tokenizer.eos_token
+def _resolve_eot_token(tokenizer):
+    """Resolve the EOT token string and ID from the tokenizer.
+
+    Search order:
+    1. tokenizer.eot_token / tokenizer.eot_token_id attributes
+    2. Second entry of additional_special_tokens (convention: [SOT, EOT, ...])
+
+    Returns (eot_token, eot_token_id) or raises if unresolvable.
+    """
+    # 1. Direct attribute (some tokenizers set eot_token explicitly)
+    token = getattr(tokenizer, "eot_token", None)
+    token_id = getattr(tokenizer, "eot_token_id", None)
+    if token is not None or token_id is not None:
+        if token is not None and token_id is None:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+        if token_id is not None and token is None:
+            token = tokenizer.convert_ids_to_tokens(token_id)
+        logging.info("Resolved EOT token via direct attribute: %s (ID: %s)", token, token_id)
+        return token, token_id
+
+    # 2. additional_special_tokens — convention is [SOT, EOT, ...].
+    #    Try multiple sources since some tokenizer types (e.g. slow
+    #    GemmaTokenizer) don't expose the attribute directly.
+    extra = (
+        getattr(tokenizer, "additional_special_tokens", None)
+        or tokenizer.special_tokens_map.get("additional_special_tokens")
+        or tokenizer.init_kwargs.get("additional_special_tokens")
+        or tokenizer.init_kwargs.get("extra_special_tokens")
+        or []
+    )
+    if len(extra) > 1:
+        candidate = str(extra[1])
+        candidate_id = tokenizer.convert_tokens_to_ids(candidate)
+        if candidate_id is not None and candidate_id != tokenizer.unk_token_id:
+            logging.info("Resolved EOT token via additional_special_tokens[1]: %s (ID: %s)", candidate, candidate_id)
+            return candidate, candidate_id
+
+    raise RuntimeError(
+        "Could not resolve EOT token from tokenizer. "
+        f"additional_special_tokens={extra}. "
+        "Please ensure your tokenizer has an EOT token defined."
     )
 
-    # Convert to ID
-    eot_token_id = tokenizer.convert_tokens_to_ids(eot_token)
 
-    # Get the base EOS token ID
-    base_eos_token_id = tokenizer.eos_token_id
+def configure_eos_eot(tokenizer, model):
+    """Configure generation EOS/EOT handling and ensure pad_token is set.
 
-    # Update generation config with both EOS and EOT tokens
-    if hasattr(model.generation_config, "eos_token_id"):
-        # Create a list of both tokens
-        eos_token_ids = []
+    Resolves the EOT token, merges it into the model's eos_token_id list
+    so generation stops on either EOS or EOT, and sets pad_token if missing.
+    """
+    logging.info("special_tokens_map=%s", tokenizer.special_tokens_map)
+    logging.info("eos_token=%s id=%s", tokenizer.eos_token, tokenizer.eos_token_id)
 
-        # Add base EOS token
-        if isinstance(base_eos_token_id, list):
-            eos_token_ids.extend(base_eos_token_id)
-        else:
-            eos_token_ids.append(base_eos_token_id)
+    eot_token, eot_token_id = _resolve_eot_token(tokenizer)
 
-        # Add EOT token if it's different
-        if eot_token_id not in eos_token_ids:
-            eos_token_ids.append(eot_token_id)
-
-        model.generation_config.eos_token_id = eos_token_ids
-    else:
-        model.generation_config.eos_token_id = [base_eos_token_id, eot_token_id]
+    # Build deduplicated list of stop-token IDs
+    base = tokenizer.eos_token_id
+    eos_ids = list(base) if isinstance(base, list) else [base]
+    if eot_token_id not in eos_ids:
+        eos_ids.append(eot_token_id)
+    model.generation_config.eos_token_id = eos_ids
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    logging.info("Configured EOT token: %s (ID: %s)", eot_token, eot_token_id)
     return eot_token, eot_token_id
 
 

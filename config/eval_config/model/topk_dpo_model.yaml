@@ -7,6 +7,10 @@ defaults:
 k: 64
 r: 8192
 layer: 18
-type: dpo_${.module_type.name}_k${.k}_r${.r}_layer${.layer}
-adapter_checkpoint_dir: "models/dpo/${.module_type.name}/k${.k}/r${.r}/layer${.layer}"
+reg: "on"
+type: dpo_${.module_type.name}_k${.k}_r${.r}_reg${.reg}_layer${.layer}
+adapter_checkpoint_dir: "models/dpo/${.module_type.name}/k${.k}/r${.r}/reg${.reg}/layer${.layer}"
 train_steps: 5000
+# base_model.model.model.layers.18.mlp.gate_proj: B max = 0.006235;  A max = 0.022853
+# base_model.model.model.layers.18.mlp.up_proj: B max = 0.006031;  A max = 0.023481
+# base_model.model.model.layers.18.mlp.down_proj: B max = 0.007567;  A max = 0.018276

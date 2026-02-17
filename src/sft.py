@@ -616,7 +616,14 @@ def run_sft(cfg):
     }
 
     # Use enhanced trainer if TopK is enabled, otherwise regular trainer
-    reg_mode = "z_only" if use_topk else "off"
+    reg_mode_default = "z_only" if use_topk else "off"
+    reg_mode = (
+        getattr(cfg.training.sft_experiment, "reg_mode", None) or reg_mode_default
+    )
+    if reg_mode not in {"off", "z_only", "z_plus_ortho"}:
+        raise ValueError(
+            f"Invalid reg_mode '{reg_mode}'. Expected one of ['off', 'z_only', 'z_plus_ortho']."
+        )
 
     # ----------------------- TopK Injection (Enhanced) -----------------------
     # Check if TopK is enabled in the configuration
@@ -761,6 +768,7 @@ def run_sft(cfg):
     hparams = {
         "model": cfg.training.model.model_name,
         "tokenizer": getattr(tokenizer, "name_or_path", "unknown"),
+        "reg_mode": reg_mode,
         "sft_config": {
             "max_seq_length": cfg.training.sft.max_seq_length,
             "num_epochs": cfg.training.sft.num_epochs,
@@ -834,6 +842,7 @@ def run_sft(cfg):
         summary = []
         summary.append(f"model: {cfg.training.model.model_name}")
         summary.append(f"training: SFT with {cfg.training.sft_experiment.lora.r}r LoRA")
+        summary.append(f"reg_mode: {reg_mode}")
         if hasattr(train_dataset, "__len__"):
             summary.append(f"dataset: {len(train_dataset)} train samples")
         if getattr(cfg.training.sft_experiment.lora, "use_topk", False):

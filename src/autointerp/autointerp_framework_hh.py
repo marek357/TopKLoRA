@@ -24,8 +24,8 @@ from tqdm import tqdm
 from src.models import TopKLoRALinearSTE, _hard_topk_mask
 from src.steering import FeatureSteeringContext, list_available_adapters
 from src.utils import hh_string_to_messages, generate_completions_from_prompts
-from src.causal_explainer import run_explainer
-from src.autointerp_utils import (
+from .causal_explainer import run_explainer
+from .autointerp_utils import (
     _ensure_dir,
     _write_jsonl,
     _read_jsonl,
@@ -650,14 +650,15 @@ def run_autointerp_framework(cfg, model, tokenizer) -> None:
     # Run explainer stage to generate hypotheses
     if eval_cfg.stages.hypothesis:
         logger.info("Running causal explainer to generate hypotheses...")
-        
+
         # Get vLLM server URL from config or use default
         vllm_cfg = getattr(eval_cfg, "vllm", None)
         vllm_base_url = (
             getattr(vllm_cfg, "base_url", "http://localhost:8080/v1")
-            if vllm_cfg else "http://localhost:8080/v1"
+            if vllm_cfg
+            else "http://localhost:8080/v1"
         )
-        
+
         hypotheses = run_explainer(
             cfg,
             output_dir=output_dir,

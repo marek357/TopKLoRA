@@ -1249,6 +1249,7 @@ def _collect_hparams(
     hparams = {
         "experiment_name": getattr(cfg, "experiment_name", None),
         "task": "dpo_topk_lora",
+        "reg_mode": getattr(experiment_args, "reg_mode", None) or "z_only",
         "model": {
             "base": base_model_path,
             "model_name": cfg.training.model.model_name,
@@ -1467,6 +1468,11 @@ def prepare_civil_comments_datasets(
 def run_dpo(cfg, quant_cfg):
     dpo_args = cfg.training.dpo
     experiment_args = cfg.training.dpo_experiment
+    reg_mode = getattr(experiment_args, "reg_mode", None) or "z_only"
+    if reg_mode not in {"off", "z_only", "z_plus_ortho"}:
+        raise ValueError(
+            f"Invalid reg_mode '{reg_mode}'. Expected one of ['off', 'z_only', 'z_plus_ortho']."
+        )
     init_distributed()
     world_size = get_world_size()
     device = (
@@ -1668,7 +1674,9 @@ def run_dpo(cfg, quant_cfg):
 
         # Also create a human-friendly symlink using experiment_name so runs are easy to find
         try:
-            friendly_name = getattr(cfg, "experiment_name", None) or os.path.basename(output_dir)
+            friendly_name = getattr(cfg, "experiment_name", None) or os.path.basename(
+                output_dir
+            )
             friendly_link = os.path.join(cfg.training.dump_path, friendly_name)
             if os.path.islink(friendly_link) or os.path.exists(friendly_link):
                 try:
@@ -1697,6 +1705,7 @@ def run_dpo(cfg, quant_cfg):
             f"alpha={getattr(experiment_args.lora, 'alpha', getattr(experiment_args.lora, 'lora_alpha', 16))}, temp={getattr(experiment_args.lora, 'temperature', 1.0)}, "
             f"k_warmup_frac={getattr(experiment_args.lora, 'k_warmup_frac', getattr(experiment_args.lora, 'k_warmup_fraction', 0.2))}"
         )
+        summary.append(f"reg_mode: {reg_mode}")
         summary.append(
             f"dpo: beta={dpo_args.beta}, lr={dpo_args.learning_rate}, steps={dpo_args.max_steps}, bs={dpo_args.per_device_train_batch_size}x{dpo_args.gradient_accumulation_steps}"
         )
@@ -1853,7 +1862,7 @@ def run_dpo(cfg, quant_cfg):
         processing_class=tokenizer,
         callbacks=callbacks,
         reg_cfg=reg_cfg,
-        reg_mode="z_only",  # Enable z-based regs (decorrelation, mass, entropy)
+        reg_mode=reg_mode,
     )
 
     print(trainer.train_dataset[0])

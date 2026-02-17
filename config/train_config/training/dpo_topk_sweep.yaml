@@ -33,11 +33,11 @@ defaults:
   - quantization: 4bit
 
 dump_trained_model: True
-dump_path: "models/dpo_topk_sweep/${training.model.model_name}/r${training.dpo_experiment.lora.r}_k${training.dpo_experiment.lora.k}_kf${training.dpo_experiment.lora.k_final}_${training.dpo_experiment.lora.module_type}"
+dump_path: "models/dpo_topk_sweep/${training.model.model_name}/r${training.dpo_experiment.lora.r}_k${training.dpo_experiment.lora.k}_kf${training.dpo_experiment.lora.k_final}_${training.dpo_experiment.lora.module_type}_reg${training.dpo_experiment.reg_mode_tag}"
 
 # Experiment naming for WandB: includes all sweep parameters
 # Format: dpo_r{r}_k{k}_kf{k_final}_{module_type}_L{layer}
-experiment_name: "dpo_r${training.dpo_experiment.lora.r}_k${training.dpo_experiment.lora.k}_kf${training.dpo_experiment.lora.k_final}_${training.dpo_experiment.lora.module_type}_L${training.dpo_experiment.lora.layer}"
+experiment_name: "dpo_r${training.dpo_experiment.lora.r}_k${training.dpo_experiment.lora.k}_kf${training.dpo_experiment.lora.k_final}_${training.dpo_experiment.lora.module_type}_L${training.dpo_experiment.lora.layer}_reg${training.dpo_experiment.reg_mode_tag}"
 
 sft:
   enabled: False

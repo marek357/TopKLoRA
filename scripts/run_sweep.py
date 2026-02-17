@@ -94,32 +94,40 @@ def build_command(
     python_bin: str = "python",
     bs_r8192: int | None = None,
     ga_r8192: int | None = None,
+    reg_mode: str | None = None,
 ) -> str:
     """Build the training command for a single config."""
     if mode == "dpo":
         training_config = "dpo_topk_sweep"
-        experiment_path = "training.dpo_experiment.lora"
+        experiment_root = "training.dpo_experiment"
     else:
         training_config = "sft_recommended_topk_sweep"
-        experiment_path = "training.sft_experiment.lora"
+        experiment_root = "training.sft_experiment"
+
+    lora_path = f"{experiment_root}.lora"
 
     cmd_parts = [
         f"CUDA_VISIBLE_DEVICES={gpu}",
         python_bin,
         "main.py",
         f"training={training_config}",
-        f"{experiment_path}.r={config['r']}",
-        f"{experiment_path}.k={config['k']}",
-        f"{experiment_path}.k_final={config['k_final']}",
-        f"{experiment_path}.module_type={config['module_type']}",
-        f"{experiment_path}.layer={config['layer']}",
+        f"{lora_path}.r={config['r']}",
+        f"{lora_path}.k={config['k']}",
+        f"{lora_path}.k_final={config['k_final']}",
+        f"{lora_path}.module_type={config['module_type']}",
+        f"{lora_path}.layer={config['layer']}",
     ]
+
+    if reg_mode:
+        cmd_parts.append(f"{experiment_root}.reg_mode={reg_mode}")
 
     # Optional automatic batch-size override for large r to avoid OOM (e.g., r=8192 on A40)
     if config["r"] >= 8192 and mode == "dpo":
         if bs_r8192:
             cmd_parts.append(f"training.dpo.per_device_train_batch_size={bs_r8192}")
-            cmd_parts.append(f"training.dpo.per_device_eval_batch_size={max(1, bs_r8192//2)}")
+            cmd_parts.append(
+                f"training.dpo.per_device_eval_batch_size={max(1, bs_r8192 // 2)}"
+            )
         if ga_r8192:
             cmd_parts.append(f"training.dpo.gradient_accumulation_steps={ga_r8192}")
 
@@ -146,12 +154,22 @@ def run_sequential(
     dry_run: bool = False,
     bs_r8192: int | None = None,
     ga_r8192: int | None = None,
+    reg_mode: str | None = None,
 ):
     """Run configs sequentially on a single GPU."""
     for i, config in enumerate(configs):
-        cmd = build_command(config, gpu, extra_args, mode, bs_r8192=bs_r8192, ga_r8192=ga_r8192)
+        cmd = build_command(
+            config,
+            gpu,
+            extra_args,
+            mode,
+            bs_r8192=bs_r8192,
+            ga_r8192=ga_r8192,
+            reg_mode=reg_mode,
+        )
+        reg_str = f", reg_mode={reg_mode}" if reg_mode else ""
         print(
-            f"\n[GPU {gpu}] Running {i + 1}/{len(configs)}: r={config['r']}, k={config['k']}, k_final={config['k_final']}, {config['module_type']}"
+            f"\n[GPU {gpu}] Running {i + 1}/{len(configs)}: r={config['r']}, k={config['k']}, k_final={config['k_final']}, {config['module_type']}{reg_str}"
         )
         print(f"  Command: {cmd}")
 
@@ -170,12 +188,22 @@ def run_parallel_multiprocess(
     dry_run: bool = False,
     bs_r8192: int | None = None,
     ga_r8192: int | None = None,
+    reg_mode: str | None = None,
 ):
     """Run sweeps in parallel using multiprocessing."""
     import multiprocessing as mp
 
     def worker(gpu: int, configs: List[dict]):
-        run_sequential(configs, gpu, extra_args, mode, dry_run, bs_r8192=bs_r8192, ga_r8192=ga_r8192)
+        run_sequential(
+            configs,
+            gpu,
+            extra_args,
+            mode,
+            dry_run,
+            bs_r8192=bs_r8192,
+            ga_r8192=ga_r8192,
+            reg_mode=reg_mode,
+        )
 
     processes = []
     for gpu, configs in gpu_splits:
@@ -195,6 +223,7 @@ def generate_shell_scripts(
     conda_env: str = "klora",
     bs_r8192: int | None = None,
     ga_r8192: int | None = None,
+    reg_mode: str | None = None,
 ):
     """Generate shell scripts for each GPU to run manually or via tmux."""
     os.makedirs(output_dir, exist_ok=True)
@@ -227,9 +256,11 @@ def generate_shell_scripts(
                     python_bin=python_bin,
                     bs_r8192=bs_r8192,
                     ga_r8192=ga_r8192,
+                    reg_mode=reg_mode,
                 ).replace(f"CUDA_VISIBLE_DEVICES={gpu} ", "")
+                reg_str = f", reg_mode={reg_mode}" if reg_mode else ""
                 f.write(
-                    f"echo '=== [{i + 1}/{len(configs)}] r={config['r']}, k={config['k']}, k_final={config['k_final']}, {config['module_type']} ==='\n"
+                    f"echo '=== [{i + 1}/{len(configs)}] r={config['r']}, k={config['k']}, k_final={config['k_final']}, {config['module_type']}{reg_str} ==='\n"
                 )
                 f.write(f"{cmd}\n\n")
 
@@ -324,6 +355,14 @@ def main():
         help="If set, overrides training.dpo.gradient_accumulation_steps when r>=8192",
     )
 
+    parser.add_argument(
+        "--reg-mode",
+        type=str,
+        choices=["off", "z_only", "z_plus_ortho"],
+        default=None,
+        help="Override TopK regularization mode (default follows training script)",
+    )
+
     # Extra args to pass to main.py
     parser.add_argument(
         "extra", nargs="*", help="Additional arguments to pass to main.py"
@@ -375,6 +414,7 @@ def main():
             args.conda_env,
             bs_r8192=args.bs_r8192,
             ga_r8192=args.ga_r8192,
+            reg_mode=args.reg_mode,
         )
     elif args.parallel and len(gpus) > 1:
         print(f"\nRunning {args.mode.upper()} in parallel across GPUs...")
@@ -385,6 +425,7 @@ def main():
             args.dry_run,
             bs_r8192=args.bs_r8192,
             ga_r8192=args.ga_r8192,
+            reg_mode=args.reg_mode,
         )
     else:
         # Sequential on each GPU (useful for single GPU or dry-run)
@@ -397,6 +438,7 @@ def main():
                 args.dry_run,
                 bs_r8192=args.bs_r8192,
                 ga_r8192=args.ga_r8192,
+                reg_mode=args.reg_mode,
             )
 
 
