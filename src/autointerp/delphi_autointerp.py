@@ -97,7 +97,11 @@ def _stream_and_format_dataset(
     skipped_empty_prompt = 0
     skipped_empty_continuation = 0
 
-    for example in tqdm(islice(dataset, max_examples)):
+    for example in tqdm(
+        islice(dataset, max_examples),
+        desc=f"Streaming {dataset_split} split",
+        total=max_examples,
+    ):
         prompt_text = _extract_prompt_from_example(example)
         messages, continuation_text, continuation_source = (
             _extract_continuation_messages(example, continuation_choice, rng)
