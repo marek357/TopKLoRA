@@ -6,7 +6,7 @@ activation_collection:
   n_tokens: 50000000
   seq_len: 2048 # max sequence length (longer prompts are truncated by the collator)
   top_prompt_count: 1000
-  max_batches: 500000
+  max_prompts: 500000
   batch_size: 4
   streaming_cache: true # avoid host-side OOM by streaming split writes
   retry_on_oom: true
