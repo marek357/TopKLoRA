@@ -2,7 +2,6 @@ import asyncio
 import dataclasses
 import json
 import os
-import sys
 import hashlib
 import heapq
 import random
@@ -12,16 +11,14 @@ from pathlib import Path
 import numpy as np
 import torch
 from datasets import load_dataset
-from delphi.clients import Offline, OpenRouter
+from delphi.clients import Offline
 from delphi.config import ConstructorConfig, SamplerConfig
-from delphi.explainers import ContrastiveExplainer, DefaultExplainer
-from delphi.latents import LatentCache, LatentDataset
+from delphi.explainers import DefaultExplainer
+from delphi.latents import LatentDataset
 from delphi.pipeline import Pipeline, process_wrapper
 from delphi.scorers import (
     DetectionScorer,
-    FuzzingScorer,
     OpenAISimulator,
-    SurprisalScorer,
 )
 from torch.utils.data import DataLoader
 from .autointerp_utils import _read_jsonl, _write_jsonl, build_latent_index
@@ -29,6 +26,7 @@ from src.utils import hh_string_to_messages, autointerp_violates_alternation
 import logging
 from .openai_client import OpenAIClient
 from .streaming_latent_cache import make_latent_cache
+from tqdm import tqdm
 
 # Add path for our improvements
 
@@ -99,7 +97,7 @@ def _stream_and_format_dataset(
     skipped_empty_prompt = 0
     skipped_empty_continuation = 0
 
-    for example in islice(dataset, max_examples):
+    for example in tqdm(islice(dataset, max_examples)):
         prompt_text = _extract_prompt_from_example(example)
         messages, continuation_text, continuation_source = (
             _extract_continuation_messages(example, continuation_choice, rng)
@@ -852,18 +850,46 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
         streaming=True,
     )
 
+    # For lmsys-chat-1m, keep only English, non-redacted conversations.
+    # Because the dataset is streamed we cannot know the total size upfront,
+    # so we count accepted/rejected samples inside the filter callback.
+    if "lmsys-chat" in exp_cfg.dataset_name:
+        _filter_counts = {"before": 0, "after": 0}
+
+        def _lmsys_filter(x):
+            _filter_counts["before"] += 1
+            keep = x.get("language") == "English" and x.get("redacted") is False
+            if keep:
+                _filter_counts["after"] += 1
+            return keep
+
+        flat_ds = flat_ds.filter(_lmsys_filter)
+    else:
+        _filter_counts = None
+
     continuation_choice = getattr(exp_cfg, "dataset_continuation")
     rng = random.Random(int(getattr(cfg, "seed", 42)))
 
-    max_batches = getattr(exp_cfg, "max_batches")
+    max_prompts = getattr(exp_cfg, "max_prompts")
     flat_ds, prompt_records, stats = _stream_and_format_dataset(
         flat_ds,
-        max_batches,
+        max_prompts,
         rng,
         continuation_choice,
         dataset_split,
         dataset_config,
     )
+
+    if _filter_counts is not None and _filter_counts["before"] > 0:
+        pct = _filter_counts["after"] / _filter_counts["before"] * 100
+        logging.info(
+            "lmsys-chat filter: %d / %d samples kept (%.1f%%) "
+            "[English=True, redacted=False]",
+            _filter_counts["after"],
+            _filter_counts["before"],
+            pct,
+        )
+
     if stats["total_records"]:
         logging.info(
             "Skipped %d/%d (%.2f%%) incorrectly formatted examples.",
