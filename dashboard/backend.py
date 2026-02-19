@@ -860,6 +860,22 @@ def load_top_activating_examples(
         else:
             tokens = [f"tok_{tid}" for tid in token_ids.tolist()]
 
+        # Strip trailing pad tokens unless an activating position is a pad token
+        n_pads_removed = 0
+        if tokenizer and tokenizer.pad_token_id is not None:
+            pad_id = tokenizer.pad_token_id
+            any_activating_pad = any(
+                token_ids[seq_idx].item() == pad_id for seq_idx, _ in positions
+            )
+            if not any_activating_pad:
+                # Find last non-pad token and truncate
+                orig_len = len(tokens)
+                last_non_pad = len(token_ids) - 1
+                while last_non_pad >= 0 and token_ids[last_non_pad].item() == pad_id:
+                    last_non_pad -= 1
+                tokens = tokens[: last_non_pad + 1]
+                n_pads_removed = orig_len - len(tokens)
+
         # Build highlighted HTML with all activating positions
         highlighted_seq = []
         for i, tok in enumerate(tokens):
@@ -896,10 +912,15 @@ def load_top_activating_examples(
             [f"pos {seq_idx} ({act:.4f})" for seq_idx, act in positions]
         )
 
+        pad_note = (
+            f" | <span style='color:#8b5cf6;'>{n_pads_removed} pad tokens hidden</span>"
+            if n_pads_removed > 0
+            else ""
+        )
         html_parts.append(
             f"<div style='margin: 12px 0; padding: 8px; background: #f9f9f9; border-radius: 4px;'>"
             f"<div style='font-size: 0.85em; color: #666; margin-bottom: 4px;'>"
-            f"Rank #{rank + 1} | Max: {max_activation:.4f} | Batch {batch_idx} | {len(positions)} activation(s): {pos_summary}</div>"
+            f"Rank #{rank + 1} | Max: {max_activation:.4f} | Batch {batch_idx} | {len(positions)} activation(s): {pos_summary}{pad_note}</div>"
             f"<div style='line-height: 1.8;'>{' '.join(highlighted_seq)}</div>"
             f"</div>"
         )
