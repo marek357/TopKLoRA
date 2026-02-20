@@ -598,7 +598,7 @@ def compute_token_activations(
         return f"<p>Latent index must be in [0, {module.r - 1}].</p>"
 
     # Check cache: if messages + hookpoint match, skip forward pass
-    messages_key = json.dumps(messages)
+    messages_key = json.dumps(messages, sort_keys=True)
     if (
         state.viz_cache["text"] == messages_key
         and state.viz_cache["hookpoint"] == hookpoint
@@ -1007,12 +1007,13 @@ def generate_steered(
         # No steering - just run baseline
         with torch.no_grad():
             baseline_ids = model.generate(**enc, **gen_kwargs)
-        gen_tokens = tokenizer.convert_ids_to_tokens(baseline_ids[0][prompt_length:])
+        turn_boundaries = _compute_turn_boundaries(messages, tokenizer)
+        gen_start = turn_boundaries[-1][1] if turn_boundaries else 0
+        gen_tokens = tokenizer.convert_ids_to_tokens(baseline_ids[0][gen_start:])
         gen_text = " ".join(
             str(t).replace("<", "&lt;").replace(">", "&gt;").replace(" ", "&nbsp;")
             for t in gen_tokens
         )
-        turn_boundaries = _compute_turn_boundaries(messages, tokenizer)
         parts = []
         for start, end, role in turn_boundaries:
             toks = tokenizer.convert_ids_to_tokens(baseline_ids[0][start:end])
@@ -1212,8 +1213,11 @@ def _render_generation_with_activations(
                 f"<div style='line-height:2.2;'>{turn_spans}</div>"
                 f"</div>"
             )
-        # Render generated tokens in a new assistant bubble
-        gen_spans = " ".join(all_spans[prompt_length:])
+        # Render generated tokens (including generation prompt) in a new
+        # assistant bubble.  Turn boundaries end before the generation-prompt
+        # tokens, so start from the last boundary rather than prompt_length.
+        gen_start = turn_boundaries[-1][1] if turn_boundaries else prompt_length
+        gen_spans = " ".join(all_spans[gen_start:])
         if gen_spans.strip():
             style = _BUBBLE_STYLES["assistant"]
             label_style = _BUBBLE_LABEL_STYLES["assistant"]
