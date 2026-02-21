@@ -1051,7 +1051,7 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
                 total_entries += num_entries
                 logging.info(f"  {hp}: {num_entries} non-zero activations")
         if total_entries == 0:
-            logging.info("WARNING: No latent activations were recorded.")
+            logging.warning("No latent activations were recorded.")
         out_dir = Path(get_delphi_cache_path(cfg, directory_exists=False))
         out_dir.mkdir(parents=True, exist_ok=True)
         cache.save_splits(n_splits=84, save_dir=out_dir)
