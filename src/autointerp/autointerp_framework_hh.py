@@ -13,6 +13,7 @@ import os
 import random
 import hashlib
 import heapq
+import math
 from typing import Any, Dict, List, Tuple, Literal
 
 import numpy as np
@@ -304,6 +305,80 @@ def _build_feature_dict(
     return {latent_entry["adapter_name"]: [(latent_entry["feature_idx"], effect)]}
 
 
+def _require_nonempty_jsonl(path: str, kind: str) -> List[Dict[str, Any]]:
+    """Load a required JSONL file and ensure it is present + non-empty."""
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Missing pre-cached {kind} file: {path}")
+    records = _read_jsonl(path)
+    if not records:
+        raise ValueError(f"Pre-cached {kind} file is empty: {path}")
+    return records
+
+
+def _validate_precached_latent_records_strict(
+    records: List[Dict[str, Any]],
+    latent_index: List[Dict[str, Any]],
+    record_name: str,
+) -> List[Dict[str, Any]]:
+    """Validate strict latent-id equality against current runtime latent index."""
+    validated: List[Dict[str, Any]] = []
+    max_latent_id = len(latent_index) - 1
+
+    for rec_idx, rec in enumerate(records):
+        if "latent_id" not in rec:
+            raise ValueError(
+                f"{record_name} record #{rec_idx} is missing 'latent_id'."
+            )
+
+        try:
+            latent_id = int(rec["latent_id"])
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{record_name} record #{rec_idx} has invalid latent_id={rec.get('latent_id')!r}."
+            ) from None
+
+        if latent_id < 0 or latent_id > max_latent_id:
+            raise ValueError(
+                f"{record_name} record #{rec_idx} has latent_id={latent_id}, "
+                f"expected range [0, {max_latent_id}]."
+            )
+
+        expected = latent_index[latent_id]
+        rec_adapter_name = rec.get("adapter_name")
+        rec_feature_idx = rec.get("feature_idx")
+        if rec_adapter_name is None or rec_feature_idx is None:
+            raise ValueError(
+                f"{record_name} record #{rec_idx} (latent_id={latent_id}) must include "
+                "'adapter_name' and 'feature_idx' for strict validation."
+            )
+
+        try:
+            rec_feature_idx_int = int(rec_feature_idx)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{record_name} record #{rec_idx} has invalid feature_idx={rec_feature_idx!r}."
+            ) from None
+
+        expected_adapter = expected["adapter_name"]
+        expected_feature_idx = int(expected["feature_idx"])
+        if (
+            rec_adapter_name != expected_adapter
+            or rec_feature_idx_int != expected_feature_idx
+        ):
+            raise ValueError(
+                f"{record_name} latent mismatch at record #{rec_idx}, latent_id={latent_id}: "
+                f"expected (adapter_name={expected_adapter!r}, feature_idx={expected_feature_idx}), "
+                f"got (adapter_name={rec_adapter_name!r}, feature_idx={rec_feature_idx_int})."
+            )
+
+        updated = dict(rec)
+        updated["latent_id"] = latent_id
+        updated["feature_idx"] = rec_feature_idx_int
+        validated.append(updated)
+
+    return validated
+
+
 def _select_latents(
     cfg,
     latent_index: List[Dict[str, Any]],
@@ -370,6 +445,78 @@ def _select_latents(
     return selected_entries, selection_records
 
 
+def _compute_latent_alpha(
+    latent_id: int,
+    ev_cfg,
+    latent_stats_by_id: Dict[int, Dict[str, Any]],
+    top_prompts_by_id: Dict[int, Dict[str, Any]],
+) -> float:
+    """Resolve steering alpha for one latent under the configured alpha_mode."""
+    alpha_mode = str(getattr(ev_cfg, "alpha_mode", "fixed")).strip().lower()
+
+    if alpha_mode == "fixed":
+        alpha = float(getattr(ev_cfg, "alpha"))
+    elif alpha_mode == "mean_active":
+        stats = latent_stats_by_id.get(latent_id)
+        if stats is None:
+            raise ValueError(
+                f"alpha_mode=mean_active requires latent_stats for latent_id={latent_id}, "
+                "but no record was found."
+            )
+        p_active = float(stats.get("p_active", 0.0))
+        if p_active <= 0.0:
+            raise ValueError(
+                f"alpha_mode=mean_active failed for latent_id={latent_id}: "
+                f"p_active must be > 0, got {p_active}."
+            )
+        alpha = float(stats.get("mu", 0.0)) / p_active
+    elif alpha_mode == "mean_unconditional":
+        stats = latent_stats_by_id.get(latent_id)
+        if stats is None:
+            raise ValueError(
+                f"alpha_mode=mean_unconditional requires latent_stats for latent_id={latent_id}, "
+                "but no record was found."
+            )
+        alpha = float(stats.get("mu", 0.0))
+    elif alpha_mode == "top_prompt_mean":
+        top_rec = top_prompts_by_id.get(latent_id)
+        if top_rec is None:
+            raise ValueError(
+                f"alpha_mode=top_prompt_mean requires top_prompts for latent_id={latent_id}, "
+                "but no record was found."
+            )
+        prompts = top_rec.get("prompts", [])
+        if not prompts:
+            raise ValueError(
+                f"alpha_mode=top_prompt_mean failed for latent_id={latent_id}: "
+                "top_prompts record has no prompts."
+            )
+        vals: List[float] = []
+        for prompt_rec in prompts:
+            if "activation" in prompt_rec:
+                vals.append(float(prompt_rec["activation"]))
+            elif "score" in prompt_rec:
+                vals.append(float(prompt_rec["score"]))
+        if not vals:
+            raise ValueError(
+                f"alpha_mode=top_prompt_mean failed for latent_id={latent_id}: "
+                "no numeric activation/score values in prompts."
+            )
+        alpha = float(sum(vals) / len(vals))
+    else:
+        raise ValueError(
+            f"Unsupported alpha_mode={alpha_mode!r}. "
+            "Expected one of: fixed, mean_active, mean_unconditional, top_prompt_mean."
+        )
+
+    if not math.isfinite(alpha) or alpha <= 0.0:
+        raise ValueError(
+            f"Computed alpha is invalid for latent_id={latent_id}, alpha_mode={alpha_mode!r}: "
+            f"alpha={alpha}. Expected finite alpha > 0."
+        )
+    return alpha
+
+
 def _build_evidence_packs(
     cfg,
     model,
@@ -377,6 +524,8 @@ def _build_evidence_packs(
     prompts: List[Dict[str, Any]],
     latent_entries: List[Dict[str, Any]],
     top_prompt_map: Dict[int, List[str]] = None,
+    latent_stats_by_id: Dict[int, Dict[str, Any]] = None,
+    top_prompts_by_id: Dict[int, Dict[str, Any]] = None,
     sample_top_prompts: bool = False,
     mode: Literal["explainer", "verifier"] = "explainer",
 ) -> List[Dict[str, Any]]:
@@ -389,6 +538,8 @@ def _build_evidence_packs(
         prompts: Prompt records to sample from.
         latent_entries: Ordered list of latent entries to process.
         top_prompt_map: Mapping of latent_id -> ordered prompt_ids.
+        latent_stats_by_id: Mapping of latent_id -> latent stats record.
+        top_prompts_by_id: Mapping of latent_id -> top-prompts record.
         sample_top_prompts: Whether to sample prompts from top_prompt_map.
         mode: "explainer" or "verifier" mode for evidence pack formatting.
 
@@ -405,12 +556,8 @@ def _build_evidence_packs(
 
     gen_cfg = ev_cfg.generation
     intervention_type = getattr(ev_cfg, "intervention_type")
-
-    amplification = (
-        float(getattr(ev_cfg, "alpha"))
-        if intervention_type == "steer_with_alpha"
-        else 1.0
-    )  # set amplification only for "steer_with_alpha" mode
+    latent_stats_by_id = latent_stats_by_id or {}
+    top_prompts_by_id = top_prompts_by_id or {}
     device = next(model.parameters()).device
     gen_kwargs = dict(
         max_new_tokens=int(getattr(gen_cfg, "max_new_tokens")),
@@ -434,6 +581,15 @@ def _build_evidence_packs(
         desc=f"Building evidence packs. {getattr(ev_cfg, 'per_latent')} sets per latent",
     ):
         latent_id = entry["latent_id"]
+        if intervention_type == "steer_with_alpha":
+            amplification = _compute_latent_alpha(
+                latent_id=latent_id,
+                ev_cfg=ev_cfg,
+                latent_stats_by_id=latent_stats_by_id,
+                top_prompts_by_id=top_prompts_by_id,
+            )
+        else:
+            amplification = 1.0
 
         top_ids = []
         if top_prompt_map and latent_id in top_prompt_map:
@@ -441,13 +597,38 @@ def _build_evidence_packs(
         if not top_ids:
             top_ids = [rec["prompt_id"] for rec in prompts if rec.get("prompt_id")]
 
+        selected_ids: List[str]
         if sample_top_prompts:
             sample_k = min(len(top_ids), int(getattr(ev_cfg, "per_latent")))
             selected_ids = rng.sample(top_ids, k=sample_k)
         elif top_prompt_map:
             selected_ids = top_ids[: getattr(ev_cfg, "per_latent")]
+        else:
+            selected_ids = top_ids[: int(getattr(ev_cfg, "per_latent"))]
 
+        if not selected_ids:
+            logger.warning(
+                "No prompt ids available for latent_id=%s; skipping evidence pack generation.",
+                latent_id,
+            )
+            continue
+
+        missing_prompt_ids = [pid for pid in selected_ids if pid not in prompt_by_id]
+        if missing_prompt_ids:
+            logger.warning(
+                "Missing %d/%d prompt ids for latent_id=%s from prompt map; "
+                "continuing with available prompts.",
+                len(missing_prompt_ids),
+                len(selected_ids),
+                latent_id,
+            )
         selected = [prompt_by_id[pid] for pid in selected_ids if pid in prompt_by_id]
+        if not selected:
+            logger.warning(
+                "All selected prompt ids were missing for latent_id=%s; skipping.",
+                latent_id,
+            )
+            continue
 
         if intervention_type == "zero_ablate":
             feature_dict = _build_feature_dict(entry, "disable")
@@ -560,7 +741,44 @@ def run_autointerp_framework(cfg, model, tokenizer) -> None:
     evidence_explainer_path = os.path.join(output_dir, "evidence_explainer.jsonl")
     evidence_verifier_path = os.path.join(output_dir, "evidence_verifier.jsonl")
 
-    if eval_cfg.stages.prompts:
+    precached_cfg = getattr(eval_cfg, "precached", None)
+    use_precached = bool(
+        getattr(precached_cfg, "enabled", False) if precached_cfg else False
+    )
+    precached_stats_dir = (
+        str(getattr(precached_cfg, "stats_dir", "")).strip() if precached_cfg else ""
+    )
+    precached_recompute_selection = bool(
+        getattr(precached_cfg, "recompute_selection_from_stats", False)
+        if precached_cfg
+        else False
+    )
+
+    if use_precached:
+        logger.info(
+            "Pre-cached mode enabled. Bypassing stages.prompts=%s, "
+            "stages.latent_stats=%s, stages.latent_selection=%s.",
+            bool(eval_cfg.stages.prompts),
+            bool(eval_cfg.stages.latent_stats),
+            bool(eval_cfg.stages.latent_selection),
+        )
+        if precached_recompute_selection:
+            logger.info(
+                "precached.recompute_selection_from_stats=true; latent selection "
+                "will be recomputed from pre-cached latent_stats using "
+                "latents.selection settings."
+            )
+        if not precached_stats_dir:
+            raise ValueError(
+                "precached.enabled is true but precached.stats_dir is not set."
+            )
+        if not os.path.isdir(precached_stats_dir):
+            raise FileNotFoundError(
+                f"Pre-cached stats_dir does not exist: {precached_stats_dir}"
+            )
+        prompts_precached_path = os.path.join(precached_stats_dir, "prompts.jsonl")
+        all_prompts = _require_nonempty_jsonl(prompts_precached_path, "prompts")
+    elif eval_cfg.stages.prompts:
         all_prompts = _build_prompt_records(cfg)
         _write_jsonl(prompts_path, all_prompts)
     else:
@@ -571,7 +789,25 @@ def run_autointerp_framework(cfg, model, tokenizer) -> None:
 
     with open(latent_index_path, "w", encoding="utf-8") as f:
         json.dump(latent_index, f, indent=2)
-    if eval_cfg.stages.latent_stats:
+
+    if use_precached:
+        latent_stats_precached_path = os.path.join(
+            precached_stats_dir, "latent_stats.jsonl"
+        )
+        top_prompts_precached_path = os.path.join(precached_stats_dir, "top_prompts.jsonl")
+        latent_stats = _require_nonempty_jsonl(latent_stats_precached_path, "latent_stats")
+        top_prompts = _require_nonempty_jsonl(top_prompts_precached_path, "top_prompts")
+        latent_stats = _validate_precached_latent_records_strict(
+            latent_stats,
+            latent_index,
+            "latent_stats",
+        )
+        top_prompts = _validate_precached_latent_records_strict(
+            top_prompts,
+            latent_index,
+            "top_prompts",
+        )
+    elif eval_cfg.stages.latent_stats:
         latent_stats, top_prompts = _collect_latent_stats(
             cfg, model, tokenizer, all_prompts, modules, latent_index
         )
@@ -589,10 +825,52 @@ def run_autointerp_framework(cfg, model, tokenizer) -> None:
             for rec in top_prompts
             if "latent_id" in rec
         }
+    latent_stats_by_id = {
+        int(rec["latent_id"]): rec for rec in latent_stats if "latent_id" in rec
+    }
+    top_prompts_by_id = {
+        int(rec["latent_id"]): rec for rec in top_prompts if "latent_id" in rec
+    }
 
     selected_latents = latent_index
     selection_records: List[Dict[str, Any]] = []
-    if eval_cfg.stages.latent_selection:
+    if use_precached:
+        if precached_recompute_selection:
+            selected_latents, selection_records = _select_latents(
+                cfg,
+                latent_index,
+                latent_stats,
+            )
+            if selection_records:
+                _write_jsonl(latent_selection_path, selection_records)
+            logger.info(
+                "Recomputed latent selection from pre-cached latent_stats; "
+                "selected %d latents.",
+                len(selected_latents),
+            )
+        else:
+            latent_selection_precached_path = os.path.join(
+                precached_stats_dir, "latent_selection.jsonl"
+            )
+            selection_records = _require_nonempty_jsonl(
+                latent_selection_precached_path,
+                "latent_selection",
+            )
+            selection_records = _validate_precached_latent_records_strict(
+                selection_records,
+                latent_index,
+                "latent_selection",
+            )
+            selected_latents = [
+                entry
+                for entry in selection_records
+                if int(entry.get("selected", 0)) == 1
+            ]
+            logger.info(
+                "Loaded %d selected latents from pre-cached selection file.",
+                len(selected_latents),
+            )
+    elif eval_cfg.stages.latent_selection:
         selected_latents, selection_records = _select_latents(
             cfg,
             latent_index,
@@ -629,6 +907,8 @@ def run_autointerp_framework(cfg, model, tokenizer) -> None:
             all_prompts,
             selected_latents,
             top_prompt_map=top_prompt_map,
+            latent_stats_by_id=latent_stats_by_id,
+            top_prompts_by_id=top_prompts_by_id,
             sample_top_prompts=False,
             mode="explainer",
         )
@@ -642,6 +922,8 @@ def run_autointerp_framework(cfg, model, tokenizer) -> None:
             all_prompts,
             selected_latents,
             top_prompt_map=top_prompt_map,
+            latent_stats_by_id=latent_stats_by_id,
+            top_prompts_by_id=top_prompts_by_id,
             sample_top_prompts=True,
             mode="verifier",
         )

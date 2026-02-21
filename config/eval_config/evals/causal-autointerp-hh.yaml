@@ -1,7 +1,12 @@
 name: causal-autointerp-framework # Eval name for logging/selection.
 # output_dir: eval_outputs/causal_autointerp_framework_mlp # Output folder for all artifacts.
 # output_dir: eval_outputs/causal_autointerp_framework_attn # Output folder for all artifacts.
-output_dir: eval_outputs/causal_autointerp_framework/${model.module_type.name}_k${model.k}_r${model.r}_layer${model.layer} # Output folder for all artifacts.
+output_dir: eval_outputs/causal_autointerp_framework/${model.module_type.name}_k${model.k}_r${model.r}_reg${model.reg}_layer${model.layer} # Output folder for all artifacts.
+
+precached:
+  enabled: true
+  stats_dir: delphi_cache/${model.module_type.name}_k${model.k}_r${model.r}_reg${model.reg}_layer${model.layer}/stats
+  recompute_selection_from_stats: true # If true, ignore cached latent_selection.jsonl and recompute using latents.selection.
 
 dataset: # Prompt source configuration (HH-RLHF).
   name: Anthropic/hh-rlhf # Hugging Face dataset ID.
@@ -24,9 +29,9 @@ latents: # Latent statistics collection settings.
   selection:
     enabled: true
     seed: 42
-    max_latents: 128
+    max_latents: 64
     p_active_min: 0.01
-    p_active_max: 0.8
+    p_active_max: 1.0
     dead_p_active_max: 0.0099
 
 # evidence packs
@@ -38,6 +43,7 @@ evidence: # Evidence pack construction settings.
   explainer:
     per_latent: 10 # Prompts per latent for training evidence.
     intervention_type: steer_with_alpha # steer_with_alpha or zero_ablate
+    alpha_mode: top_prompt_mean # fixed | mean_active | mean_unconditional | top_prompt_mean
     alpha: 100 # Fixed steering alpha (calibration removed).
     baseline_samples: 1
     generation: # Text generation settings for evidence.
@@ -49,6 +55,7 @@ evidence: # Evidence pack construction settings.
   verifier:
     per_latent: 10 # Prompts per latent for eval evidence.
     intervention_type: zero_ablate # steer_with_alpha or zero_ablate
+    alpha_mode: fixed # Used only when intervention_type=steer_with_alpha
     # alpha: 1 # Fixed steering alpha (calibration removed).
     baseline_samples: 3
     generation: # Text generation settings for evidence.
@@ -93,9 +100,9 @@ stages: # Pipeline stage toggles.
   latent_selection: false # Select latents.
   evidence_explainer: true # Generate training evidence packs.
   evidence_verifier: false # Generate eval evidence packs.
-  hypothesis: true # Generate hypotheses via explainer.
-  verification: true # Run blind + hypothesis verification.
-  summary: true # Aggregate summary metrics.
+  hypothesis: false # Generate hypotheses via explainer.
+  verification: false # Run blind + hypothesis verification.
+  summary: false # Aggregate summary metrics.
 
 build_eval_function: # Hydra entry point for eval.
   _target_: src.evals.causal_autointerp_framework # Callable that runs the pipeline.

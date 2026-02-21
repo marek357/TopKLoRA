@@ -72,11 +72,15 @@ class FeatureSteerer:
         """
         self.feature_indices = feature_indices
         self.effects = effects
-        self.amplification = amplification
+        self.amplification = float(amplification)
 
         # Validate inputs
         assert len(feature_indices) == len(effects), \
             "feature_indices and effects must have same length"
+        if self.amplification <= 0.0:
+            raise ValueError(
+                f"amplification must be > 0, got {self.amplification}"
+            )
         for effect in effects:
             assert effect in ["enable", "disable", "isolate"], \
                 f"Invalid effect: {effect}. Must be 'enable', 'disable', or 'isolate'"
@@ -167,8 +171,8 @@ class FeatureSteerer:
                     g_soft[..., idx] = 1.0
                     g_hard[..., idx] = 1.0
                     
-                    # AMPLIFY the activation if amplification > 1.0
-                    if self.amplification > 1.0:
+                    # Scale the activation for this feature (amplify or attenuate)
+                    if self.amplification != 1.0:
                         z[..., idx] = z[..., idx] * self.amplification
                     
                     # Removed debug logging to avoid breaking torch.compile
@@ -232,9 +236,10 @@ def steer_features(
                          ]
                      }
         verbose: If True, log information about applied steering
-        amplification: Multiplier for enabled/isolated features (default 1.0). 
-                      Try 5.0-10.0 for stronger steering effect.
-                      Only affects "enable" and "isolate", not "disable".
+        amplification: Positive scaling factor for enabled/isolated features
+                      (default 1.0). Values >1 amplify, values between (0,1)
+                      attenuate. Only affects "enable" and "isolate", not
+                      "disable".
 
     Returns:
         Dictionary containing:
@@ -346,8 +351,9 @@ def FeatureSteeringContext(
         feature_dict: Dictionary mapping adapter names to list of (feature_num, effect) tuples
                      where effect is "enable", "disable", or "isolate"
         verbose: If True, log information about applied steering
-        amplification: Multiplier for enabled/isolated features (default 1.0). 
-                      Try 5.0-10.0 for stronger steering effect.
+        amplification: Positive scaling factor for enabled/isolated features
+                      (default 1.0). Values >1 amplify, values between (0,1)
+                      attenuate.
 
     Example:
         # Standard enable/disable

@@ -1,8 +1,8 @@
 defaults:
   - _self_
   - logger: wandb_disabled
-  # - evals/causal-autointerp-hh@evals.causal_autointerp_framework
-  - evals/auto-interpret@evals.auto_interp
+  - evals/causal-autointerp-hh@evals.causal_autointerp_framework
+  # - evals/auto-interpret@evals.auto_interp
   - model: topk_dpo_model
 
 seed: 42
