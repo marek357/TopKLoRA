@@ -37,10 +37,10 @@ def get_model_str(cfg):
     return f"{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_reg{cfg.model.reg}_layer{cfg.model.layer}"
 
 
-def resolve_delphi_cache_path(cfg):
+def get_delphi_cache_path(cfg, directory_exists=True):
     delphi_cache_dir = cfg.evals.auto_interp.delphi_cache_dir
     cache_path = os.path.join(delphi_cache_dir, get_model_str(cfg))
-    if not os.path.exists(cache_path):
+    if directory_exists and not os.path.exists(cache_path):
         raise ValueError(f"Delphi cache path not found: {cache_path}")
     return cache_path
 
@@ -1052,7 +1052,7 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
                 logging.info(f"  {hp}: {num_entries} non-zero activations")
         if total_entries == 0:
             logging.info("WARNING: No latent activations were recorded.")
-        out_dir = Path(resolve_delphi_cache_path(cfg))
+        out_dir = Path(get_delphi_cache_path(cfg, directory_exists=False))
         out_dir.mkdir(parents=True, exist_ok=True)
         cache.save_splits(n_splits=84, save_dir=out_dir)
         widths = {f"{name}.topk": wrapped_modules[name].r for name in wrapped_modules}
@@ -1100,7 +1100,7 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
 
 
 def delphi_select_latents(cfg):
-    stats_dir = Path(resolve_delphi_cache_path(cfg)) / "stats"
+    stats_dir = Path(get_delphi_cache_path(cfg)) / "stats"
 
     latent_stats_path = stats_dir / "latent_stats.jsonl"
     if not os.path.exists(latent_stats_path):
@@ -1135,7 +1135,7 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
     del wrapped_modules
 
     selection_path = os.path.join(
-        resolve_delphi_cache_path(cfg), "stats", "latent_selection.jsonl"
+        get_delphi_cache_path(cfg), "stats", "latent_selection.jsonl"
     )
 
     # Load interpretability rankings and get priority latents
@@ -1158,7 +1158,7 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
     logging.info(f"Topk modules after filtering: {topk_modules}")
     # 1) Load the raw cache you saved
     dataset = LatentDataset(
-        raw_dir=Path(resolve_delphi_cache_path(cfg)),
+        raw_dir=Path(get_delphi_cache_path(cfg)),
         modules=topk_modules,
         latents={
             # Focus on most interpretable latents only
