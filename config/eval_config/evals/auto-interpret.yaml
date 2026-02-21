@@ -1,10 +1,12 @@
 name: auto-interpret
 
+# delphi_cache_dir: "./delphi_cache"
+delphi_cache_dir: "/Volumes/T7_1TB/topklora-delphi-cache/"
+
 activation_collection:
   enabled: true
-  # n_tokens: 500000
-  n_tokens: 50000000
-  seq_len: 2048 # max sequence length (longer prompts are truncated by the collator)
+  n_tokens: 5000
+  seq_len: 256 # max sequence length (longer prompts are truncated by the collator)
   top_prompt_count: 1000
   max_prompts: 500000
   batch_size: 4
@@ -37,7 +39,13 @@ delphi_scoring:
     provider: openai # offline | openai
     openai_config:
       # openai config
-      openai_model: "gpt-4o-mini"
+      # openai_model: "gpt-4o-mini"
+      # input_cost_per_1m: 0.15
+      # output_cost_per_1m: 0.6
+      openai_model: "gpt-5-mini-2025-08-07"
+      input_cost_per_1m: 0.25
+      output_cost_per_1m: 2.0
+
       openai_base_url: null
       openai_temperature: 0.0
       openai_max_tokens: 3000
@@ -45,8 +53,6 @@ delphi_scoring:
       cost_monitor_enabled: true
       cost_monitor_every_n_requests: 10
       # Set costs per 1M tokens for estimated spend
-      input_cost_per_1m: 0.15
-      output_cost_per_1m: 0.6
 
     offline_config:
       # model_name: Qwen/Qwen3-30B-A3B-Thinking-2507

@@ -33,6 +33,18 @@ from tqdm import tqdm
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def get_model_str(cfg):
+    return f"{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_reg{cfg.model.reg}_layer{cfg.model.layer}"
+
+
+def resolve_delphi_cache_path(cfg):
+    delphi_cache_dir = cfg.evals.auto_interp.delphi_cache_dir
+    cache_path = os.path.join(delphi_cache_dir, get_model_str(cfg))
+    if not os.path.exists(cache_path):
+        raise ValueError(f"Delphi cache path not found: {cache_path}")
+    return cache_path
+
+
 def _stable_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
@@ -1039,10 +1051,8 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
                 total_entries += num_entries
                 logging.info(f"  {hp}: {num_entries} non-zero activations")
         if total_entries == 0:
-            logging.warning("No latent activations were recorded.")
-        out_dir = Path(
-            f"delphi_cache/{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_reg{cfg.model.reg}_layer{cfg.model.layer}"
-        )
+            logging.info("WARNING: No latent activations were recorded.")
+        out_dir = Path(resolve_delphi_cache_path(cfg))
         out_dir.mkdir(parents=True, exist_ok=True)
         cache.save_splits(n_splits=84, save_dir=out_dir)
         widths = {f"{name}.topk": wrapped_modules[name].r for name in wrapped_modules}
@@ -1090,11 +1100,7 @@ def delphi_collect_activations(cfg, model, tokenizer, wrapped_modules):
 
 
 def delphi_select_latents(cfg):
-    stats_dir = Path(
-        f"delphi_cache/{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_reg{cfg.model.reg}_layer{cfg.model.layer}/stats"
-    )
-    if not os.path.exists(stats_dir):
-        raise ValueError(f"Stats dir not found: {stats_dir}")
+    stats_dir = Path(resolve_delphi_cache_path(cfg)) / "stats"
 
     latent_stats_path = stats_dir / "latent_stats.jsonl"
     if not os.path.exists(latent_stats_path):
@@ -1105,9 +1111,7 @@ def delphi_select_latents(cfg):
         cfg,
         latent_stats,
     )
-    latent_selection_path = getattr(
-        cfg, "latent_selection_path", str(stats_dir / "latent_selection.jsonl")
-    )
+    latent_selection_path = str(stats_dir / "latent_selection.jsonl")
     if selection_records:
         _write_jsonl(str(latent_selection_path), selection_records)
         logging.info(
@@ -1118,7 +1122,7 @@ def delphi_select_latents(cfg):
 def delphi_score(cfg, model, tokenizer, wrapped_modules):
     cfg_exp = cfg.evals.auto_interp.delphi_scoring
     # Create model-specific identifier string based on config
-    model_str = f"{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_reg{cfg.model.reg}_layer{cfg.model.layer}"
+    model_str = get_model_str(cfg)
 
     topk_modules = [f"{name}.topk" for name, _ in wrapped_modules.items()]
 
@@ -1130,7 +1134,9 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
     del model
     del wrapped_modules
 
-    selection_path = f"delphi_cache/{model_str}/stats/latent_selection.jsonl"
+    selection_path = os.path.join(
+        resolve_delphi_cache_path(cfg), "stats", "latent_selection.jsonl"
+    )
 
     # Load interpretability rankings and get priority latents
     selection_records = _read_jsonl(selection_path)
@@ -1152,9 +1158,7 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
     logging.info(f"Topk modules after filtering: {topk_modules}")
     # 1) Load the raw cache you saved
     dataset = LatentDataset(
-        raw_dir=Path(
-            f"delphi_cache/{cfg.model.module_type.name}_k{cfg.model.k}_r{cfg.model.r}_reg{cfg.model.reg}_layer{cfg.model.layer}"
-        ),
+        raw_dir=Path(resolve_delphi_cache_path(cfg)),
         modules=topk_modules,
         latents={
             # Focus on most interpretable latents only
@@ -1250,7 +1254,6 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
         explainer_config = scoring_cfg.openai_config
         openai_model = getattr(explainer_config, "openai_model", "gpt-4o-mini")
         openai_base_url = getattr(explainer_config, "openai_base_url", None)
-        openai_temperature = float(getattr(explainer_config, "openai_temperature", 0.0))
         openai_max_tokens = int(getattr(explainer_config, "openai_max_tokens", 3000))
         openai_timeout = float(getattr(explainer_config, "openai_timeout", 60.0))
         cost_monitor_enabled = bool(
@@ -1266,18 +1269,19 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
         if output_cost_per_1m is not None:
             output_cost_per_1m = float(output_cost_per_1m)
 
+        openai_log_dir = os.path.join("autointerp", model_str, "openai_logs")
         client = OpenAIClient(
             openai_model,
             api_key=api_key,
             base_url=openai_base_url,
             max_tokens=openai_max_tokens,
-            temperature=openai_temperature,
             timeout=openai_timeout,
             tokenizer=tokenizer,
             cost_monitor_enabled=cost_monitor_enabled,
             cost_monitor_every_n_requests=cost_monitor_every_n_requests,
             input_cost_per_1m=input_cost_per_1m,
             output_cost_per_1m=output_cost_per_1m,
+            log_dir=openai_log_dir,
         )
 
         client.device = torch.device("cpu")
@@ -1302,7 +1306,7 @@ def delphi_score(cfg, model, tokenizer, wrapped_modules):
 
         # Enhanced pipeline with multiple scoring methods
         logging.info(
-            f"Running enhanced interpretability analysis on {len(priority_latents)} latents"
+            f"Running enhanced interpretability analysis on {selected_latents_counter} latents from {len(topk_modules)} modules."
         )
 
         # Multi-stage pipeline
